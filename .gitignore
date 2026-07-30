@@ -30,3 +30,6 @@ AGENTS.md
 docs/reviews/
 .claude/
 .codex/
+
+# Compiled server. Reproducible from `server/` via `npm run build:server`.
+dist-server/

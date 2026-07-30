@@ -1,0 +1,23 @@
+{
+  // Emit configuration for `npm run build:server`.
+  //
+  // Separate from `tsconfig.server.json` — which is `noEmit` and part of the root project
+  // references, so `npm run typecheck` covers `server/` exactly as before — because Node cannot
+  // run the sources directly: type stripping does not rewrite a `./canonical.js` specifier to
+  // the `./canonical.ts` file beside it, and every module in `server/` uses that spelling. So
+  // the server is compiled, like the client, and both are plain artefacts at deploy time.
+  //
+  // `rootDir: "."` keeps the `server/` directory in the output, so `import.meta.url`-relative
+  // lookups (schema.sql) and the direct-invocation check in index.ts have the same shape in the
+  // build as in the source tree.
+  "extends": "./tsconfig.server.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "./dist-server",
+    "rootDir": ".",
+    "sourceMap": true,
+    "declaration": false
+  },
+  "include": ["server"],
+  "exclude": ["server/**/*.test.ts"]
+}
