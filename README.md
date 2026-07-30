@@ -69,8 +69,21 @@ If you have been using Just 6 Weeks, you do not have to start from zero.
    your first test, type that instead.
 5. Tap **Import my history**.
 
-That is it. Every session, every repeat, every rep is now in GodMode, and it picks up exactly
-where you left off.
+That is it. Every session and every repeat that the file could be read from is now in GodMode,
+and it resumes at the day your history shows you had reached.
+
+Two honest caveats, because "nothing is lost" is the whole promise and it should not be
+overstated:
+
+- **The import tells you what it skipped.** A row it cannot read — a malformed date, a set
+  column that is not a whole number, gaps in the middle of the set columns — is reported by
+  line number rather than guessed at. It will not round `7.6` up to `8` or quietly renumber
+  your sets to close a gap. Sessions after a skipped row still import, and a day proven
+  complete by later history is still marked complete.
+- **Check the day it resumes on.** The last session in your file is judged against *our* target
+  for that day, and our interior curve is not identical to the old app's — see
+  [Where those numbers came from](#where-those-numbers-came-from). If the old app had moved you
+  on and GodMode has not, the manual advance in Settings fixes it.
 
 ### If you have never done the challenge
 
@@ -196,8 +209,16 @@ Restore from a backup** puts everything back.
 
 GodMode will nag you about this. Let it.
 
+Restoring **replaces** everything currently on the device, so it checks the file first. A backup
+that is damaged, truncated, or missing a section is refused outright with nothing changed, and a
+backup containing no sessions is refused when the device does have history — that combination is
+almost always the wrong file rather than a deliberate wipe.
+
 You can also export a **CSV** at any time, in the same format the old app used. Nothing here is
-locked in.
+locked in. Two things to know about it: the **JSON backup is the one that restores** — the CSV is
+for reading your data in a spreadsheet or taking it elsewhere — and a session that never matched
+a planned day cannot currently come back in through CSV, because it exports without a week/day
+and the importer will not accept a row it cannot place. The JSON backup carries everything.
 
 ## Stuck? Ask an AI
 
@@ -470,7 +491,27 @@ different *value* format does, which in practice means the date. Date format is 
 trying candidates and preferring the one that yields chronological order, and it reports genuine
 ambiguity rather than guessing silently.
 
-Imported rows carry **actual reps only**. Prescribed targets are never manufactured from them.
+Imported rows carry **actual reps only**. Prescribed targets are never manufactured from them —
+and "never" has teeth: a session that reconciles to no plan slot is stored with **no**
+`effectiveTarget` at all rather than borrowing its own actuals. Absent means unknown. An earlier
+version defaulted the field to `actual`, which recorded that the user had been told to do exactly
+what they did, and made every unreconciled session read as a perfect hit forever.
+
+**Validation refuses rather than repairs.** Each of these was once a silent rewrite:
+
+| Input | Old behaviour | Now |
+|---|---|---|
+| A set logged as `0` | dropped, renumbering later sets | kept, position preserved |
+| `7.6` reps | rounded to `8` | row rejected, reported by line |
+| A negative set value | dropped | row rejected |
+| Blank *between* filled set columns | closed up silently | row rejected — set order is unknowable |
+| `31.2.2026` | passed a `day <= 31` check, became 3 March | row rejected |
+| Duration `05:99` | read as 6m39s | ignored |
+
+The whole import commits in **one transaction**. It previously wrote the exercise, then the
+challenge and slots, then each workout, then the slot statuses — so a failure part-way through
+left an orphan exercise, or a challenge holding half the history with nothing recording that it
+was incomplete.
 
 ### One subtlety worth knowing
 
@@ -497,9 +538,23 @@ npm test
   guards proving a *strict* version is unsatisfiable (`M=14 → 5,7,5,5,7`, `M=20 → 7,9,7,7,10`).
   A strict assertion would have failed on session 2 of the very data the model came from.
 - The rounding boundary cases above.
-- The real CSV, where present, asserted down to individual sessions. It is personal data, so those
-  blocks skip when the file is absent and a committed synthetic fixture covers the structure — the
-  suite is green on a fresh clone either way.
+- The real CSV, asserted down to individual sessions. It is one real person's activity history,
+  committed deliberately so the import claims are reproducible by anyone who clones. Those blocks
+  skip if the file is removed, and a synthetic fixture covers the structure, so the suite is green
+  either way.
+- **Restore refusing to destroy data.** A file containing only
+  `{"format":"godmode-backup","formatVersion":1}` used to clear every store and report success,
+  because each collection was read as `?? []`. Each rejection case now asserts that the existing
+  history is *still there* afterwards, which is the property that actually matters.
+- **The v1 → v2 database migration, from a populated v1 database.** The upgrade callback created
+  every store unconditionally, so the first version bump would have thrown `ConstraintError`
+  against existing stores, aborted the upgrade, and left the app unable to open the database at
+  all — on a device holding the only copy.
+- Each import-validation refusal in the table above, paired with a good row, so the test proves
+  the bad row specifically was caught rather than the whole file being thrown away.
+- One test **pins a limitation rather than hiding it**: a session with no plan slot cannot
+  round-trip through CSV, because it exports blank week/day that the importer rejects. When that
+  is fixed the test fails and gets updated, instead of the gap being quietly forgotten.
 - The cue schedule, including the `<= 5` boundary. A one-beep-off error is genuinely hard to
   notice by ear, so it gets an assertion rather than a listen.
 - `resolveSelectedChallenge` falling back when the stored selection names a challenge that was

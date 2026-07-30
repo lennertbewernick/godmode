@@ -141,15 +141,26 @@ The final logged session was 202 against 205, which by this rule repeats.
 
 ### 1.5 Rest between sets [OUR CHOICE]
 
+What ships (`src/core/policies/rest.ts`):
+
 ```
-rest_s = clamp(round_to_5(1.46 × M(n) + 4), 30, 180)
+rest_s = clamp(round_to_5(0.71 × sessionVolume + 4), 30, 180)
 ```
 
-This is **algebra through two assumed endpoints** (30 s at M=18, 150 s at M=100), giving
-slope `(150−30)/(100−18) = 1.463`. It is not independent evidence. The duration
+This is **algebra through two assumed endpoints** (30 s at volume 37, 150 s at volume 205),
+giving slope `(150−30)/(205−37) ≈ 0.714`. It is not independent evidence. The duration
 cross-check is underidentified: one aggregate `Zeit` per session cannot separate rep pace
 from rest from UI transitions from skipped timers. A configurable product default, nothing
 more.
+
+> **Note, 2026-07-30.** Earlier drafts of this section wrote the same line against the
+> generation max instead of session volume: `1.46 × M(n) + 4`, through the endpoints
+> M=18 and M=100. The two are near-identical by construction, since volume ≈ 2.05 × M and
+> `0.71 × 2.05 ≈ 1.4555`, but they are not the same function — rounding to 5 s lands
+> differently, and slots 2 and 6 come out 5 s apart. The volume form is what the code
+> computes, so it is what this section now documents. Rest is a product default either way;
+> the point of recording the discrepancy is that the plan and the code must not be allowed
+> to drift apart silently.
 
 ### 1.6 Calories [OUR CHOICE]
 

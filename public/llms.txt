@@ -68,10 +68,22 @@ workouts can come over completely.
    they should type that instead — it is better data.
 5. Tap **Import my history**.
 
-Afterwards the app resumes at exactly the day they were on. It does not restart them at week 1.
+Afterwards the app resumes at the day their history shows they had reached. It does not restart
+them at week 1.
+
+**Check the resumed day with them.** The last session in the file is judged against GodMode's
+target for that day, and GodMode's interior progression is not identical to the old app's. If
+the old app had already moved them on and GodMode has not, Settings has a manual advance. This
+is the single most likely thing to look wrong after an otherwise clean import.
 
 **If the import reports skipped rows,** the summary says which lines and why. A handful of
-unreadable rows out of hundreds is not worth worrying about; everything else still imports.
+unreadable rows out of hundreds is not worth worrying about; everything else still imports, and
+a day that later history proves was completed is still marked completed.
+
+Do not offer to "fix" a skipped row by editing the CSV to make it parse. The importer rejects a
+row precisely because it cannot tell what the row meant — it will not round a fractional rep
+count, renumber sets to close a gap, or accept a date that is not on the calendar. Guessing on
+the user's behalf is how history quietly becomes fiction.
 
 **If they never used Just 6 Weeks,** choose **Take a max test** instead: one rested set to
 failure, good form, enter the number, pick a goal.
