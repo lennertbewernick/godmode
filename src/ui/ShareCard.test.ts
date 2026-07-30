@@ -9,7 +9,8 @@
 
 import { describe, expect, it } from 'vitest';
 import type { StatSlot, StatWorkout } from '../core/stats.js';
-import { drawShareCard } from './ShareCard.js';
+import { cardScale, drawShareCard } from './ShareCard.js';
+import { niceScale } from './chartScale.js';
 import { buildShareCard, type ShareCardInput } from './shareCardData.js';
 
 interface Painted {
@@ -131,16 +132,30 @@ describe('drawShareCard', () => {
     expect(texts).toContain('Liegestütze');
   });
 
-  it('states the context it has and invents none it does not', () => {
-    const withContext = recorder();
-    withContext.draw({ ...base, goal: 100, currentWeek: 4, currentDay: 2 });
-    expect(withContext.painted.map((p) => p.text)).toContain('Week 4 · Day 2 · goal 100');
-
-    const without = recorder();
-    without.draw(base);
-    for (const p of without.painted) {
+  it('carries no week, day or goal line under the title', () => {
+    const rec = recorder();
+    rec.draw(base);
+    for (const p of rec.painted) {
       expect(p.text).not.toMatch(/Week|Day \d|goal/);
     }
+  });
+
+  it('puts the headline figures between the exercise name and the chart', () => {
+    const rec = recorder();
+    rec.draw(base);
+    const yOf = (text: string) => rec.painted.find((p) => p.text === text)!.y;
+
+    // Read top-down: title, then the numbers someone would repeat out loud, then the chart,
+    // then the detail. The figures used to be last, below the table, where a reader arrives
+    // only if they got that far.
+    expect(yOf('Liegestütze')).toBeLessThan(yOf('REPS'));
+    expect(yOf('REPS')).toBeLessThan(yOf('0'));            // the chart's baseline label
+    expect(yOf('REPS')).toBeLessThan(yOf('Last sessions'));
+
+    // And they appear once — moved, not duplicated.
+    expect(rec.painted.filter((p) => p.text === 'REPS')).toHaveLength(1);
+    const lastRow = Math.max(...rec.painted.filter((p) => /^2026-/.test(p.text)).map((p) => p.y));
+    expect(yOf('REPS')).toBeLessThan(lastRow);
   });
 
   it('draws one continuous line of reps done, and nothing else', () => {
@@ -185,16 +200,48 @@ describe('drawShareCard', () => {
     // "moved on" whether or not the history contained either. Nothing announces them now.
     expect(texts).not.toContain('reps you did');
     expect(texts).not.toContain('reps the day asked for');
-    expect(texts).not.toContain('deload');
-    expect(texts).not.toContain('moved on');
   });
 
-  it('carries no footer', () => {
+  it('says no outcome word anywhere, however the sessions went', () => {
+    const rec = recorder();
+    rec.draw({
+      ...base,
+      workouts: [
+        { ...workout(1, 118, 's1'), outcome: 'deload' },
+        { ...workout(3, 173), outcome: 'failed' },
+        { ...workout(5, 141, 's3'), outcome: 'advanced_manually' },
+      ],
+    });
+    for (const p of rec.painted) {
+      expect(p.text).not.toMatch(/deload|missed|moved on|as planned|scaled up/);
+    }
+  });
+
+  it('does not reinstate the discarded tagline', () => {
     const rec = recorder();
     rec.draw(base);
     for (const p of rec.painted) {
-      expect(p.text).not.toMatch(/device|GodMode —/);
+      expect(p.text).not.toMatch(/device|every rep/);
     }
+  });
+
+  it('prints the public project URL once, quietly, and never the private remote', () => {
+    const rec = recorder();
+    rec.draw(base);
+
+    const url = rec.painted.filter((p) => p.text === 'https://github.com/marcushorndt/godmode');
+    expect(url).toHaveLength(1);
+
+    // The canonical remote is a private Forgejo host. This image gets sent to a group chat, so
+    // that hostname must not be derivable from anything on it.
+    for (const p of rec.painted) {
+      expect(p.text).not.toMatch(/git\.marcushorndt\.de|forgejo/i);
+    }
+
+    // Quiet, but pinned: small enough to read as a footprint, large enough to still be read.
+    expect(url[0]!.size).toBe(24);
+    expect(url[0]!.y).toBeGreaterThan(1250);
+    expect(url[0]!.y).toBeLessThan(1350);
   });
 
   it('keeps the prescription in the table, with an em dash where there was none', () => {
@@ -234,8 +281,9 @@ describe('drawShareCard', () => {
     rec.draw(base);
     const label = rec.painted.find((p) => p.text === 'Liegestütze')!;
     const value = rec.painted.find((p) => p.text === String(118 + 173 + 141))!;
-    // The numbers are a footing, not the subject: smaller than the exercise they belong to.
-    expect(value.size).toBeLessThan(label.size);
+    // Next to the title rather than alone at the bottom, the figures have to stay clearly
+    // subordinate to it, or the exercise name reads as their caption.
+    expect(value.size).toBeLessThanOrEqual(label.size * 0.7);
     expect(value.size).toBeGreaterThanOrEqual(28);
     expect(value.y).toBeGreaterThan(label.y);
   });
@@ -255,13 +303,49 @@ describe('drawShareCard', () => {
     expect(texts).not.toContain('—');
   });
 
-  it('paints no text too small to read at the size this card is looked at', () => {
+  it('paints no content too small to read at the size this card is looked at', () => {
     const rec = recorder();
-    rec.draw({ ...base, goal: 100, currentWeek: 4, currentDay: 2 });
+    rec.draw(base);
     expect(rec.painted.length).toBeGreaterThan(20);
     for (const p of rec.painted) {
+      // The project URL is the one deliberate exception: a footprint, not content.
+      if (p.text.startsWith('https://')) continue;
       expect(p.size).toBeGreaterThanOrEqual(28);
     }
+  });
+
+  it('fits the y-axis to the data instead of leaving a fifth of the plot empty', () => {
+    // The real history peaks at 202. The shared niceScale takes that to a 250 ceiling, which
+    // wastes a fifth of the plot and flattens the curve with it.
+    expect(niceScale(202).top).toBe(250);
+    expect(cardScale(202)).toEqual({ top: 225, step: 25 });
+  });
+
+  it('keeps the axis on round numbers and rooted at zero', () => {
+    for (const max of [7, 42, 99, 100, 202, 613, 3134]) {
+      const { top, step } = cardScale(max);
+      expect(top).toBeGreaterThanOrEqual(max);
+      expect(Number.isInteger(step)).toBe(true);
+      expect(top % step).toBe(0);
+      const lines = top / step;
+      expect(lines).toBeGreaterThanOrEqual(4);
+      expect(lines).toBeLessThanOrEqual(9);
+      // Never tighter than the data, and never looser than the shared scale.
+      expect(top).toBeLessThanOrEqual(niceScale(max).top);
+    }
+  });
+
+  it('draws the axis it chose, from zero upward', () => {
+    const rec = recorder();
+    rec.draw(base);
+    // base peaks at 173 → step 25, top 175.
+    const { top, step } = cardScale(173);
+    const expected: string[] = [];
+    for (let v = 0; v <= top; v += step) expected.push(String(v));
+    // The value labels sit 18px left of the plot's left edge (PAD 64 + axis gutter 84).
+    const axis = rec.painted.filter((p) => p.x === 130);
+    expect(axis.map((p) => p.text)).toEqual(expected);
+    expect(axis[0]!.text).toBe('0');
   });
 
   it('keeps everything it paints inside the card', () => {

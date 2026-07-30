@@ -108,22 +108,26 @@ describe('buildShareCard', () => {
       .toBe(1);
   });
 
-  it('says nothing about a context it does not have', () => {
+  it('assembles only what the card draws', () => {
     const card = buildShareCard(input());
-    expect(card.context).toEqual({});
-    expect(card.context.week).toBeUndefined();
-    expect(card.context.goal).toBeUndefined();
+    // The week/day/goal context and the per-row outcome were both dropped from the card during
+    // its 2026-07-30 revisions. They are gone from here too — an unread field is a field that
+    // rots, and the next reader cannot tell it is dead.
+    expect(Object.keys(card).sort()).toEqual([
+      'exerciseLabel',
+      'metrics',
+      'points',
+      'recent',
+      'totals',
+    ]);
+    expect(Object.keys(card.recent[0]!).sort()).toEqual(['actualTotal', 'date', 'targetTotal']);
   });
 
-  it('carries the challenge context when it exists', () => {
-    const card = buildShareCard(input({ goal: 100, currentWeek: 4, currentDay: 2 }));
-    expect(card.context).toEqual({ week: 4, day: 2, goal: 100 });
-  });
-
-  it('omits a week without a day rather than defaulting the missing half', () => {
-    const card = buildShareCard(input({ currentWeek: 4 }));
-    expect(card.context).toEqual({ week: 4 });
-    expect('day' in card.context).toBe(false);
+  it('leaves the domain alone while trimming the card', () => {
+    // The outcome is still on every session point, because History still shows the words. The
+    // card not drawing something is no reason for the data underneath to lose it.
+    const card = buildShareCard(input());
+    expect(card.points.every((p) => typeof p.outcome === 'string')).toBe(true);
   });
 
   it('reports kcal only when there is some, and labels how it was arrived at', () => {

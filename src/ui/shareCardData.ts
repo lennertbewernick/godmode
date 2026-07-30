@@ -9,6 +9,12 @@
  *
  * The card reports. Every figure on it is something `core/stats` already computes; nothing here
  * recalculates, rounds differently, or invents a statistic of its own.
+ *
+ * This assembles only what the card actually draws. The week/day/goal context and the per-row
+ * outcome were both dropped from the card during its 2026-07-30 revisions, so they are gone from
+ * here too rather than left as fields nobody reads. `WorkoutRecord.outcome` and
+ * `SessionPoint.outcome` are untouched — History still shows the outcome words, and this module
+ * has no business trimming the domain to match one picture.
  */
 
 import {
@@ -22,7 +28,6 @@ import {
   type StatSlot,
   type StatWorkout,
 } from '../core/stats.js';
-import type { WorkoutOutcome } from '../core/types.js';
 import type { WorkoutRecord } from '../db/schema.js';
 
 /** How many sessions the card's table holds. More than this and the type stops being legible. */
@@ -34,7 +39,6 @@ export interface RecentRow {
   actualTotal: number;
   /** Absent when the session belonged to no slot. Never filled in from the actual. */
   targetTotal?: number;
-  outcome: WorkoutOutcome;
 }
 
 export interface ShareCardInput {
@@ -43,18 +47,10 @@ export interface ShareCardInput {
   slots: StatSlot[];
   /** Sets the streak's rest-day tolerance. See `rhythmGapDays`. */
   daysPerWeek: number;
-  goal?: number;
-  currentWeek?: number;
-  currentDay?: number;
 }
 
 export interface ShareCardData {
   exerciseLabel: string;
-  /**
-   * Every field optional and omitted rather than defaulted. An open-ended plan genuinely has
-   * no week and no day, and a card that prints `W0D0` is stating something false.
-   */
-  context: { week?: number; day?: number; goal?: number };
   points: SessionPoint[];
   recent: RecentRow[];
   totals: LifetimeTotals;
@@ -89,7 +85,6 @@ export function buildShareCard(input: ShareCardInput): ShareCardData {
     .map((p) => ({
       date: p.performedAt.slice(0, 10),
       actualTotal: p.actualTotal,
-      outcome: p.outcome,
       // Copied straight off the point, and left absent when the point has none.
       ...(p.targetTotal === undefined ? {} : { targetTotal: p.targetTotal }),
     }));
@@ -103,11 +98,6 @@ export function buildShareCard(input: ShareCardInput): ShareCardData {
 
   return {
     exerciseLabel: input.exerciseLabel,
-    context: {
-      ...(input.currentWeek === undefined ? {} : { week: input.currentWeek }),
-      ...(input.currentDay === undefined ? {} : { day: input.currentDay }),
-      ...(input.goal === undefined ? {} : { goal: input.goal }),
-    },
     points,
     recent,
     totals,

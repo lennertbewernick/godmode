@@ -14,17 +14,27 @@
  * the app still has exactly one dialog pattern.
  *
  * Revised 2026-07-30 after looking at the first one: the chart is a single line of reps done,
- * with no dashed prescription and no outcome dots, and there is no legend and no footer. Five
- * things to decode is right for the History tab, where you are asking a question; it is wrong
- * for an image someone glances at in a chat. The prescription and the outcome words did not
- * disappear — they moved to where they can be read, in the table underneath.
+ * with no dashed prescription and no outcome dots, and there is no legend. Five things to decode
+ * is right for the History tab, where you are asking a question; it is wrong for an image
+ * someone glances at in a chat. The prescription and the outcome words did not disappear — they
+ * moved to where they can be read, in the table underneath.
+ *
+ * Revised a third time: the outcome words left the table too. The app's History tab keeps all of
+ * it — the dashed prescription, the coloured dots, the legend, the outcome labels — because that
+ * is the surface where you work out *why* a day went the way it did. This one goes to people
+ * with no context, who get one glance. The divergence is the design, not drift.
+ *
+ * Revised again the same day: the week/day/goal subtitle is gone and the headline figures took
+ * its place, directly under the exercise name. A card is read top-down and stops being read
+ * early, so the numbers someone would actually repeat out loud now sit where the eye already is
+ * rather than at the far end.
  */
 
 import { useEffect, useState } from 'react';
 import { formatDuration } from '../core/stats.js';
 import type { SessionPoint } from '../core/stats.js';
 import { downloadBlob, shareImageFilename } from '../data/exchange.js';
-import { OUTCOME_DOT, OUTCOME_LABEL, niceScale, shortDate, tickIndices } from './chartScale.js';
+import { shortDate, tickIndices } from './chartScale.js';
 import type { ShareCardData } from './shareCardData.js';
 import { Banner, Button, Spinner } from './kit.js';
 
@@ -47,6 +57,17 @@ const ACTUAL = '#5eead4';
  * does not implement it.
  */
 const STACK = 'system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif';
+
+/**
+ * The public mirror, hard-coded on purpose.
+ *
+ * The canonical remote is a private Forgejo host, and this image gets sent to a group chat —
+ * deriving the URL from `git remote` would put a private hostname in front of everyone the card
+ * reaches. Printed with its scheme: nothing in a PNG is clickable, so a reader has to type it
+ * or point a camera at it, and the `https://` is what makes it unambiguously a URL to copy
+ * rather than something that merely looks like a path.
+ */
+const PROJECT_URL = 'https://github.com/marcushorndt/godmode';
 
 /**
  * The card is judged at roughly 0.4 scale — in the preview panel, and on a phone in a chat.
@@ -86,12 +107,12 @@ export function drawShareCard(canvas: HTMLCanvasElement, data: ShareCardData): v
   ctx.textBaseline = 'alphabetic';
   ctx.textAlign = 'left';
 
-  const y = drawChart(ctx, data.points, drawHeading(ctx, data));
-  drawTable(ctx, data, y);
-  drawHeadline(ctx, data);
+  const chartTop = drawHeadline(ctx, data, drawHeading(ctx, data));
+  drawTable(ctx, data, drawChart(ctx, data.points, chartTop));
+  drawFootprint(ctx);
 }
 
-/** Wordmark, exercise, and a context line built only from the fields that exist. */
+/** Wordmark and the exercise. Returns the y the headline figures start at. */
 function drawHeading(ctx: CanvasRenderingContext2D, data: ShareCardData): number {
   ctx.font = font(40, 700);
   ctx.fillStyle = INK;
@@ -102,38 +123,61 @@ function drawHeading(ctx: CanvasRenderingContext2D, data: ShareCardData): number
   ctx.fillStyle = ACTUAL;
   ctx.fillText('No More Later', PAD + wordmark + 20, 100);
 
-  let y = 182;
   ctx.fillStyle = INK;
   // A long label gets smaller rather than running off the edge of the image.
   fitText(ctx, data.exerciseLabel, INNER_RIGHT - PAD, 66, 40, 700);
-  ctx.fillText(data.exerciseLabel, PAD, y);
+  ctx.fillText(data.exerciseLabel, PAD, 182);
 
-  const bits: string[] = [];
-  const { week, day, goal } = data.context;
-  if (week !== undefined && day !== undefined) bits.push(`Week ${week} · Day ${day}`);
-  else if (week !== undefined) bits.push(`Week ${week}`);
-  else if (day !== undefined) bits.push(`Day ${day}`);
-  if (goal !== undefined) bits.push(`goal ${goal}`);
+  return 228;
+}
 
-  // An open-ended plan has no week and no day. Say nothing and take the space back, rather
-  // than printing a placeholder that reads as a fact.
-  if (bits.length > 0) {
-    y += 44;
-    ctx.font = font(32);
-    ctx.fillStyle = MUTED;
-    ctx.fillText(bits.join(' · '), PAD, y);
+/** Step sizes that keep every gridline on a round number. 2.5 is allowed only where it lands
+ * on an integer — at magnitude 10 it gives 25, which is a perfectly ordinary axis. */
+const STEP_MULTIPLIERS = [1, 2, 2.5, 5, 10];
+
+/**
+ * A y-axis for the card: always rooted at 0, always on round numbers, and as close to the data
+ * as those two allow.
+ *
+ * The shared `niceScale` picks the first round step at or above `max / targetLines`, which is
+ * right for the app's chart but leaves the card slack: a 202-rep peak became a 250 ceiling, so a
+ * fifth of the plot was empty and the curve was flattened by it. This searches instead —
+ * every round step whose line count is sane, then the one with the least dead space — and gets
+ * 225 for the same data. It never truncates the baseline: starting anywhere but 0 would
+ * overstate the progress, which is the one thing this card must not do.
+ *
+ * `chartScale.ts` is untouched. The app's chart plots two series and needs headroom for the
+ * target above the actual; the card plots one and does not.
+ */
+export function cardScale(max: number): { top: number; step: number } {
+  let best: { top: number; step: number; lines: number } | undefined;
+
+  for (let exponent = 0; exponent <= 6; exponent += 1) {
+    for (const multiplier of STEP_MULTIPLIERS) {
+      const step = multiplier * 10 ** exponent;
+      if (!Number.isInteger(step)) continue;
+      const top = Math.ceil(max / step) * step;
+      const lines = top / step;
+      // Fewer than four gridlines reads as no scale at all; more than nine is a grid.
+      if (lines < 4 || lines > 9) continue;
+      if (!best || top < best.top || (top === best.top && lines < best.lines)) {
+        best = { top, step, lines };
+      }
+    }
   }
 
-  return y + 42;
+  // Only reachable for a max of 3 or less — one or two very small sessions.
+  if (!best) return { top: Math.max(4, Math.ceil(max)), step: 1 };
+  return { top: best.top, step: best.step };
 }
 
 /**
- * Taller than the app's own chart, and taller than this card's first version. Dropping the
- * target line, the outcome dots, the legend and the footer freed most of a third of the card,
- * and the chart is the thing people actually look at, so it took the space rather than leaving
- * a band of nothing.
+ * Taller than the app's own chart, and taller than either earlier version of this card. Dropping
+ * the target line, the outcome dots, the legend and the subtitle freed most of a third of the
+ * card, and the chart is the thing people actually look at, so it took the space each time
+ * rather than leaving a band of nothing.
  */
-const PLOT_HEIGHT = 460;
+const PLOT_HEIGHT = 480;
 const AXIS_GUTTER = 84;
 
 /**
@@ -156,7 +200,7 @@ function drawChart(ctx: CanvasRenderingContext2D, points: SessionPoint[], top: n
   }
 
   // Scaled to the reps actually done, because that is now the only line on the chart.
-  const scale = niceScale(Math.max(...points.map((p) => p.actualTotal), 1));
+  const scale = cardScale(Math.max(...points.map((p) => p.actualTotal), 1));
   const stepX = points.length === 1 ? 0 : (INNER_RIGHT - left) / (points.length - 1);
   const x = (i: number) =>
     points.length === 1 ? left + (INNER_RIGHT - left) / 2 : left + i * stepX;
@@ -213,9 +257,13 @@ function drawChart(ctx: CanvasRenderingContext2D, points: SessionPoint[], top: n
   return bottom + 104;
 }
 
-const COL_TARGET = 620;
-const COL_ACTUAL = 812;
-const COL_OUTCOME = 852;
+/**
+ * Three columns spread across the card's full width: the date from the left margin, the target
+ * right-aligned a third in, and the reps right-aligned on the same margin the chart above ends
+ * at, so the table and the plot share an edge.
+ */
+const COL_TARGET = 698;
+const COL_ACTUAL = INNER_RIGHT;
 
 function drawTable(ctx: CanvasRenderingContext2D, data: ShareCardData, top: number): void {
   if (data.recent.length === 0) {
@@ -265,24 +313,27 @@ function drawTable(ctx: CanvasRenderingContext2D, data: ShareCardData, top: numb
     ctx.fillStyle = INK;
     ctx.fillText(String(row.actualTotal), COL_ACTUAL, y);
 
-    ctx.font = font(28);
-    ctx.fillStyle = OUTCOME_DOT[row.outcome] ?? ACTUAL;
-    ctx.textAlign = 'left';
-    ctx.fillText(OUTCOME_LABEL[row.outcome], COL_OUTCOME, y);
-
     y += 48;
   }
   ctx.textAlign = 'left';
 }
 
 /**
- * Headline figures, anchored to the bottom so a short table does not drag them up.
+ * The headline figures, directly under the exercise they belong to. Returns the chart's top.
  *
- * Deliberately understated. At 68px these read as the subject of the card and competed with the
- * exercise name and the chart, which are the subject. They are a footing now: still legible at
- * thumbnail size, no longer shouting.
+ * They used to sit at the foot of the card, below the table, which is where a reader arrives
+ * last if at all. A card is read top-down and abandoned early, so the numbers someone would
+ * actually repeat — reps, time, streak — now sit where the eye already is.
+ *
+ * Deliberately subordinate to the 66px exercise name above them: at 46px, next to the title
+ * rather than alone at the bottom, they turned the title into a caption. 40px keeps the name
+ * leading and is still 17 CSS px in the preview.
  */
-function drawHeadline(ctx: CanvasRenderingContext2D, data: ShareCardData): void {
+function drawHeadline(
+  ctx: CanvasRenderingContext2D,
+  data: ShareCardData,
+  top: number,
+): number {
   const columns: { label: string; value: string; sub: string }[] = [
     {
       label: 'REPS',
@@ -309,17 +360,35 @@ function drawHeadline(ctx: CanvasRenderingContext2D, data: ShareCardData): void 
     const x = PAD + i * width;
     ctx.font = font(28, 600);
     ctx.fillStyle = MUTED;
-    ctx.fillText(column.label, x, 1196);
+    ctx.fillText(column.label, x, top);
 
-    // 46px, against a 28px floor — the smallest this can be and still carry the row.
-    ctx.font = font(46, 700);
+    ctx.font = font(40, 700);
     ctx.fillStyle = INK;
-    ctx.fillText(column.value, x, 1252);
+    ctx.fillText(column.value, x, top + 44);
 
     ctx.font = font(28);
     ctx.fillStyle = MUTED;
-    ctx.fillText(column.sub, x, 1296);
+    ctx.fillText(column.sub, x, top + 80);
   });
+
+  return top + 124;
+}
+
+/**
+ * Where this came from, set quietly at the foot of the card.
+ *
+ * 24px — below the 28px floor, deliberately. That floor exists for content someone is meant to
+ * read; this is a footprint, and it earns its quietness from being small and low-contrast rather
+ * than from being hidden. At the preview width it is still around 10 CSS px and legible.
+ */
+const FOOTPRINT_SIZE = 24;
+
+function drawFootprint(ctx: CanvasRenderingContext2D): void {
+  // Written out rather than passed through `font`, which clamps to the content floor.
+  ctx.font = `400 ${FOOTPRINT_SIZE}px ${STACK}`;
+  ctx.fillStyle = '#55637d';
+  ctx.textAlign = 'left';
+  ctx.fillText(PROJECT_URL, PAD, 1310);
 }
 
 interface Rendered {

@@ -188,9 +188,6 @@ export function App() {
         status: s.status,
       })),
       daysPerWeek: daysPerWeek(state.challenge),
-      ...(state.challenge.goalValue === undefined ? {} : { goal: state.challenge.goalValue }),
-      ...(state.currentSlot?.week === undefined ? {} : { currentWeek: state.currentSlot.week }),
-      ...(state.currentSlot?.day === undefined ? {} : { currentDay: state.currentSlot.day }),
     });
   }, [state]);
 
