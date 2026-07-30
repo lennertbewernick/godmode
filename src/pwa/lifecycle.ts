@@ -2,6 +2,7 @@ import { registerSW } from 'virtual:pwa-register';
 import {
   UPDATE_CHECK_INTERVAL_MS,
   decideLocalAction,
+  isDevServerResponse,
   isLocalhostHost,
   shouldCheckForUpdate,
 } from './policy.js';
@@ -73,11 +74,13 @@ async function purge(): Promise<void> {
 async function probeDevServer(): Promise<boolean> {
   try {
     // Absolute path on purpose: the dev server roots at `/` whatever `base: './'` says.
-    // `vite preview` serves static files out of dist and 404s here, which is exactly what
-    // makes this a sound discriminator between "a dev server is hiding behind this worker"
-    // and "this is a real static build".
+    // The status code is deliberately not the test — `vite preview` answers unknown paths
+    // with 200 and the built index.html. See `isDevServerResponse`.
     const response = await fetch('/@vite/client', { cache: 'no-store' });
-    return response.ok;
+    return isDevServerResponse({
+      ok: response.ok,
+      contentType: response.headers.get('content-type'),
+    });
   } catch {
     return false;
   }

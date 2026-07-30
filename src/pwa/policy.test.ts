@@ -2,10 +2,39 @@ import { describe, expect, it } from 'vitest';
 import {
   UPDATE_CHECK_INTERVAL_MS,
   decideLocalAction,
+  isDevServerResponse,
   isLocalhostHost,
   shouldCheckForUpdate,
   shouldOfferUpdate,
 } from './policy.js';
+
+describe('isDevServerResponse', () => {
+  it('recognises the dev server by the module it serves', () => {
+    expect(isDevServerResponse({ ok: true, contentType: 'text/javascript' })).toBe(true);
+    expect(
+      isDevServerResponse({ ok: true, contentType: 'application/javascript; charset=utf-8' }),
+    ).toBe(true);
+  });
+
+  it('is not fooled by an SPA fallback', () => {
+    // Measured, not assumed: `vite preview` answers GET /@vite/client with 200 and the
+    // built index.html, because its default appType is 'spa'. A status check alone would
+    // therefore report "a dev server is live" on every static preview and every static
+    // host — which would purge the very worker `npm run preview:pwa` exists to install.
+    expect(isDevServerResponse({ ok: true, contentType: 'text/html' })).toBe(false);
+    expect(isDevServerResponse({ ok: true, contentType: 'text/html; charset=utf-8' })).toBe(false);
+  });
+
+  it('treats a missing or unhelpful content type as "not a dev server"', () => {
+    expect(isDevServerResponse({ ok: true, contentType: null })).toBe(false);
+    expect(isDevServerResponse({ ok: true, contentType: '' })).toBe(false);
+    expect(isDevServerResponse({ ok: true, contentType: 'application/octet-stream' })).toBe(false);
+  });
+
+  it('rejects an error response outright', () => {
+    expect(isDevServerResponse({ ok: false, contentType: 'text/javascript' })).toBe(false);
+  });
+});
 
 describe('isLocalhostHost', () => {
   it('accepts the three names a local server actually answers to', () => {

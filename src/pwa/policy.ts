@@ -32,6 +32,25 @@ export function isLocalhostHost(hostname: string): boolean {
   return LOCAL_HOSTNAMES.has(hostname.trim().toLowerCase());
 }
 
+/**
+ * Did a request for `/@vite/client` come back from an actual Vite dev server?
+ *
+ * The status code alone is not enough, and getting this wrong is expensive in both
+ * directions. `vite preview` defaults to `appType: 'spa'`, so it answers *any* unknown path
+ * with 200 and the built `index.html` — verified by hand on 2026-07-30, against the belief
+ * that it 404s. Trusting `response.ok` would therefore report "a dev server is live" on every
+ * static preview, purging the worker that `npm run preview:pwa` exists to install and taking
+ * offline support down with it.
+ *
+ * The dev server serves that path as a JavaScript module; a fallback serves HTML. That
+ * content-type difference is the discriminator.
+ */
+export function isDevServerResponse(input: { ok: boolean; contentType: string | null }): boolean {
+  if (!input.ok) return false;
+  const contentType = (input.contentType ?? '').toLowerCase();
+  return contentType.includes('javascript') || contentType.includes('ecmascript');
+}
+
 export type LocalAction = 'register' | 'purge-and-reload' | 'purge' | 'none';
 
 export interface LocalActionInput {
