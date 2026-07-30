@@ -158,6 +158,13 @@ GodMode will nag you about this. Let it.
 You can also export a **CSV** at any time, in the same format the old app used. Nothing here is
 locked in.
 
+## Stuck? Ask an AI
+
+If you would rather be walked through it than read this, paste the app's link into ChatGPT,
+Claude, or whatever you use, and ask it to help you install it. The site serves a file at
+**`/llms.txt`** written specifically for that — the install steps, the CSV export path, the
+vocabulary, and the mistakes people actually make. Assistants read it automatically.
+
 ---
 
 # Part 2 — How it works
@@ -337,6 +344,7 @@ src/db/           IndexedDB schema and repository
 src/import/       the four-stage CSV pipeline + mapping profiles
 src/data/         backup, restore, CSV export
 src/ui/           screens and a small hand-rolled component kit
+public/llms.txt   install + setup guide written for AI assistants, served at /llms.txt
 ```
 
 `src/core/` is where the value is. It has no imports from the rest of the app and is heavily

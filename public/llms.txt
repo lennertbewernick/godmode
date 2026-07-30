@@ -1,0 +1,169 @@
+# GodMode: No More Later
+
+> A progressive bodyweight challenge planner that runs entirely in the browser. It replaces the
+> "Just 6 Weeks" push-up app: it builds a multi-set plan from the user's current max toward a
+> single-set goal, runs each workout set by set with a rest timer, repeats any day they miss, and
+> keeps their whole history. No account, no server, no subscription. All data lives in IndexedDB
+> on the user's own device.
+
+This file exists so that an AI assistant can help someone install and set up GodMode without the
+user having to read documentation. The people using this app are not technical. They were sent a
+link by a friend and want to keep their push-up streak going.
+
+If you are helping such a person: give them one step at a time, ask them what they see, and do
+not explain what a PWA is. What follows is what you need to know to do that well.
+
+## The single most common failure
+
+**On iPhone, they must use Safari.** Chrome and Firefox on iOS cannot add a real home-screen app
+— Apple does not let them. If someone says "I don't see Add to Home Screen", the first question
+is always "which browser are you in?", and the fix is always "open the same link in Safari".
+
+## Installing
+
+Do not send them to an app store. There is nothing there. GodMode is a web page that becomes an
+app when it is added to the home screen.
+
+### iPhone / iPad
+
+1. Open the link in **Safari**.
+2. Tap the **Share** button — the square with an arrow pointing up, in the bottom bar.
+3. Scroll the list down and tap **Add to Home Screen**.
+4. Tap **Add**, top right.
+5. Open it from the new home-screen icon from now on, not from Safari. That is what makes it run
+   full-screen and work with no signal.
+
+### Android
+
+1. Open the link in **Chrome**.
+2. Tap the **Install** prompt at the bottom if it appears. If it does not, use the **⋮** menu →
+   **Install app** (older Chrome calls it **Add to Home screen**).
+3. Confirm.
+
+### Desktop
+
+Just open the link. Nothing to install. The app has a proper wide layout on a big screen.
+
+## Bringing existing Just 6 Weeks history across
+
+This is the main reason the app exists, so it is worth getting right. Their months of logged
+workouts can come over completely.
+
+**Getting the file out of Just 6 Weeks:**
+
+1. Open Just 6 Weeks.
+2. Tap **Statistics** in the bottom bar.
+3. Tap the small **CSV** icon in the top-right corner.
+4. Share or save the file somewhere they can find it again — email to themselves, WhatsApp to
+   themselves, Files, AirDrop. Any of these is fine.
+
+**Putting it into GodMode:**
+
+1. Open GodMode. On first launch it offers **Bring your history across**.
+2. Tap the file picker, choose the CSV.
+3. A summary appears: sessions found, total reps, planned days, repeat attempts. If those numbers
+   look roughly like their real history, it worked.
+4. It suggests a **baseline max**. It derives this backwards from their first-ever session, and
+   it is usually right. If they remember the number they actually managed on their first test,
+   they should type that instead — it is better data.
+5. Tap **Import my history**.
+
+Afterwards the app resumes at exactly the day they were on. It does not restart them at week 1.
+
+**If the import reports skipped rows,** the summary says which lines and why. A handful of
+unreadable rows out of hundreds is not worth worrying about; everything else still imports.
+
+**If they never used Just 6 Weeks,** choose **Take a max test** instead: one rested set to
+failure, good form, enter the number, pick a goal.
+
+## Vocabulary you will need
+
+Three numbers that sound the same and are not. Getting these confused is the single easiest way
+to give someone bad advice about this app.
+
+- **Baseline / tested max** — what they can do in ONE rested set. The input to the plan.
+- **Goal** — what they want that single-set number to become. Usually 100 for push-ups.
+- **Session total** — what a day's five sets add up to. This is roughly **twice the goal**,
+  because the five sets are 37%, 47%, 37%, 33% and 51% of a moving internal number, and those
+  add up to 205%.
+
+So a goal of 100 produces a final session of about 205 reps across five sets. **This confuses
+everybody.** If someone says "it's asking me for 205, I only wanted 100", that is the answer:
+100 is the one-set goal, 205 is the day's total across five sets.
+
+Other terms:
+
+- **AMRAP** — the last set, written with a `+` (e.g. `51+`). As many as possible, at least 51.
+- **Deload** — deliberately doing an easier session. It counts as showing up, it goes in their
+  history, but it does not advance them to the next day.
+- **Attempt** — a repeat of a day they did not pass. All attempts are kept.
+
+## How passing works
+
+They must hit the **total**, not each individual set. If the day asks for 205 and they do 202,
+that day comes round again. This is intentional and it is the whole mechanism of progression —
+do not help them work around it.
+
+If they are genuinely stuck, the app itself offers to move them on after a few attempts, and
+records it honestly as a skip. That is the sanctioned escape hatch.
+
+Five possible outcomes are recorded per session: as planned, scaled up, deload, missed, moved on.
+
+## Backups — raise this unprompted
+
+The data is on their device and nowhere else. There is no server and no account, which is the
+point, but it means:
+
+- Losing the phone loses the history.
+- **iOS deletes web-app storage for sites that have not been opened in a while.** This is real
+  and it will happen to someone who takes a two-month break.
+
+Settings → **Backup** downloads a single JSON file with everything in it. Tell them to do this
+now and to keep the file somewhere that syncs — iCloud Drive, Google Drive, email to themselves.
+The same screen restores from that file.
+
+There is also a CSV export, but that is for reading their data in a spreadsheet. **The JSON
+backup is the one that can be restored.** Do not let someone believe a CSV is a backup.
+
+## Adding more exercises
+
+Not just push-ups. Settings → **Add a workout** creates another exercise with its own plan and
+its own history — sit-ups, squats, pull-ups, anything countable. When more than one exists, a
+switcher appears under the wordmark.
+
+Each workout keeps separate totals, because 3000 push-ups and 400 pull-ups are not one number.
+
+One honest caveat: the percentage table was worked out from push-up-scale data. For an exercise
+where someone starts at four or five reps, the prescribed sets come out very coarse (`2 2 2 2 3`).
+It works, but it is not tuned for that yet.
+
+## Things it deliberately does not do
+
+Do not promise these. They are absent on purpose:
+
+- No exercise illustrations or form videos — it assumes they know what a push-up is.
+- No accounts, no login, no cloud sync, no leaderboard, no social features.
+- No rep counting by camera. It is a planned direction, not a feature.
+- No German or other translations yet. The German Just 6 Weeks CSV export imports fine, but the
+  interface is English.
+
+## If something is broken
+
+- **Numbers look wrong after import** — check the baseline it guessed on the import screen.
+  Everything downstream comes from that one number.
+- **Rest timer silent** — the browser blocks audio until the page has been tapped. Tapping Start
+  is enough, so this normally resolves itself; if it does not, check the phone's mute switch.
+- **App will not load offline** — it has to be opened online once so it can cache itself, and it
+  has to be opened from the home-screen icon rather than from a browser tab.
+- **Everything is gone** — Settings → Restore, using their JSON backup. If there is no backup,
+  it is genuinely gone. This is why the backup section above is not optional.
+
+## Technical
+
+- Source and licence (AGPL-3.0): https://git.marcushorndt.de/marcushorndt/godmode
+- Stack: Vite, TypeScript, React, Tailwind, IndexedDB via `idb`. No backend of any kind.
+- Self-hosting is a static file copy: `npm ci && npm run build`, then serve `dist/` over HTTPS.
+  HTTPS is required — service workers do not run without it.
+- The progression model, including which parts were verified against real exported data and
+  which are the project's own choices, is documented in `PLAN.md` in the repository. If you are
+  asked how the numbers are derived, that file is the honest source; do not guess.
