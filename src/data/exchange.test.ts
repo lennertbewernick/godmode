@@ -243,9 +243,11 @@ describe('schema migration v1 to v2', () => {
     });
     v1.close();
 
-    // Reopening through the real opener runs the guarded v2 branch.
+    // Reopening through the real opener runs the guarded v2 branch — and every branch above
+    // it. Asserted against DB_VERSION rather than a literal, because what this test is about
+    // is that the rewrite happens on the way past, not which version it stops at.
     const migrated = await openFitnessDB(name);
-    expect(migrated.version).toBe(2);
+    expect(migrated.version).toBe(DB_VERSION);
 
     const legacy = await migrated.get('workouts', 'wo-legacy');
     expect(legacy?.importSource).toBe('incumbent-csv-v1');
@@ -267,6 +269,7 @@ describe('schema migration v1 to v2', () => {
       'performanceTests',
       'planSlots',
       'workouts',
+      'workoutDrafts',
       'settings',
     ]) {
       expect(db.objectStoreNames).toContain(store);

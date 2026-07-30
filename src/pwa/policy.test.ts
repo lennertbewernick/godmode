@@ -180,10 +180,11 @@ describe('shouldOfferUpdate', () => {
   });
 
   it('stays silent during a workout, however ready the update is', () => {
-    // Runner.tsx holds the session's `actuals` in React state and writes nothing to
-    // IndexedDB until the workout is saved. Showing a reload button mid-session invites
-    // the user to destroy reps they already did. This guard is the reason the function
-    // exists at all — it must not degrade into `return updateReady`.
+    // Runner.tsx persists a draft as the session goes, so a reload no longer costs the reps
+    // — but it still costs the session: the rest clock, the set in progress, and anything
+    // typed but not yet committed. Offering a reload mid-workout is still the wrong thing to
+    // do. This guard is the reason the function exists at all — it must not degrade into
+    // `return updateReady`.
     expect(shouldOfferUpdate({ updateReady: true, workoutInProgress: true })).toBe(false);
     expect(shouldOfferUpdate({ updateReady: false, workoutInProgress: true })).toBe(false);
   });

@@ -97,9 +97,12 @@ export function decideLocalAction(input: LocalActionInput): LocalAction {
 /**
  * May the "a newer version is ready" banner render?
  *
- * `workoutInProgress` is not a nicety. `Runner.tsx` keeps the session's `actuals` in React
- * state and writes nothing to IndexedDB until the workout is saved, so a reload started
- * mid-session throws away reps the user has already done.
+ * `workoutInProgress` still holds, for a narrower reason than it used to. `Runner.tsx` now
+ * writes a draft to IndexedDB after every completed set, so a reload mid-session no longer
+ * destroys the reps — the app offers them back on the next launch. What a reload still costs
+ * is the session itself: the running rest clock, the set you are standing in, and the reps
+ * typed but not yet committed. Interrupting someone mid-workout to install an update is a
+ * thing not to do even when it is survivable.
  */
 export function shouldOfferUpdate(input: {
   updateReady: boolean;

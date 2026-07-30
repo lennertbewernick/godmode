@@ -24,32 +24,41 @@ import type { MergePlan } from '../data/merge.js';
 import {
   countAllWorkouts,
   countAttempts,
+  deleteDraft,
   endChallenge,
   exerciseLabels,
   getCurrentSlot,
   getDB,
   getSettings,
   listActiveChallenges,
+  listDrafts,
   listSlots,
   listWorkouts,
   logWorkout,
+  newId,
   resolveSelectedChallenge,
+  saveDraft,
   saveSettings,
   startNextBlock,
 } from '../db/repo.js';
 import type {
   ChallengeRecord,
+  DatabaseConflict,
   PlanSlotRecord,
   SettingsRecord,
+  WorkoutDraftRecord,
   WorkoutRecord,
 } from '../db/schema.js';
+import { onDatabaseConflict } from '../db/schema.js';
 import { ExportSheet } from './ExportSheet.js';
 import { History } from './History.js';
 import { RestoreDialog } from './RestoreDialog.js';
 import { Runner } from './Runner.js';
+import { LeaveRunnerDialog, ResumeDialog } from './ResumeDialog.js';
 import { Settings } from './Settings.js';
 import { Today } from './Today.js';
 import { AddWorkout, Welcome } from './Welcome.js';
+import { chooseDraftOffer, draftProgress, newDraft } from './draft.js';
 import { TABS, shouldShowWorkoutBar, type Tab } from './nav.js';
 import { buildShareCard, toStatWorkouts } from './shareCardData.js';
 import { Banner, Button, Card, NumberField, Segmented, Spinner } from './kit.js';
@@ -132,6 +141,8 @@ interface State {
   exerciseLabel: string;
   /** Across every exercise and every ended chain — durability is a whole-database property. */
   totalWorkouts: number;
+  /** In-progress workouts found on this device. Normally none, or exactly one. */
+  drafts: WorkoutDraftRecord[];
 }
 
 export function App() {
@@ -139,10 +150,16 @@ export function App() {
   const [view, setView] = useState<View>(() => ({ kind: 'tab', tab: storedTab() }));
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [runConfig, setRunConfig] = useState<{
-    targets: number[];
-    adjustment: AdjustmentType;
-  } | null>(null);
+  /** The session the runner is driving. Its `id` is the id the workout will be logged under. */
+  const [run, setRun] = useState<WorkoutDraftRecord | null>(null);
+  /** A draft the user has been shown and left alone. Offering it again on every render would nag. */
+  const [dismissedDraftId, setDismissedDraftId] = useState<string | null>(null);
+  const [leavePrompt, setLeavePrompt] = useState(false);
+  /** Writing the draft is failing. The runner says so rather than promising a durability it has lost. */
+  const [draftBroken, setDraftBroken] = useState(false);
+  /** The last save attempt threw. The runner re-arms its save button on this. */
+  const [saveFailed, setSaveFailed] = useState(false);
+  const [dbConflict, setDbConflict] = useState<DatabaseConflict | null>(null);
   /**
    * A chosen backup file, read and planned but not applied. Holding the parsed file alongside
    * the plan is what lets the confirmed action work from the file itself — `mergeBackup` plans
@@ -159,11 +176,12 @@ export function App() {
   const [updateReady, setUpdateReady] = useState(false);
 
   const load = useCallback(async () => {
-    const [active, challenge, settings, totalWorkouts] = await Promise.all([
+    const [active, challenge, settings, totalWorkouts, drafts] = await Promise.all([
       listActiveChallenges(),
       resolveSelectedChallenge(),
       getSettings(),
       countAllWorkouts(),
+      listDrafts(),
     ]);
     const labels = await exerciseLabels(active);
 
@@ -179,6 +197,7 @@ export function App() {
         settings,
         exerciseLabel: '',
         totalWorkouts,
+        drafts,
       });
       return;
     }
@@ -201,6 +220,7 @@ export function App() {
       settings,
       exerciseLabel: labels.get(challenge.exerciseId) ?? 'Exercise',
       totalWorkouts,
+      drafts,
     });
   }, []);
 
@@ -213,6 +233,100 @@ export function App() {
   // Fires immediately with the current value, so an update that landed before React mounted
   // is not lost.
   useEffect(() => subscribeUpdateReady(setUpdateReady), []);
+
+  // Two tabs disagreeing about the database version. Nothing is done about it automatically —
+  // closing this tab's connection could interrupt a workout — but the user is told, because
+  // otherwise the other tab simply appears to hang on a blank screen.
+  useEffect(() => onDatabaseConflict(setDbConflict), []);
+
+  /**
+   * Is there a workout to pick back up?
+   *
+   * Computed rather than stored, so it cannot go stale behind a refresh of the app's state.
+   * Two filters do the work, and both are needed: the draft must belong to the session on
+   * screen, and its id must not already be a logged workout. The second is what actually stops
+   * a draft offering to redo finished work — see `chooseDraftOffer`.
+   */
+  const offer = useMemo(
+    () =>
+      chooseDraftOffer({
+        drafts: state?.drafts ?? [],
+        currentSlot: state?.currentSlot,
+        // A draft whose workout is already in the history describes finished work. Matching
+        // the current slot does not rule that out: a failed attempt leaves its slot current.
+        loggedWorkoutIds: new Set((state?.workouts ?? []).map((w) => w.id)),
+        nowMs: Date.now(),
+      }),
+    [state],
+  );
+
+  /**
+   * Write the in-progress workout.
+   *
+   * A failure here is reported, never thrown: the workout carries on in memory, exactly as it
+   * always used to, and the runner tells the user that closing the app would now cost them the
+   * session.
+   */
+  const persistDraft = useCallback(async (draft: WorkoutDraftRecord) => {
+    try {
+      await saveDraft(draft);
+      setDraftBroken(false);
+    } catch {
+      setDraftBroken(true);
+    }
+    // Keep the shell's copy in step with the runner's, so the "leave this workout?" dialog
+    // counts the reps that are actually on disk. Guarded on the id: a write that lands after
+    // the workout was saved must not put the session back on screen.
+    setRun((prev) => (prev !== null && prev.id === draft.id ? draft : prev));
+  }, []);
+
+  const startRun = useCallback(
+    async (targets: number[], adjustment: AdjustmentType) => {
+      if (!state?.challenge || !state.currentSlot) return;
+      // The workout's id is minted here, before a single rep is recorded, and it travels with
+      // the draft all the way to `logWorkout`. That is what makes saving idempotent.
+      const draft = newDraft({
+        id: newId('wo'),
+        challengeId: state.challenge.id,
+        chainId: state.challenge.chainId,
+        slot: state.currentSlot,
+        attemptNo: state.attemptNo,
+        effectiveTargets: targets,
+        adjustmentType: adjustment,
+        restOverrideSeconds: state.settings.restOverrideSeconds,
+        nowMs: Date.now(),
+      });
+      setDraftBroken(false);
+      setSaveFailed(false);
+      await persistDraft(draft);
+      setRun(draft);
+      setMessage(null);
+      setView({ kind: 'runner' });
+    },
+    [state, persistDraft],
+  );
+
+  const resumeRun = useCallback((draft: WorkoutDraftRecord) => {
+    setDismissedDraftId(null);
+    setDraftBroken(false);
+    setSaveFailed(false);
+    setRun(draft);
+    setMessage(null);
+    setView({ kind: 'runner' });
+  }, []);
+
+  const discardRun = useCallback(
+    async (draft: WorkoutDraftRecord) => {
+      await deleteDraft(draft.id);
+      setRun(null);
+      setLeavePrompt(false);
+      setDismissedDraftId(null);
+      setView({ kind: 'tab', tab: 'today' });
+      await load();
+      setMessage('That workout was discarded. Nothing was added to your history.');
+    },
+    [load],
+  );
 
   /**
    * The card's data, assembled from state the shell already holds. Built here rather than in
@@ -353,18 +467,40 @@ export function App() {
   }, [restorePrompt, load, goToTab]);
 
   const finishWorkout = useCallback(
-    async (performance: WorkoutPerformance, durationSeconds: number, manual = false) => {
+    async (
+      performance: WorkoutPerformance,
+      durationSeconds: number,
+      options: { manual?: boolean; workoutId?: string } = {},
+    ) => {
       if (!state?.challenge || !state.currentSlot) return;
-      const { evaluation } = await logWorkout({
-        challenge: state.challenge,
-        slot: state.currentSlot,
-        performance,
-        durationSeconds,
-        manuallyAdvance: manual,
-      });
-      setRunConfig(null);
-      goToTab('today');
-      setMessage(evaluation.reason);
+      setSaveFailed(false);
+      try {
+        // `logWorkout` deletes the draft in the same transaction that writes the workout, so
+        // there is no window in which the session exists twice or not at all. Passing the
+        // draft's id also makes a retry safe: the second attempt finds the first one's row and
+        // returns it rather than logging the session again.
+        const { evaluation } = await logWorkout({
+          challenge: state.challenge,
+          slot: state.currentSlot,
+          performance,
+          durationSeconds,
+          manuallyAdvance: options.manual === true,
+          ...(options.workoutId === undefined ? {} : { workoutId: options.workoutId }),
+        });
+        setRun(null);
+        goToTab('today');
+        setMessage(evaluation.reason);
+      } catch (e) {
+        // The runner stays where it is, with its numbers, and its save button comes back. The
+        // draft is still on the device — the failed transaction did not delete it.
+        setSaveFailed(true);
+        setError(
+          e instanceof Error
+            ? `That workout was not saved: ${e.message} Your reps are still here — try again.`
+            : 'That workout was not saved. Your reps are still here — try again.',
+        );
+        return;
+      }
       await load();
     },
     [state, load, goToTab],
@@ -381,7 +517,7 @@ export function App() {
         effectiveTotal: state.currentSlot.targetTotal,
       },
       0,
-      true,
+      { manual: true },
     );
   }, [state, finishWorkout]);
 
@@ -412,22 +548,46 @@ export function App() {
     return <Welcome onReady={() => void load()} />;
   }
 
-  if (view.kind === 'runner' && state.currentSlot && runConfig) {
+  if (view.kind === 'runner' && state.currentSlot && run) {
     return (
-      <Runner
-        slot={state.currentSlot}
-        attemptNo={state.attemptNo}
-        effectiveTargets={runConfig.targets}
-        adjustmentType={runConfig.adjustment}
-        {...(state.settings.restOverrideSeconds === undefined
-          ? {}
-          : { restOverrideSeconds: state.settings.restOverrideSeconds })}
-        onFinish={(performance, duration) => void finishWorkout(performance, duration)}
-        onCancel={() => {
-          setRunConfig(null);
-          goToTab('today');
-        }}
-      />
+      <>
+        <Runner
+          // Keyed by the workout id so resuming a different session remounts rather than
+          // reusing the previous one's frozen prescription.
+          key={run.id}
+          draft={run}
+          slot={state.currentSlot}
+          persistFailed={draftBroken}
+          saveFailed={saveFailed}
+          onPersist={(draft) => void persistDraft(draft)}
+          onFinish={(performance, duration) =>
+            void finishWorkout(performance, duration, { workoutId: run.id })
+          }
+          onCancel={() => setLeavePrompt(true)}
+        />
+        {error ? (
+          <div className="fixed inset-x-0 bottom-0 mx-auto w-full px-4 pb-4 md:max-w-lg safe-b">
+            <Banner tone="warn" onDismiss={() => setError(null)}>
+              {error}
+            </Banner>
+          </div>
+        ) : null}
+        {leavePrompt ? (
+          <LeaveRunnerDialog
+            progress={draftProgress(run)}
+            onStay={() => setLeavePrompt(false)}
+            onKeep={() => {
+              setLeavePrompt(false);
+              setRun(null);
+              // Shown once and left alone: Today's Start button brings the offer back.
+              setDismissedDraftId(run.id);
+              goToTab('today');
+              void load();
+            }}
+            onDiscard={() => void discardRun(run)}
+          />
+        ) : null}
+      </>
     );
   }
 
@@ -541,9 +701,24 @@ export function App() {
       ) : null}
 
       {/*
-        This app never reloads itself. Runner.tsx keeps the session's `actuals` in React state
-        and writes nothing until the workout is saved, so an unattended reload would silently
-        destroy reps the user has already done. The reload is always the user's tap.
+        Two tabs, two versions of the app. Nothing is closed or reloaded automatically — a
+        workout could be running in either one — so the only honest thing to do is name it.
+      */}
+      {dbConflict !== null ? (
+        <div className="pb-3">
+          <Banner tone="warn" onDismiss={() => setDbConflict(null)}>
+            {dbConflict === 'blocked'
+              ? 'This app is open in another tab on an older version. Close that tab and reload here.'
+              : 'Another tab is waiting to update this app. Close this one when you are finished.'}
+          </Banner>
+        </div>
+      ) : null}
+
+      {/*
+        This app never reloads itself. Runner.tsx now persists a draft as it goes, so a reload
+        no longer destroys the reps — but it still throws away the running session: the rest
+        clock, the set the user is standing in, and anything typed but not yet committed. The
+        reload is always the user's tap.
 
         `workoutInProgress` is passed even though this render site already sits after the
         `view.kind === 'runner'` early return, so the banner is structurally unreachable during
@@ -589,9 +764,13 @@ export function App() {
             lastMessage={message}
             onDismissMessage={() => setMessage(null)}
             onStart={(targets, adjustment) => {
-              setRunConfig({ targets, adjustment });
-              setMessage(null);
-              setView({ kind: 'runner' });
+              // An unfinished session for this very day is not something to start over
+              // silently. Put the choice back in front of the user instead.
+              if (offer.kind === 'offer') {
+                setDismissedDraftId(null);
+                return;
+              }
+              void startRun(targets, adjustment);
             }}
             onAdvanceManually={() => void advanceManually()}
             onContinueChain={() => setView({ kind: 'continue' })}
@@ -650,6 +829,22 @@ export function App() {
           ))}
         </div>
       </nav>
+
+      {/*
+        The recovered workout. Offered, never applied — and offered here, over Today, rather
+        than by dropping the user into a runner they did not ask for.
+      */}
+      {offer.kind === 'offer' && offer.draft.id !== dismissedDraftId && !restorePrompt ? (
+        <ResumeDialog
+          draft={offer.draft}
+          progress={offer.progress}
+          stale={offer.stale}
+          nowMs={Date.now()}
+          onResume={() => resumeRun(offer.draft)}
+          onDiscard={() => void discardRun(offer.draft)}
+          onDismiss={() => setDismissedDraftId(offer.draft.id)}
+        />
+      ) : null}
 
       {restorePrompt ? (
         <RestoreDialog
@@ -805,6 +1000,7 @@ async function wipeAll(): Promise<void> {
     'performanceTests',
     'planSlots',
     'workouts',
+    'workoutDrafts',
     'settings',
   ] as const;
   const tx = db.transaction(stores, 'readwrite');

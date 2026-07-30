@@ -25,6 +25,7 @@ import type {
   WorkoutPerformance,
 } from '../core/types.js';
 import {
+  DB_NAME,
   DEFAULT_SETTINGS,
   KCAL_ESTIMATOR_VERSION,
   openFitnessDB,
@@ -33,6 +34,7 @@ import {
   type ExerciseRecord,
   type PlanSlotRecord,
   type SettingsRecord,
+  type WorkoutDraftRecord,
   type WorkoutRecord,
 } from './schema.js';
 
@@ -45,7 +47,13 @@ const nowIso = () => new Date().toISOString();
 let dbPromise: Promise<Database> | null = null;
 
 export function getDB(): Promise<Database> {
-  dbPromise ??= openFitnessDB();
+  // The handle is cached, so a connection the browser kills would otherwise poison every
+  // later call. Dropping it here means the next call opens a fresh one instead.
+  dbPromise ??= openFitnessDB(DB_NAME, {
+    onTerminated: () => {
+      dbPromise = null;
+    },
+  });
   return dbPromise;
 }
 
@@ -466,6 +474,112 @@ export function estimateKcal(
   return Math.round(totalReps * bodyweightKg * coefficient);
 }
 
+// ── Workout drafts (the in-progress workout buffer) ─────────────────────────────
+
+/**
+ * Ids this tab has deliberately thrown away.
+ *
+ * A discard has to survive the writes that are still in flight when it happens. The runner
+ * debounces rep edits, and its own unmount flushes whatever is pending — so discarding while
+ * an edit was inside its debounce window used to delete the draft and then immediately write
+ * it back, while the screen said it was gone.
+ *
+ * Per tab and per page load, deliberately: it is a record of a decision made in this session,
+ * not persisted state. Another tab is stopped by the durable checks in `saveDraft` instead.
+ */
+const discardedDrafts = new Set<string>();
+
+/**
+ * Test seam — forget this tab's discards.
+ *
+ * Standing in for a *second tab*, which has its own module state and therefore knows nothing
+ * about what this one threw away. It is what lets a test show that the durable checks below
+ * hold on their own, rather than being masked by the in-memory set.
+ */
+export function __forgetDiscardedDrafts(): void {
+  discardedDrafts.clear();
+}
+
+export type SaveDraftResult =
+  | 'saved'
+  /** The workout was already logged, or the draft was discarded. Writing it back would resurrect it. */
+  | 'refused-gone'
+  /** Something further along is already stored — another tab. Overwriting would lose sets. */
+  | 'refused-stale';
+
+/** Sets with a completed stamp. The measure of how far a draft has actually got. */
+function completedSets(draft: WorkoutDraftRecord): number {
+  return draft.stamps.reduce<number>((n, stamp) => (stamp === null ? n : n + 1), 0);
+}
+
+/**
+ * Write the in-progress workout.
+ *
+ * Called after every material action in the runner, so it is a whole-record `put`: a
+ * read-modify-write of the runner's own state would race the next tap of the stepper.
+ *
+ * It is not an unconditional `put`, though, and the two conditions are the difference between
+ * a buffer and a liability. Both are checked inside the transaction that does the writing,
+ * because the thing they are defending against is another tab:
+ *
+ *   - a draft whose workout is already in the history is never written back. Otherwise a
+ *     second tab still holding the session could recreate the draft after `logWorkout` deleted
+ *     it, and the app would offer to redo a workout that is already saved.
+ *   - a draft that has completed fewer sets than the one already stored is never written
+ *     either. Last-writer-wins across two tabs would otherwise let a stale one erase sets the
+ *     other had recorded. Rep counts within the same set still go to the last writer; that is
+ *     a genuine conflict and this layer does not pretend to resolve it.
+ */
+export async function saveDraft(draft: WorkoutDraftRecord): Promise<SaveDraftResult> {
+  if (discardedDrafts.has(draft.id)) return 'refused-gone';
+
+  const db = await getDB();
+  const tx = db.transaction(['workouts', 'workoutDrafts'], 'readwrite');
+  const drafts = tx.objectStore('workoutDrafts');
+
+  const [logged, stored] = await Promise.all([
+    tx.objectStore('workouts').get(draft.id),
+    drafts.get(draft.id),
+  ]);
+
+  if (logged) {
+    await tx.done;
+    return 'refused-gone';
+  }
+  if (stored && completedSets(stored) > completedSets(draft)) {
+    await tx.done;
+    return 'refused-stale';
+  }
+
+  await Promise.all([drafts.put(draft), tx.done]);
+  return 'saved';
+}
+
+/** Every draft on the device. There is normally at most one; see `chooseDraftOffer`. */
+export async function listDrafts(): Promise<WorkoutDraftRecord[]> {
+  const db = await getDB();
+  return db.getAll('workoutDrafts');
+}
+
+export async function getDraft(id: string): Promise<WorkoutDraftRecord | undefined> {
+  const db = await getDB();
+  return db.get('workoutDrafts', id);
+}
+
+/**
+ * Throw a draft away. Idempotent: deleting a key that is not there is a no-op in IndexedDB, so
+ * a double tap, a retry after a failed save, and a draft already cleared by `logWorkout` all
+ * behave the same.
+ *
+ * The id is recorded before anything is awaited, so a write already queued behind this call
+ * cannot land after it and undo it.
+ */
+export async function deleteDraft(id: string): Promise<void> {
+  discardedDrafts.add(id);
+  const db = await getDB();
+  await db.delete('workoutDrafts', id);
+}
+
 export interface LogWorkoutInput {
   challenge: ChallengeRecord;
   slot: PlanSlotRecord;
@@ -475,11 +589,21 @@ export interface LogWorkoutInput {
   manuallyAdvance?: boolean;
   performedAt?: string;
   note?: string;
+  /**
+   * The id this workout was promised when it started — the draft's id.
+   *
+   * Supplying it makes this call idempotent: a second save of the same session finds the first
+   * one already there and returns it untouched, instead of writing a duplicate and counting a
+   * second attempt. Omit it and an id is minted here, exactly as before.
+   */
+  workoutId?: string;
 }
 
 export async function logWorkout(input: LogWorkoutInput): Promise<{
   workout: WorkoutRecord;
   evaluation: EvaluationResult;
+  /** False when this exact workout id was already stored and nothing was written. */
+  written: boolean;
 }> {
   const db = await getDB();
   const spec: PlanSlotSpec = {
@@ -504,15 +628,39 @@ export async function logWorkout(input: LogWorkoutInput): Promise<{
   // Everything below happens inside one transaction. The attempt number used to be read
   // before it opened, so two tabs — or one impatient double-tap — could both read "2 attempts"
   // and both write attempt 3.
-  const tx = db.transaction(['workouts', 'planSlots'], 'readwrite');
+  //
+  // The draft is deleted here too, in the same transaction as the workout it became. Any other
+  // arrangement has a window: delete first and a failed insert loses the session; insert first
+  // and a crash before the delete leaves a draft offering to redo a workout already in the
+  // history.
+  const tx = db.transaction(['workouts', 'planSlots', 'workoutDrafts'], 'readwrite');
   const workoutsStore = tx.objectStore('workouts');
   const slotsStore = tx.objectStore('planSlots');
+  const draftsStore = tx.objectStore('workoutDrafts');
+
+  const workoutId = input.workoutId ?? newId('wo');
+
+  // Idempotency, checked inside the transaction so two tabs cannot both pass it. A workout
+  // already under this id is the same session saved twice — the second save returns the first
+  // one's result and writes nothing. Overwriting instead would renumber the attempt and could
+  // ratchet a slot on the strength of a duplicate.
+  const alreadyStored = await workoutsStore.get(workoutId);
+  if (alreadyStored) {
+    const draftKeys = await draftsStore.index('bySlot').getAllKeys(input.slot.id);
+    for (const key of draftKeys) discardedDrafts.add(key);
+    await Promise.all([...draftKeys.map((key) => draftsStore.delete(key)), tx.done]);
+    return {
+      workout: alreadyStored,
+      evaluation: alreadyStored.evaluation ?? evaluation,
+      written: false,
+    };
+  }
 
   const existingAttempts = await workoutsStore.index('bySlot').getAll(input.slot.id);
   const attemptNo = existingAttempts.length + 1;
 
   const workout: WorkoutRecord = {
-    id: newId('wo'),
+    id: workoutId,
     challengeId: input.challenge.id,
     chainId: input.challenge.chainId,
     planSlotId: input.slot.id,
@@ -550,14 +698,23 @@ export async function logWorkout(input: LogWorkoutInput): Promise<{
   const nextStatus =
     storedSlot.status === 'completed' || evaluation.advances ? 'completed' : 'attempted';
 
+  // Every draft for this slot, not only the one whose id we were given: a session abandoned
+  // without a decision and then redone leaves an older draft behind, and it describes work that
+  // is now in the history under a different id.
+  const draftKeys = await draftsStore.index('bySlot').getAllKeys(input.slot.id);
+  // Tombstoned as well as deleted: a debounced write from this tab that is still on its way
+  // must not put back a draft whose workout is now in the history.
+  for (const key of draftKeys) discardedDrafts.add(key);
+
   await Promise.all([
     workoutsStore.put(workout),
     // The slot record itself is never edited beyond its lifecycle status.
     slotsStore.put({ ...storedSlot, status: nextStatus }),
+    ...draftKeys.map((key) => draftsStore.delete(key)),
     tx.done,
   ]);
 
-  return { workout, evaluation };
+  return { workout, evaluation, written: true };
 }
 
 /** Insert an imported workout, which may be unlinked from any generated slot. */

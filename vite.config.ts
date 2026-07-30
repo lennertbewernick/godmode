@@ -76,8 +76,9 @@ export default defineConfig(({ mode }) => {
          * Under 'autoUpdate' the plugin sets skipWaiting + clientsClaim, so a new worker takes
          * over a live page on its own schedule, and the plugin's own register client calls
          * window.location.reload() on activation with no idea whether a workout is running.
-         * Runner.tsx holds the session's reps in React state until the workout is saved, so
-         * that reload silently destroys them. Under 'prompt' the new worker waits until the app
+         * Runner.tsx persists a draft as it goes, so such a reload no longer destroys the reps
+         * — but it still throws away the live session, and it does it without asking. Under
+         * 'prompt' the new worker waits until the app
          * asks — which only happens on the user's tap — so the guard is structural.
          */
         registerType: 'prompt',

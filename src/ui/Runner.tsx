@@ -7,77 +7,219 @@
  *
  * Per-set start/end timestamps are recorded (RUN-06), which the incumbent never did — it
  * stored one aggregate duration, which is exactly why its rest behaviour had to be guessed.
+ *
+ * Everything the session knows is written to IndexedDB as it happens. It used to live in React
+ * state and refs until the workout was saved, which meant a killed tab, a crashed browser, an
+ * iOS reclaim of the PWA or a service-worker activation threw away every rep already done. The
+ * component now runs off a draft record: it is handed one, it edits it, and it hands each
+ * version back through `onPersist`. What the user was prescribed — targets, AMRAP flags, rest —
+ * is read from that record and never re-read from the slot, so nothing can change underneath a
+ * session that is already under way.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatClock } from '../core/stats.js';
-import type { AdjustmentType, PerformedSet, WorkoutPerformance } from '../core/types.js';
-import type { PlanSlotRecord } from '../db/schema.js';
+import type { PerformedSet, WorkoutPerformance } from '../core/types.js';
+import type {
+  DraftSetStamp,
+  PlanSlotRecord,
+  RunnerPhase,
+  WorkoutDraftRecord,
+} from '../db/schema.js';
 import { cueForSecondsLeft, playCue } from './cues.js';
+import { restLeftSeconds } from './draft.js';
 import { Banner, Button, Card, SetRow } from './kit.js';
-
-type Phase = 'set' | 'rest' | 'review';
 
 /** Seconds remaining at which the clock starts warning, then counting. */
 const WARN_AT = 10;
 const COUNT_FROM = 5;
 
+/**
+ * How long a rep edit sits before it is written.
+ *
+ * Holding the `+` on an AMRAP set produces a tap every few tens of milliseconds and each one
+ * would otherwise be a transaction. A completed set is never debounced — see `completeSet`.
+ */
+const REP_DEBOUNCE_MS = 400;
+
+/** The part of a draft the runner actually changes. The rest is the frozen prescription. */
+interface SessionState {
+  actuals: number[];
+  stamps: (DraftSetStamp | null)[];
+  index: number;
+  phase: RunnerPhase;
+  restTotalSeconds: number;
+  restEndsAt: string | null;
+  setStartedAt: string;
+}
+
 export interface RunnerProps {
+  /**
+   * The session, fresh or recovered. Its snapshot fields are captured on mount and never read
+   * again, so a re-render with a rebuilt object cannot rewrite a workout in progress.
+   */
+  draft: WorkoutDraftRecord;
+  /** Display context only — the week/day heading. Nothing prescriptive is taken from here. */
   slot: PlanSlotRecord;
-  attemptNo: number;
-  /** Effective targets for this attempt, after any adjustment. */
-  effectiveTargets: number[];
-  adjustmentType: AdjustmentType;
-  restOverrideSeconds?: number;
+  /** Set when writing the draft has been failing, so the runner can stop promising durability. */
+  persistFailed?: boolean;
+  /** The last save threw. Brings the save button back rather than stranding a finished workout. */
+  saveFailed?: boolean;
+  onPersist: (draft: WorkoutDraftRecord) => void;
   onFinish: (performance: WorkoutPerformance, durationSeconds: number) => void;
   onCancel: () => void;
 }
 
 export function Runner({
+  draft,
   slot,
-  attemptNo,
-  effectiveTargets,
-  adjustmentType,
-  restOverrideSeconds,
+  persistFailed = false,
+  saveFailed = false,
+  onPersist,
   onFinish,
   onCancel,
 }: RunnerProps) {
+  // The prescription, frozen at mount. `draft` is a prop, and a prop can be replaced; the
+  // numbers this session is judged against cannot.
+  const base = useRef(draft).current;
+  const effectiveTargets = base.effectiveTargets;
+  const amrapFlags = base.amrapFlags;
   const setCount = effectiveTargets.length;
-  const baseRest = restOverrideSeconds ?? slot.restSeconds;
 
-  const [index, setIndex] = useState(0);
-  const [phase, setPhase] = useState<Phase>('set');
-  const [actuals, setActuals] = useState<number[]>(() => [...effectiveTargets]);
-  const [restLeft, setRestLeft] = useState(baseRest);
-  const [restTotal, setRestTotal] = useState(baseRest);
+  const [session, setSession] = useState<SessionState>(() => ({
+    actuals: [...draft.actuals],
+    stamps: [...draft.stamps],
+    index: draft.index,
+    phase: draft.phase,
+    restTotalSeconds: draft.restTotalSeconds,
+    restEndsAt: draft.restEndsAt,
+    setStartedAt: draft.setStartedAt,
+  }));
+  // A rest that expired while the app was gone comes back at zero and drops straight into the
+  // set, because that is what happened.
+  const [restLeft, setRestLeft] = useState(() => restLeftSeconds(draft, Date.now()));
+  const [saving, setSaving] = useState(false);
 
-  const startedAt = useRef(Date.now());
-  const setStartedAt = useRef(Date.now());
-  const stamps = useRef<{ startedAt: string; endedAt: string }[]>([]);
+  const sessionRef = useRef(session);
+  const onPersistRef = useRef(onPersist);
+  useEffect(() => {
+    onPersistRef.current = onPersist;
+  }, [onPersist]);
 
-  const amrapFlags = useMemo(() => slot.targets.map((t) => t.isAmrap), [slot.targets]);
-  const isAmrap = amrapFlags[index] === true;
-  const target = effectiveTargets[index] ?? 0;
+  const timerRef = useRef<number | null>(null);
+  const pendingRef = useRef<WorkoutDraftRecord | null>(null);
+  // Once the workout is saved the draft is deleted inside the same transaction. A debounced
+  // write landing after that would put it straight back, and the app would offer to redo a
+  // session already in the history.
+  const finishedRef = useRef(false);
+
+  const compose = useCallback(
+    (next: SessionState): WorkoutDraftRecord => ({
+      ...base,
+      ...next,
+      updatedAt: new Date().toISOString(),
+    }),
+    [base],
+  );
+
+  const cancelPending = useCallback(() => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    pendingRef.current = null;
+  }, []);
+
+  /**
+   * Advance the session and write it.
+   *
+   * `immediate` is the default for everything that represents work done or a decision taken.
+   * Only rep edits wait, and only for as long as it takes the user to stop tapping.
+   */
+  const apply = useCallback(
+    (patch: Partial<SessionState>, { immediate = true }: { immediate?: boolean } = {}) => {
+      const next = { ...sessionRef.current, ...patch };
+      sessionRef.current = next;
+      setSession(next);
+
+      if (finishedRef.current) return;
+      const record = compose(next);
+      cancelPending();
+      if (immediate) {
+        onPersistRef.current(record);
+        return;
+      }
+      pendingRef.current = record;
+      timerRef.current = window.setTimeout(() => {
+        timerRef.current = null;
+        const queued = pendingRef.current;
+        pendingRef.current = null;
+        if (queued && !finishedRef.current) onPersistRef.current(queued);
+      }, REP_DEBOUNCE_MS);
+    },
+    [compose, cancelPending],
+  );
+
+  // A save that threw wrote nothing and deleted nothing: the draft is still on the device and
+  // the session is still on screen. Re-arm, so the user can press the button again instead of
+  // staring at a greyed-out one holding the only copy of their workout.
+  useEffect(() => {
+    if (!saveFailed) return;
+    finishedRef.current = false;
+    setSaving(false);
+  }, [saveFailed]);
+
+  /** Write anything the debounce is still holding. */
+  const flush = useCallback(() => {
+    const queued = pendingRef.current;
+    cancelPending();
+    if (queued && !finishedRef.current) onPersistRef.current(queued);
+  }, [cancelPending]);
+
+  // The tab going away is exactly the case this whole file exists for, and it is the one moment
+  // a 400ms debounce is too long. `pagehide` fires on an iOS home-screen app being backgrounded,
+  // where `beforeunload` does not.
+  useEffect(() => {
+    const onHide = () => flush();
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') flush();
+    };
+    window.addEventListener('pagehide', onHide);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('pagehide', onHide);
+      document.removeEventListener('visibilitychange', onVisibility);
+      // Leaving the runner without saving — Cancel, or a re-render that unmounts it — still
+      // keeps the reps. Unless the workout was saved, in which case the draft is already gone.
+      flush();
+    };
+  }, [flush]);
+
+  const isAmrap = amrapFlags[session.index] === true;
+  const target = effectiveTargets[session.index] ?? 0;
 
   // Rest countdown. A self-rescheduling timeout keyed on the remaining seconds, rather than
   // one long-lived interval, so ±15s takes effect on the very next tick and the value that
   // drives the cues is always the value on screen.
+  //
+  // The countdown itself is never persisted: the draft stores the instant rest ends, so a
+  // ticking clock would be a write a second for no information the deadline does not already
+  // carry.
   useEffect(() => {
-    if (phase !== 'rest') return;
+    if (session.phase !== 'rest') return;
     if (restLeft <= 0) {
-      setPhase('set');
-      setStartedAt.current = Date.now();
+      apply({ phase: 'set', setStartedAt: new Date().toISOString(), restEndsAt: null });
       return;
     }
     const timer = window.setTimeout(() => setRestLeft((left) => left - 1), 1000);
     return () => window.clearTimeout(timer);
-  }, [phase, restLeft]);
+  }, [session.phase, restLeft, apply]);
 
   // Cues follow the displayed second. Sounding them here rather than inside the countdown's
   // state updater keeps the updater pure, so React re-invoking it never double-beeps.
   const lastCuedAt = useRef<number | null>(null);
   useEffect(() => {
-    if (phase !== 'rest') {
+    if (session.phase !== 'rest') {
       lastCuedAt.current = null;
       return;
     }
@@ -85,56 +227,113 @@ export function Runner({
     lastCuedAt.current = restLeft;
     const cue = cueForSecondsLeft(restLeft);
     if (cue) playCue(cue);
-  }, [phase, restLeft]);
+  }, [session.phase, restLeft]);
 
-  const setActual = useCallback((value: number) => {
-    setActuals((prev) => {
-      const next = [...prev];
-      next[index] = Math.max(0, value);
-      return next;
-    });
-  }, [index]);
+  const setActual = useCallback(
+    (value: number) => {
+      const actuals = [...sessionRef.current.actuals];
+      actuals[sessionRef.current.index] = Math.max(0, value);
+      apply({ actuals }, { immediate: false });
+    },
+    [apply],
+  );
 
   const completeSet = useCallback(() => {
-    const endedAt = new Date().toISOString();
-    stamps.current[index] = {
-      startedAt: new Date(setStartedAt.current).toISOString(),
-      endedAt,
+    const now = Date.now();
+    const current = sessionRef.current;
+    const stamps = [...current.stamps];
+    stamps[current.index] = {
+      startedAt: current.setStartedAt,
+      endedAt: new Date(now).toISOString(),
     };
 
-    if (index + 1 >= setCount) {
-      setPhase('review');
+    // A finished set is durable before anything else happens. This is the write the whole
+    // mechanism exists for.
+    if (current.index + 1 >= setCount) {
+      apply({ stamps, phase: 'review' });
       return;
     }
-    const nextRest = slot.targets[index]?.restAfterSeconds ?? baseRest;
-    const rest = restOverrideSeconds ?? nextRest;
-    setRestTotal(rest);
+
+    const rest = base.restSecondsPerSet[current.index] ?? 0;
     setRestLeft(rest);
-    setIndex(index + 1);
-    setPhase(rest > 0 ? 'rest' : 'set');
-    if (rest <= 0) setStartedAt.current = Date.now();
-  }, [index, setCount, slot.targets, baseRest, restOverrideSeconds]);
+    apply({
+      stamps,
+      index: current.index + 1,
+      phase: rest > 0 ? 'rest' : 'set',
+      restTotalSeconds: rest,
+      restEndsAt: rest > 0 ? new Date(now + rest * 1000).toISOString() : null,
+      setStartedAt: new Date(now).toISOString(),
+    });
+  }, [apply, base.restSecondsPerSet, setCount]);
+
+  const adjustRest = useCallback(
+    (delta: number) => {
+      const current = sessionRef.current;
+      const left = Math.max(0, restLeft + delta);
+      setRestLeft(left);
+      apply({
+        restTotalSeconds: Math.max(1, current.restTotalSeconds + delta),
+        restEndsAt: new Date(Date.now() + left * 1000).toISOString(),
+      });
+    },
+    [apply, restLeft],
+  );
+
+  const skipRest = useCallback(() => {
+    setRestLeft(0);
+    apply({ phase: 'set', restEndsAt: null, setStartedAt: new Date().toISOString() });
+  }, [apply]);
+
+  const editActual = useCallback(
+    (i: number, value: number) => {
+      const actuals = [...sessionRef.current.actuals];
+      actuals[i] = Math.max(0, value);
+      apply({ actuals }, { immediate: false });
+    },
+    [apply],
+  );
 
   const finish = useCallback(() => {
-    const sets: PerformedSet[] = actuals.map((actual, i) => ({
-      index: i + 1,
-      effectiveTarget: effectiveTargets[i] ?? 0,
-      actual,
-      ...(stamps.current[i] === undefined
-        ? {}
-        : { startedAt: stamps.current[i]!.startedAt, endedAt: stamps.current[i]!.endedAt }),
-    }));
-    const actualTotal = actuals.reduce((s, n) => s + n, 0);
+    if (finishedRef.current) return;
+    const current = sessionRef.current;
+    const sets: PerformedSet[] = current.actuals.map((actual, i) => {
+      const stamp = current.stamps[i];
+      return {
+        index: i + 1,
+        effectiveTarget: effectiveTargets[i] ?? 0,
+        actual,
+        ...(stamp === null || stamp === undefined
+          ? {}
+          : { startedAt: stamp.startedAt, endedAt: stamp.endedAt }),
+      };
+    });
+    const actualTotal = current.actuals.reduce((s, n) => s + n, 0);
     const effectiveTotal = effectiveTargets.reduce((s, n) => s + n, 0);
-    onFinish(
-      { sets, actualTotal, adjustmentType, effectiveTotal },
-      Math.round((Date.now() - startedAt.current) / 1000),
-    );
-  }, [actuals, effectiveTargets, adjustmentType, onFinish]);
 
-  const runningTotal = actuals
-    .slice(0, phase === 'review' ? setCount : index)
-    .reduce((s, n) => s + n, 0);
+    // Write whatever the debounce is still holding BEFORE sealing. A correction made on the
+    // review screen and saved within 400ms would otherwise be in the workout being handed over
+    // but not in the draft — and if the save then failed and the tab died, the draft offered on
+    // the next launch would be missing an edit the user had made and been told was safe.
+    flush();
+
+    // From here the draft must not be written again: the save deletes it.
+    finishedRef.current = true;
+    cancelPending();
+    setSaving(true);
+
+    onFinish(
+      { sets, actualTotal, adjustmentType: base.adjustmentType, effectiveTotal },
+      Math.max(0, Math.round((Date.now() - Date.parse(base.startedAt)) / 1000)),
+    );
+  }, [effectiveTargets, base.adjustmentType, base.startedAt, cancelPending, flush, onFinish]);
+
+  const runningTotal = useMemo(
+    () =>
+      session.actuals
+        .slice(0, session.phase === 'review' ? setCount : session.index)
+        .reduce((s, n) => s + n, 0),
+    [session.actuals, session.phase, session.index, setCount],
+  );
 
   return (
     <div className="mx-auto flex min-h-screen w-full flex-col px-4 md:max-w-lg safe-t safe-b">
@@ -144,10 +343,10 @@ export function Runner({
             {slot.week !== undefined && slot.day !== undefined
               ? `Week ${slot.week} · Day ${slot.day}`
               : (slot.cycleLabel ?? `Session ${slot.ordinal}`)}
-            {attemptNo > 1 ? ` · attempt ${attemptNo}` : ''}
+            {base.attemptNo > 1 ? ` · attempt ${base.attemptNo}` : ''}
           </div>
           <div className="tnum text-xs text-slate-500">
-            target {slot.targetTotal} · running {runningTotal}
+            target {base.targetTotal} · running {runningTotal}
           </div>
         </div>
         <Button variant="subtle" onClick={onCancel}>
@@ -155,56 +354,57 @@ export function Runner({
         </Button>
       </header>
 
+      {/*
+        Said plainly rather than swallowed. If the draft cannot be written, this session is back
+        to living in memory, and the user is the only one who can decide what to do about it.
+      */}
+      {persistFailed ? (
+        <div className="pb-3">
+          <Banner tone="warn">
+            This device is not saving your progress right now. Finish and save the workout
+            without closing the app.
+          </Banner>
+        </div>
+      ) : null}
+
       <SetRow
         reps={effectiveTargets}
         amrapFlags={amrapFlags}
-        activeIndex={phase === 'review' ? undefined : index}
+        activeIndex={session.phase === 'review' ? undefined : session.index}
         className="pb-4"
       />
 
-      {phase === 'rest' ? (
+      {session.phase === 'rest' ? (
         <RestPanel
           left={restLeft}
-          total={restTotal}
+          total={session.restTotalSeconds}
           nextTarget={target}
           nextIsAmrap={isAmrap}
-          onAdjust={(delta) => {
-            setRestLeft((l) => Math.max(0, l + delta));
-            setRestTotal((t) => Math.max(1, t + delta));
-          }}
-          onSkip={() => {
-            setPhase('set');
-            setStartedAt.current = Date.now();
-            setRestLeft(0);
-          }}
+          onAdjust={adjustRest}
+          onSkip={skipRest}
         />
       ) : null}
 
-      {phase === 'set' ? (
+      {session.phase === 'set' ? (
         <SetPanel
-          setNumber={index + 1}
+          setNumber={session.index + 1}
           setCount={setCount}
           target={target}
           isAmrap={isAmrap}
-          actual={actuals[index] ?? 0}
+          actual={session.actuals[session.index] ?? 0}
           onChange={setActual}
           onDone={completeSet}
         />
       ) : null}
 
-      {phase === 'review' ? (
+      {session.phase === 'review' ? (
         <ReviewPanel
           effectiveTargets={effectiveTargets}
           amrapFlags={amrapFlags}
-          actuals={actuals}
-          targetTotal={slot.targetTotal}
-          onEdit={(i, v) =>
-            setActuals((prev) => {
-              const next = [...prev];
-              next[i] = Math.max(0, v);
-              return next;
-            })
-          }
+          actuals={session.actuals}
+          targetTotal={base.targetTotal}
+          saving={saving}
+          onEdit={editActual}
           onSave={finish}
         />
       ) : null}
@@ -372,6 +572,7 @@ function ReviewPanel({
   amrapFlags,
   actuals,
   targetTotal,
+  saving,
   onEdit,
   onSave,
 }: {
@@ -379,6 +580,7 @@ function ReviewPanel({
   amrapFlags: boolean[];
   actuals: number[];
   targetTotal: number;
+  saving: boolean;
   onEdit: (index: number, value: number) => void;
   onSave: () => void;
 }) {
@@ -431,8 +633,10 @@ function ReviewPanel({
 
       <Banner tone="info">Correct anything you mis-tapped before saving.</Banner>
 
-      <Button onClick={onSave} className="w-full">
-        Save workout
+      {/* Disabled the moment it is pressed: the save is a transaction, and a second press
+          while it is in flight is one the user did not mean to make. */}
+      <Button onClick={onSave} className="w-full" disabled={saving}>
+        {saving ? 'Saving…' : 'Save workout'}
       </Button>
     </Card>
   );

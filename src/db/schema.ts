@@ -36,9 +36,10 @@ export const DB_NAME = 'fitness-companion';
  * applies to some users.
  *
  * v1 created the stores. v2 normalised the persisted import-profile id after the profile was
- * renamed (see `canonicalProfileId` in `src/import/profiles.ts`).
+ * renamed (see `canonicalProfileId` in `src/import/profiles.ts`). v3 added `workoutDrafts`,
+ * the in-progress workout buffer.
  */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 export interface ExerciseRecord {
   id: string;
@@ -131,6 +132,80 @@ export interface WorkoutRecord {
   importSource?: string;
 }
 
+/** The runner's three phases. Persisted, so it lives with the record rather than in the view. */
+export type RunnerPhase = 'set' | 'rest' | 'review';
+
+export interface DraftSetStamp {
+  startedAt: string;
+  endedAt: string;
+}
+
+/**
+ * Format version of `WorkoutDraftRecord` itself, independent of `DB_VERSION`.
+ *
+ * A draft is written by one build and read by the next — a service-worker update can land
+ * between the two. `DB_VERSION` cannot express that: the store does not change shape when the
+ * record does. So the reader checks this integer and simply declines to resume a draft it does
+ * not understand, rather than reconstructing a workout from fields it is guessing at.
+ */
+export const WORKOUT_DRAFT_VERSION = 1;
+
+/**
+ * A workout that has been started and not yet logged.
+ *
+ * This is a write-ahead buffer, not history. It exists because `Runner.tsx` used to hold the
+ * whole session in React state: a crashed tab, an iOS reclaim of the PWA, or a service-worker
+ * activation destroyed every rep the user had already done.
+ *
+ * Two properties are load-bearing:
+ *
+ *   - `id` is the id the workout will be given when it is logged. Generating it up front makes
+ *     saving idempotent — the same draft finished twice writes one workout — and it is the
+ *     idempotency key the server command will carry later.
+ *   - everything from `effectiveTargets` to `restSecondsPerSet` is an IMMUTABLE snapshot taken
+ *     when the session started. The plan slot, the rest override in settings, even the
+ *     challenge can change underneath a session that is already in progress; a resumed workout
+ *     must finish against the prescription its user was actually shown.
+ */
+export interface WorkoutDraftRecord {
+  id: string;
+  draftVersion: number;
+  challengeId: string;
+  chainId: string;
+  planSlotId: string;
+  /** Display only. The authoritative attempt number is counted inside `logWorkout`'s transaction. */
+  attemptNo: number;
+  /** Snapshot: prescribed reps per set, after any adjustment the user made before starting. */
+  effectiveTargets: number[];
+  /** Snapshot: which of those sets are open-ended. */
+  amrapFlags: boolean[];
+  /** Snapshot: the slot's prescribed total, for the review screen's shortfall line. */
+  targetTotal: number;
+  /** Snapshot: resolved rest after each set, with any settings override already applied. */
+  restSecondsPerSet: number[];
+  adjustmentType: AdjustmentType;
+  /** Reps recorded so far. Pre-filled with the targets, exactly as the runner does. */
+  actuals: number[];
+  /** Per-set stamps. `null` until that set is completed — never a sparse array, which does not survive a structured clone intact. */
+  stamps: (DraftSetStamp | null)[];
+  /** Index of the set being performed or rested before. */
+  index: number;
+  phase: RunnerPhase;
+  restTotalSeconds: number;
+  /**
+   * When the current rest ends, as an absolute instant — not a countdown.
+   *
+   * A countdown would have to be written once a second to stay true, which is a write per
+   * second for the length of every rest. A deadline is written only when rest starts, is
+   * adjusted, or is skipped, and a resumed session computes what is left from the clock.
+   */
+  restEndsAt: string | null;
+  /** Start of the set currently in progress, so a resumed set still has an honest stamp. */
+  setStartedAt: string;
+  startedAt: string;
+  updatedAt: string;
+}
+
 export interface SettingsRecord {
   id: 'settings';
   bodyweightKg?: number | undefined;
@@ -173,13 +248,89 @@ export interface FitnessDB extends DBSchema {
     value: WorkoutRecord;
     indexes: { byChallenge: string; bySlot: string; byChain: string; byPerformedAt: string };
   };
+  workoutDrafts: {
+    key: string;
+    value: WorkoutDraftRecord;
+    indexes: { bySlot: string };
+  };
   settings: { key: string; value: SettingsRecord };
 }
 
 export type Database = IDBPDatabase<FitnessDB>;
 
-export function openFitnessDB(name = DB_NAME): Promise<Database> {
+/**
+ * Two connections to the same database disagreeing about its version.
+ *
+ * `blocked`  — this tab wants to upgrade and an older connection is holding the database open.
+ * `blocking` — this tab holds the old connection and another one is waiting to upgrade.
+ */
+export type DatabaseConflict = 'blocked' | 'blocking';
+
+type ConflictListener = (kind: DatabaseConflict) => void;
+
+const conflictListeners = new Set<ConflictListener>();
+
+/** Subscribe to version conflicts so the UI can say what is happening. Returns an unsubscribe. */
+export function onDatabaseConflict(listener: ConflictListener): () => void {
+  conflictListeners.add(listener);
+  return () => conflictListeners.delete(listener);
+}
+
+function reportConflict(kind: DatabaseConflict): void {
+  for (const listener of conflictListeners) listener(kind);
+}
+
+export interface OpenOptions {
+  /**
+   * The connection died under us. The caller caches its handle, and every call on a dead one
+   * rejects forever, so it needs telling to throw the handle away rather than keep using it.
+   */
+  onTerminated?: () => void;
+}
+
+export function openFitnessDB(name = DB_NAME, options: OpenOptions = {}): Promise<Database> {
   return openDB<FitnessDB>(name, DB_VERSION, {
+    /**
+     * Another tab is still on the old version, so this tab's upgrade cannot start. The open
+     * promise stays pending until that tab closes its connection; saying so is all we can
+     * usefully do.
+     */
+    blocked() {
+      console.warn(
+        '[fitness-db] Another tab has this app open on an older version. This one cannot ' +
+          'finish updating until that tab is closed.',
+      );
+      reportConflict('blocked');
+    },
+
+    /**
+     * This tab holds the connection another tab is waiting on.
+     *
+     * We deliberately do NOT `db.close()` here, and never reload. A workout may be in progress
+     * in this tab, and closing the connection out from under it would break exactly the writes
+     * that exist to protect it. The other tab waits; the user is told why.
+     */
+    blocking() {
+      console.warn(
+        '[fitness-db] Another tab is waiting to update this app. This tab keeps its ' +
+          'connection so an in-progress workout is not interrupted — close it when you are done.',
+      );
+      reportConflict('blocking');
+    },
+
+    /**
+     * The browser dropped the connection — a crash in the storage process, or eviction.
+     *
+     * Nothing reopens by itself here. The handle is cached by the caller, and every call on a
+     * dead one rejects forever, so the caller is told to discard it; the next database call
+     * then opens a new connection. Without that, a mid-workout termination would turn every
+     * subsequent draft write into a silent failure for as long as the tab stayed open.
+     */
+    terminated() {
+      console.warn('[fitness-db] The browser closed this database connection unexpectedly.');
+      options.onTerminated?.();
+    },
+
     // `oldVersion` is 0 for a brand-new database and the stored version otherwise. Every
     // branch must be guarded: an unguarded `createObjectStore` throws ConstraintError on an
     // existing database, which aborts the upgrade transaction and leaves the app unable to
@@ -227,6 +378,17 @@ export function openFitnessDB(name = DB_NAME): Promise<Database> {
             }
           }
         })();
+      }
+
+      // v3: the in-progress workout buffer. Guarded like every other branch — an unguarded
+      // `createObjectStore` on a database that already has the store throws ConstraintError,
+      // which aborts the upgrade and leaves the app unable to open its own data.
+      //
+      // Creation only. No existing record is read or rewritten, so this branch cannot fail on
+      // a populated database: the five stores from v1 are not touched.
+      if (oldVersion < 3) {
+        const drafts = db.createObjectStore('workoutDrafts', { keyPath: 'id' });
+        drafts.createIndex('bySlot', 'planSlotId');
       }
     },
   });
