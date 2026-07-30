@@ -20,7 +20,7 @@ export function Settings({
   onEndWorkout,
   onSave,
   onOpenExport,
-  onRestore,
+  onRestoreFile,
   onResetAll,
 }: {
   settings: SettingsRecord;
@@ -30,9 +30,13 @@ export function Settings({
   labels: Map<string, string>;
   onEndWorkout: (challengeId: string) => void;
   onSave: (patch: Partial<SettingsRecord>) => void;
-  /** Opens the one export sheet. Restore stays here, because it is import and it destroys. */
+  /** Opens the one export sheet. Restore stays here, because it is import. */
   onOpenExport: () => void;
-  onRestore: (file: File) => void;
+  /**
+   * Hands the chosen file up. It is not restored on the spot: the shell reads it and shows
+   * what it would change, and the choice between adding and replacing is made there.
+   */
+  onRestoreFile: (file: File) => void;
   onResetAll: () => void;
 }) {
   const [bodyweight, setBodyweight] = useState<number | ''>(settings.bodyweightKg ?? '');
@@ -132,12 +136,12 @@ export function Settings({
             accept=".json,application/json"
             onChange={(e) => {
               const file = e.target.files?.[0];
-              if (file) onRestore(file);
+              if (file) onRestoreFile(file);
             }}
             className="mt-1.5 block w-full cursor-pointer rounded-xl border border-dashed border-[#3b4a68] bg-[#0f1728] px-3 py-3 text-sm text-slate-300 file:mr-3 file:rounded-lg file:border-0 file:bg-[#26324b] file:px-3 file:py-1.5 file:text-slate-200"
           />
           <span className="mt-1.5 block text-xs text-slate-400">
-            Replaces everything currently stored here.
+            Shows what the file would change before anything is written.
           </span>
         </label>
       </Card>

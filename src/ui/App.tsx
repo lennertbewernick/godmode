@@ -15,9 +15,12 @@ import {
   buildCsv,
   csvFilename,
   downloadFile,
+  mergeBackup,
+  previewMergeBackup,
   restoreBackup,
   shouldPromptBackup,
 } from '../data/exchange.js';
+import type { MergePlan } from '../data/merge.js';
 import {
   countAllWorkouts,
   countAttempts,
@@ -42,6 +45,7 @@ import type {
 } from '../db/schema.js';
 import { ExportSheet } from './ExportSheet.js';
 import { History } from './History.js';
+import { RestoreDialog } from './RestoreDialog.js';
 import { Runner } from './Runner.js';
 import { Settings } from './Settings.js';
 import { Today } from './Today.js';
@@ -120,6 +124,17 @@ export function App() {
   const [runConfig, setRunConfig] = useState<{
     targets: number[];
     adjustment: AdjustmentType;
+  } | null>(null);
+  /**
+   * A chosen backup file, read and planned but not applied. Holding the parsed file alongside
+   * the plan is what lets the confirmed action work from the file itself — `mergeBackup` plans
+   * again inside its own write transaction, so what is shown here is a report, never a
+   * commitment.
+   */
+  const [restorePrompt, setRestorePrompt] = useState<{
+    plan: MergePlan;
+    parsed: unknown;
+    fileName: string;
   } | null>(null);
   const [backupDismissed, setBackupDismissed] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
@@ -257,18 +272,67 @@ export function App() {
           return;
         }
 
-        const result = await restoreBackup(parsed);
-        await load();
-        goToTab('today');
-        setMessage(
-          `Restored ${result.workouts} sessions across ${result.challenges} challenge(s).`,
-        );
+        // Read and counted, written nowhere. The choice between adding and replacing belongs
+        // to the user, and it cannot be made honestly without these numbers.
+        const plan = await previewMergeBackup(parsed);
+        setRestorePrompt({ plan, parsed, fileName: file.name });
       } catch (e) {
         setError(e instanceof Error ? e.message : 'That backup could not be restored.');
       }
     },
-    [load, goToTab, state],
+    [state],
   );
+
+  const applyMerge = useCallback(async () => {
+    if (!restorePrompt) return;
+    setError(null);
+    try {
+      const result = await mergeBackup(restorePrompt.parsed);
+      setRestorePrompt(null);
+      await load();
+      goToTab('today');
+      // A silent "done" would defeat the point of showing the preview, so the numbers that
+      // actually landed are reported — including the ones that did not.
+      const parts = [
+        result.totals.added === 0
+          ? 'Nothing new in that backup — everything in it was already here.'
+          : `Added ${result.totals.added} record(s). Nothing here was changed or removed.`,
+      ];
+      if (result.totals.skipped > 0) {
+        parts.push(
+          `${result.totals.skipped} were left out: they point at something neither this ` +
+            'device nor the file has.',
+        );
+      }
+      if (result.totals.divergent > 0) {
+        parts.push(
+          `${result.totals.divergent} exist here in a different version; this device's copy ` +
+            'was kept.',
+        );
+      }
+      setMessage(parts.join(' '));
+    } catch (e) {
+      setRestorePrompt(null);
+      setError(e instanceof Error ? e.message : 'That backup could not be merged.');
+    }
+  }, [restorePrompt, load, goToTab]);
+
+  const applyReplace = useCallback(async () => {
+    if (!restorePrompt) return;
+    setError(null);
+    try {
+      const result = await restoreBackup(restorePrompt.parsed);
+      setRestorePrompt(null);
+      await load();
+      goToTab('today');
+      setMessage(
+        `Restored ${result.workouts} sessions across ${result.challenges} challenge(s).`,
+      );
+    } catch (e) {
+      setRestorePrompt(null);
+      setError(e instanceof Error ? e.message : 'That backup could not be restored.');
+    }
+  }, [restorePrompt, load, goToTab]);
 
   const finishWorkout = useCallback(
     async (performance: WorkoutPerformance, durationSeconds: number, manual = false) => {
@@ -543,7 +607,7 @@ export function App() {
               });
             }}
             onOpenExport={() => setShareOpen(true)}
-            onRestore={(file) => void handleRestore(file)}
+            onRestoreFile={(file) => void handleRestore(file)}
             onResetAll={() => void wipeAll().then(() => window.location.reload())}
           />
         ) : null}
@@ -568,6 +632,16 @@ export function App() {
           ))}
         </div>
       </nav>
+
+      {restorePrompt ? (
+        <RestoreDialog
+          plan={restorePrompt.plan}
+          fileName={restorePrompt.fileName}
+          onMerge={() => void applyMerge()}
+          onReplace={() => void applyReplace()}
+          onCancel={() => setRestorePrompt(null)}
+        />
+      ) : null}
 
       {shareOpen ? (
         <ExportSheet
