@@ -46,6 +46,7 @@ import { Runner } from './Runner.js';
 import { Settings } from './Settings.js';
 import { Today } from './Today.js';
 import { AddWorkout, Welcome } from './Welcome.js';
+import { buildShareCard, toStatWorkouts } from './shareCardData.js';
 import { Banner, Button, Card, NumberField, Segmented, Spinner } from './kit.js';
 
 type Tab = 'today' | 'history' | 'settings';
@@ -170,6 +171,28 @@ export function App() {
       setError(e instanceof Error ? e.message : 'Could not open your data.'),
     );
   }, [load]);
+
+  /**
+   * The card's data, assembled from state the shell already holds. Built here rather than in
+   * the sheet so the sheet stays a menu and the card stays a pure function of the history.
+   */
+  const card = useMemo(() => {
+    if (!state?.challenge) return undefined;
+    return buildShareCard({
+      exerciseLabel: state.exerciseLabel,
+      workouts: toStatWorkouts(state.workouts),
+      slots: state.slots.map((s) => ({
+        id: s.id,
+        ordinal: s.ordinal,
+        targetTotal: s.targetTotal,
+        status: s.status,
+      })),
+      daysPerWeek: daysPerWeek(state.challenge),
+      ...(state.challenge.goalValue === undefined ? {} : { goal: state.challenge.goalValue }),
+      ...(state.currentSlot?.week === undefined ? {} : { currentWeek: state.currentSlot.week }),
+      ...(state.currentSlot?.day === undefined ? {} : { currentDay: state.currentSlot.day }),
+    });
+  }, [state]);
 
   const goToTab = useCallback((tab: Tab) => {
     rememberTab(tab);
@@ -458,6 +481,7 @@ export function App() {
             }}
             onAdvanceManually={() => void advanceManually()}
             onContinueChain={() => setView({ kind: 'continue' })}
+            onShare={() => setShareOpen(true)}
           />
         ) : null}
 
@@ -522,6 +546,7 @@ export function App() {
           onExportCsv={exportCsv}
           onExportJson={() => void exportJson()}
           canExportCsv={state.challenge !== undefined}
+          {...(card === undefined ? {} : { card })}
         />
       ) : null}
     </div>

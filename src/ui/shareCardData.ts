@@ -4,7 +4,8 @@
  * Pure: no DOM, no storage, no React. It sits in the UI layer rather than in `core/` because
  * shaping a picture is presentation, and `core/` is the domain — but it holds no drawing code
  * either, so the selection rules and the IMP-07 honesty guarantee can be tested without a
- * canvas.
+ * canvas. It is named `shareCardData` rather than `shareCard` because the renderer next to it
+ * is `ShareCard.tsx`, and a case-insensitive filesystem cannot tell those two apart.
  *
  * The card reports. Every figure on it is something `core/stats` already computes; nothing here
  * recalculates, rounds differently, or invents a statistic of its own.

@@ -13,7 +13,7 @@ import {
   type StatSlot,
   type StatWorkout,
 } from '../core/stats.js';
-import { SHARE_TABLE_ROWS, buildShareCard, type ShareCardInput } from './shareCard.js';
+import { SHARE_TABLE_ROWS, buildShareCard, type ShareCardInput } from './shareCardData.js';
 
 function slot(ordinal: number, targetTotal: number): StatSlot {
   return { id: `s${ordinal}`, ordinal, targetTotal, status: 'completed' };

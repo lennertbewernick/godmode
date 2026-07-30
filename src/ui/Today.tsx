@@ -24,6 +24,8 @@ export interface TodayProps {
   onAdvanceManually: () => void;
   onContinueChain: () => void;
   onDismissMessage: () => void;
+  /** Opens the export sheet. The moment a session lands is when someone wants to post it. */
+  onShare?: () => void;
 }
 
 export function Today({
@@ -38,6 +40,7 @@ export function Today({
   onAdvanceManually,
   onContinueChain,
   onDismissMessage,
+  onShare,
 }: TodayProps) {
   const [adjusting, setAdjusting] = useState(false);
   const [draft, setDraft] = useState<number[]>([]);
@@ -84,6 +87,15 @@ export function Today({
         <div className="lg:col-span-2">
           <Banner tone="good" onDismiss={onDismissMessage}>
             {lastMessage}
+            {onShare ? (
+              <>
+                {' '}
+                <button type="button" className="underline" onClick={onShare}>
+                  Share your progress
+                </button>
+                .
+              </>
+            ) : null}
           </Banner>
         </div>
       ) : null}

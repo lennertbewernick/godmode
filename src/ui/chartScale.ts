@@ -7,6 +7,8 @@
  * them picks a different ceiling or a different date format.
  */
 
+import type { WorkoutOutcome } from '../core/types.js';
+
 /**
  * A readable y-axis top and gridline step for a maximum value.
  *
@@ -30,6 +32,15 @@ export const OUTCOME_DOT: Partial<Record<string, string>> = {
   deload: '#fbbf24',
   failed: '#f87171',
   advanced_manually: '#38bdf8',
+};
+
+/** How an outcome is worded, wherever it is worded. One vocabulary, one place. */
+export const OUTCOME_LABEL: Record<WorkoutOutcome, string> = {
+  completed_as_planned: 'as planned',
+  scaled_up: 'scaled up',
+  deload: 'deload',
+  failed: 'missed',
+  advanced_manually: 'moved on',
 };
 
 /** Roughly evenly spaced indices to label, both ends included. */

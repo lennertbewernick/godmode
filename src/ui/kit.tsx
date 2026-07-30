@@ -292,6 +292,15 @@ export function Modal({
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
 
+  // Callers pass an inline arrow, so `onClose` is a new function on every parent render. Held
+  // in a ref and read at event time, the open/close effect below can run exactly once —
+  // otherwise it tears down and re-runs on every parent render, yanking focus out of whatever
+  // the user was actually using inside the dialog.
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
   useEffect(() => {
     // Whatever had focus when the dialog opened — usually the trigger. Without restoring it,
     // closing the sheet drops a keyboard user back at the top of the document every time.
@@ -301,7 +310,7 @@ export function Modal({
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (event.key !== 'Tab') return;
@@ -328,7 +337,7 @@ export function Modal({
       document.removeEventListener('keydown', onKeyDown);
       previous?.focus?.();
     };
-  }, [onClose]);
+  }, []);
 
   return (
     <div

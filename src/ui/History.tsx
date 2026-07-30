@@ -22,15 +22,9 @@ import {
 import type { WorkoutOutcome } from '../core/types.js';
 import type { PlanSlotRecord, WorkoutRecord } from '../db/schema.js';
 import { CumulativeChart, SessionChart } from './Chart.js';
+import { OUTCOME_LABEL } from './chartScale.js';
+import { toStatWorkouts } from './shareCardData.js';
 import { Button, Card, Segmented, Stat } from './kit.js';
-
-const OUTCOME_LABEL: Record<WorkoutOutcome, string> = {
-  completed_as_planned: 'as planned',
-  scaled_up: 'scaled up',
-  deload: 'deload',
-  failed: 'missed',
-  advanced_manually: 'moved on',
-};
 
 const OUTCOME_STYLE: Record<WorkoutOutcome, string> = {
   completed_as_planned: 'text-teal-300',
@@ -58,18 +52,8 @@ export function History({
   /** Opens the one export sheet. History keeps the affordance, not a second implementation. */
   onShare: () => void;
 }) {
-  const statWorkouts: StatWorkout[] = useMemo(
-    () =>
-      workouts.map((w) => ({
-        performedAt: w.performedAt,
-        actualTotal: w.actualTotal,
-        outcome: w.outcome,
-        ...(w.durationSeconds === undefined ? {} : { durationSeconds: w.durationSeconds }),
-        ...(w.planSlotId === undefined ? {} : { planSlotId: w.planSlotId }),
-        ...(w.kcal === undefined ? {} : { kcal: { value: w.kcal.value, source: w.kcal.source } }),
-      })),
-    [workouts],
-  );
+  // The same mapping the share card uses, so the two views of one history agree.
+  const statWorkouts: StatWorkout[] = useMemo(() => toStatWorkouts(workouts), [workouts]);
 
   const statSlots: StatSlot[] = useMemo(
     () =>

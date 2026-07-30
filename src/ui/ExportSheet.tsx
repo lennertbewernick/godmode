@@ -11,7 +11,9 @@
  * press away from two harmless ones. It stays in Settings beside the copy that explains it.
  */
 
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
+import { ShareCardPreview } from './ShareCard.js';
+import type { ShareCardData } from './shareCardData.js';
 import { Modal } from './kit.js';
 
 function Option({
@@ -43,21 +45,45 @@ export function ExportSheet({
   onExportCsv,
   onExportJson,
   canExportCsv,
+  card,
 }: {
   onClose: () => void;
   onExportCsv: () => void;
   onExportJson: () => void;
   /** False when no workout is selected — there is nothing to write a CSV about. */
   canExportCsv: boolean;
+  /** Absent when there is nothing to draw; the card option is then not offered at all. */
+  card?: ShareCardData;
 }) {
+  const [mode, setMode] = useState<'menu' | 'card'>('menu');
+
   const run = (action: () => void) => () => {
     action();
     onClose();
   };
 
+  if (mode === 'card' && card) {
+    return (
+      <Modal title="Share card" onClose={onClose} wide>
+        <ShareCardPreview
+          data={card}
+          exerciseLabel={card.exerciseLabel}
+          onBack={() => setMode('menu')}
+        />
+      </Modal>
+    );
+  }
+
   return (
     <Modal title="Share & export" onClose={onClose}>
       <div className="flex flex-col gap-2">
+        {card ? (
+          <Option
+            label="Share card (image)"
+            description="A picture of your progress for the group chat."
+            onSelect={() => setMode('card')}
+          />
+        ) : null}
         <Option
           label="Export CSV"
           description={
