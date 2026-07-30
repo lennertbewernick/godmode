@@ -72,6 +72,42 @@ does not follow it — a secret must never land in a directory that gets shared 
 **Back it up.** The file is `godmode.sqlite` plus its `-wal` and `-shm` siblings; copy all three,
 or use `sqlite3 godmode.sqlite ".backup out.sqlite"` for a consistent single file.
 
+## One process owns the database at a time
+
+The server takes `godmode.sqlite.lock` before it opens the database and gives it back when it
+closes. The migration importer takes the same lock before it reads anything and holds it through
+the rename that replaces the file. So:
+
+- **Starting a second server** against the same data directory fails with a message naming the
+  process that already has it — instead of two servers writing to one file.
+- **Running `npm run import-backup` while the server is up** fails the same way, instead of
+  renaming a fresh database over the one the server has open and leaving every write that server
+  makes afterwards in an unlinked inode nobody will ever read. Stop the server, then import.
+
+**After a crash or a power cut** the lock file outlives its holder. The server detects that by
+itself — a recorded process id that is no longer running on this host — reclaims the lock, and says
+so on startup, keeping the old lock file as `godmode.sqlite.lock.stale-<uuid>`. So an unattended
+restart works.
+
+The importer deliberately does *not* reclaim by itself: it is the side that replaces the file.
+It refuses, prints who held the lock and why it judges it stale, and you re-run with
+`--break-stale-lock`. That flag is not a `--force` — it refuses a lock whose holder is still
+alive, and refuses one it cannot judge at all (another hostname, another process namespace, a
+process id reused since a reboot, or a lock file that will not parse). For those, check by hand
+that no server is running and delete `godmode.sqlite.lock` yourself.
+
+**This protocol assumes every participant shares one filesystem and one process namespace.** Two
+environments where that can fail, both described in full in `server/PERSISTENCE.md` §15:
+
+- **NFS** — exclusive create is not reliably atomic on older NFSv3 paths. Keep the database on
+  local storage.
+- **Containers** — process ids are namespaced, so a lock written in one container cannot be judged
+  from another and will never be broken automatically. A hard-killed container therefore leaves a
+  lock its replacement refuses. Deleting it in the entrypoint is **only** safe if your orchestrator
+  guarantees the old task is gone before the new one starts — rolling deployments and multi-replica
+  services do not. If it cannot, get exclusivity from outside: one replica, or a volume that only
+  one task can attach.
+
 ## What the API guarantees
 
 - `GET /api/snapshot` returns the whole dataset in one read transaction, with a `revision` and

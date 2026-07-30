@@ -9,7 +9,7 @@
  * is argument parsing, a plain-language report, and an exit code — deliberately thin, so that the
  * part which touches the only copy of the data is the part that is unit-tested.
  *
- * Two decisions worth knowing before you run it:
+ * Three decisions worth knowing before you run it:
  *
  * - **`--target` is explicit.** No platform default is guessed here. Resolving the data directory
  *   (`GODMODE_DATA_DIR`, else a platform default, else refuse) belongs to the server's own
@@ -21,6 +21,12 @@
  *   copy stays. The backup JSON stays. The browser's IndexedDB stays — no code in this work calls
  *   `indexedDB.deleteDatabase`.
  *
+ * - **It will not run while the server has the database open.** Both sides take `<target>.lock`:
+ *   the server for its whole lifetime, this for the whole import. Forgetting to stop the server is
+ *   now a refusal with a message naming the process holding it, not a silently lost afternoon.
+ *   `server/lock.ts` is where the mechanism and its limits are written down.
+ *
+
  * Run it with `--dry-run` first. That builds the whole database and runs every verification check
  * against it, then throws the file away without touching the target: a full rehearsal, including
  * the parts that can fail.
@@ -48,6 +54,9 @@ Options:
                              Legitimate after a partial restore; suspicious otherwise.
   --allow-total-mismatch     Accept a workout total that is not the sum of its sets, or a plan
                              slot total that is not the sum of its targets.
+  --break-stale-lock         Take over a <target>.lock whose holder is provably gone — a dead
+                             process on this machine. Refuses a lock held by a running server,
+                             and refuses one it cannot judge. Only needed after a crash.
   -h, --help                 This.
 
 What it does:
@@ -61,10 +70,11 @@ What it does:
 Re-running is safe: a record that is already there and identical is a no-op, and a record that is
 already there with different content aborts the whole import and names it.
 
-STOP THE SERVER FIRST. This refuses to run if SQLite left a -wal, -shm or -journal file beside
-the target, and it takes a lock that stops a second importer — but an idle connection leaves no
-trace, so nothing here can prove the server is stopped. Renaming a database out from under an
-open connection loses whatever that connection writes next.`;
+Stop the server first — and if you forget, this stops instead of you. The server holds
+<target>.lock for its whole lifetime and this takes the same lock exclusively before it reads a
+byte, so an import cannot start while a server has the database open, idle or not. It also still
+refuses if SQLite left a -wal, -shm or -journal file beside the target, which catches a database
+left mid-write by something that never took the lock at all.`;
 
 export interface CliArguments {
   readonly backupPath: string;
@@ -72,6 +82,7 @@ export interface CliArguments {
   readonly dryRun: boolean;
   readonly allowDanglingChainHead: boolean;
   readonly allowTotalMismatch: boolean;
+  readonly breakStaleLock: boolean;
 }
 
 export class UsageError extends Error {
@@ -91,6 +102,7 @@ export function parseArguments(
   let dryRun = false;
   let allowDanglingChainHead = false;
   let allowTotalMismatch = false;
+  let breakStaleLock = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const argument = argv[i] as string;
@@ -112,6 +124,9 @@ export function parseArguments(
         break;
       case '--allow-total-mismatch':
         allowTotalMismatch = true;
+        break;
+      case '--break-stale-lock':
+        breakStaleLock = true;
         break;
       default: {
         if (argument.startsWith('-')) throw new UsageError(`Unknown option "${argument}".`);
@@ -141,6 +156,7 @@ export function parseArguments(
     dryRun,
     allowDanglingChainHead,
     allowTotalMismatch,
+    breakStaleLock,
   };
 }
 
@@ -185,6 +201,7 @@ export function run(
       dryRun: args.dryRun,
       allowDanglingChainHead: args.allowDanglingChainHead,
       allowTotalMismatch: args.allowTotalMismatch,
+      breakStaleLock: args.breakStaleLock,
     });
     out(describeReport(report));
     return 0;

@@ -197,7 +197,10 @@ export function createGodmodeServer(options: ServerOptions = {}): RunningServer 
         }, SHUTDOWN_GRACE_MS);
         grace.unref();
       });
-      opened.db.close();
+      // Closes the connection *and* releases the ownership lock. A server that stopped listening
+      // but kept the lock would block the importer for no reason; one that dropped the lock while
+      // still holding the file open would be the bug the lock exists to prevent.
+      opened.close();
     },
   };
 }
@@ -313,6 +316,18 @@ async function main(argv: readonly string[]): Promise<void> {
   };
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
+
+  // A last, synchronous chance to hand the database back — an uncaught throw, or `process.exit`
+  // from somewhere that never ran `stop`. SIGKILL and a power cut still leave the lock file
+  // behind; that is the stale case, and `server/lock.ts` detects and recovers from exactly that.
+  //
+  // `opened.close()`, never a bare `lock.release()`: releasing the lock while this process still
+  // has the database open would advertise the file as free for the remainder of exit-handler time,
+  // which is the precise state the lock exists to make impossible. `close` is idempotent, so this
+  // costs nothing when `stop` already ran.
+  process.on('exit', () => {
+    running.opened.close();
+  });
 }
 
 const invokedDirectly =

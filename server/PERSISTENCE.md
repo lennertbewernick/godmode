@@ -417,7 +417,7 @@ difference. `insertSql()` in `server/rows.ts` emits a plain `INSERT` and has no 
   of this schema.
 
 (The importer, the temp-file-then-atomic-rename procedure and the verification checks were the
-next step and are now built — see §14.)
+next step and are now built — see §14. The exclusive-ownership lock the two share is §15.)
 
 ## 13. Verified against the real data, 2026-07-30
 
@@ -466,16 +466,21 @@ compiled command is `node dist-server/server/import-backup.js`.
 
 ### The procedure
 
-1. `validateBackupStrict` — every field of every record, unknown format versions refused.
-2. Read the existing target **read-only**, decoding every row through `rows.ts` (which
+1. `validateBackupStrict` — every field of every record, unknown format versions refused. Nothing
+   is created and no lock is taken, so a rejection here costs nobody anything.
+2. Take `<target>.lock` **exclusively** and hold it to the end. The server holds the same lock for
+   its whole lifetime, so this is where "you forgot to stop the server" becomes a refusal naming
+   the process instead of a lost afternoon. See §15.
+3. Read the existing target **read-only**, decoding every row through `rows.ts` (which
    re-validates it). Refuse if a `-wal`, `-shm` or `-journal` sidecar is present.
-3. Plan: absent id → insert; present and canonically identical → no-op; present and different →
+4. Plan: absent id → insert; present and canonically identical → no-op; present and different →
    **abort, naming the ids and the differing fields**. Never `INSERT OR REPLACE`.
-4. Build a **fresh** database in a temporary file inside the target's own directory, holding
+5. Build a **fresh** database in a temporary file inside the target's own directory, holding
    stored ∪ incoming, in one transaction.
-5. Verify it — 13 checks, below. Any failure discards the temporary file.
-6. `fsync`; copy the old database to `<target>.pre-import-<timestamp>.sqlite` with
-   `COPYFILE_EXCL`; re-check for sidecars; `renameSync`; `fsync` the directory.
+6. Verify it — 13 checks, below. Any failure discards the temporary file.
+7. `fsync`; copy the old database to `<target>.pre-import-<timestamp>.sqlite` with
+   `COPYFILE_EXCL`; re-confirm the lock is still ours; re-check for sidecars; `renameSync`;
+   `fsync` the directory.
 
 Nothing is ever deleted. Not the safety copy, not the backup JSON, and not the browser's
 IndexedDB — no code in this work calls `indexedDB.deleteDatabase`.
@@ -531,15 +536,132 @@ The 29-session export (2 exercises, 2 challenges, 1 max test, 36 plan slots, 29 
 The tests in the repository use `server/fixtures.ts`, not that export: a test reading an absolute
 path outside the repository would fail for everyone else and rot.
 
-### The limit this cannot close, stated plainly
+### Still unverified
 
-**Stop the server before importing.** The sidecar refusal catches a database that was not closed
-cleanly, and a lock file stops two importers colliding — but an *idle* SQLite connection leaves no
-trace at all, so neither proves the server is stopped. On POSIX, renaming a file over one that a
-process still has open succeeds: that process keeps writing to the old inode, and those writes go
-nowhere. Closing this properly needs a lock file the server holds for its whole lifetime and the
-importer takes exclusively. That is a contract with two sides, and `server/db.ts` is not written
-yet. Claiming the guarantee before the other half exists would be worse than recording the gap.
+Crash-recovery behaviour on the eventual deploy filesystem, and the safety copy's collision retry
+(guarded by `COPYFILE_EXCL` plus a random suffix, but not exercised by a test).
 
-Also unverified: crash-recovery behaviour on the eventual deploy filesystem, and the safety copy's
-collision retry (guarded by `COPYFILE_EXCL` plus a random suffix, but not exercised by a test).
+---
+
+## 15. Exclusive ownership — the gap that is now closed, 2026-07-30
+
+This section previously said **"stop the server before importing"** and admitted the importer could
+not enforce it: the sidecar check cannot see an *idle* SQLite connection, and on POSIX a `rename`
+over a file a process still has open succeeds — that process keeps writing into an unlinked inode
+and those writes are gone. It was recorded as an open gap because closing it needs a contract with
+two sides and `server/db.ts` did not exist yet. It exists. The gap is closed.
+
+**`server/lock.ts` is the contract, and both sides now honour it.**
+
+- The server takes `<database>.lock` in `openDatabase` *before* it opens the file, and gives it
+  back in `close()` — connection first, then lock, so the file is never advertised as free while
+  this process still has it.
+- The importer takes the same lock before its first read and holds it through the rename, and
+  re-confirms immediately before the rename that the file on disk is still the lock it took.
+- So an import cannot begin while a server has the database open, idle or not, and a server cannot
+  start on a database an import is rebuilding.
+
+### Why a lock file, and not `flock`
+
+There is no advisory-locking call in Node's standard library — no `flock`, no `fcntl`, and no
+`O_EXLOCK` in `fs.constants` on this platform (BSD and macOS have that flag; Linux does not, so it
+was never the portable answer). Reaching `flock(2)` would mean a native addon, and this project
+takes no new runtime dependencies. The choice was "lock file or nothing".
+
+That is a fortunate constraint. POSIX `fcntl` record locks are released when **any** file
+descriptor for that file is closed anywhere in the process — a `readFileSync` of the lock file in
+unrelated code would silently drop a live server's lock. `flock(2)` does not have that flaw but is
+not POSIX and is unreachable from here anyway.
+
+### Telling a stale lock from a live one
+
+The lock file is JSON: role, pid, hostname, pid namespace, the host's boot time, an ISO timestamp,
+a nonce. A pid number only means something inside one host **and** one pid namespace, so both are
+checked before it is probed at all.
+
+| Observation | Verdict |
+|---|---|
+| hostname differs | **unknowable** — that pid means nothing here |
+| pid namespace differs | **unknowable** — two containers, one bind mount, one hostname |
+| the file will not parse | **unknowable** |
+| pid is not running | **stale** |
+| pid is running, boot time matches | **live** |
+| pid is running, boot time does not | **unknowable** — a reboot plus pid reuse |
+
+Boot time is `Date.now() - os.uptime()`, which a wall-clock step would move, so it is only ever
+allowed to *withhold* a verdict, never to produce one. A dead pid decides staleness alone.
+
+The record parser is deliberately strict — positive integer pid, non-empty host and nonce, parseable
+timestamp, known role. Not tidiness: `undefined` means *unknowable*, which means refuse, while
+anything that parses gets **judged**, and a judgement is what breaks a lock. Codex found the
+concrete instance: `pid: -1` used to parse, `process.kill(-1, 0)` says no such process, and a
+hand-mangled lock file was therefore "provably stale".
+
+### Breaking one, and why the two sides differ
+
+- **The server reclaims a provably stale lock itself**, printing what it did and keeping the old
+  lock file as `<lock>.stale-<uuid>`. A server that refused to start after a power cut would train
+  the owner to delete lock files by hand, which is exactly the habit this must not create.
+- **The importer only reclaims when told to**, with `--break-stale-lock` — which is not a
+  `--force`: it refuses a live holder and refuses one it cannot judge, so it does nothing at all
+  against a running server, and exists for one situation, after a crash.
+
+Reclaiming is not "unlink and take it". Codex's critical finding against the first version of this
+was a TOCTOU: importer A judges stale lock S, server B reclaims S and starts using the database, A
+then renames *B's* lock aside, takes its own, reads its own nonce back happily, and renames a fresh
+database over the one B has open. A pathname is a name for a thing, not the thing.
+
+There is no conditional rename in POSIX and none in Node, so the check happens **after**: the lock
+is read through a descriptor that is also `fstat`ed, so the record and its inode arrive together;
+`renameSync` preserves the inode; and if what lands at the sideline is not the object that was
+judged, it is renamed straight back and the acquisition refuses. The importer never reaches the
+database rename.
+
+### Where the guarantee does *not* hold
+
+- **Only processes that take the lock are constrained.** `sqlite3 godmode.sqlite`, a backup tool, a
+  file manager — none of them know the lock exists. This is not a mandatory filesystem lock and
+  cannot be one. (The sidecar check is kept for exactly this reason: it catches a database left
+  mid-write by something that never took the lock.)
+- **NFS.** `open(O_CREAT|O_EXCL)` is atomic on NFSv4 and on NFSv3 servers that implement exclusive
+  create properly; older NFSv3 emulation can produce two winners or a spurious `EEXIST`, and a
+  read-back is a transient observation rather than proof of continuing ownership. Keep the database
+  on local storage.
+- **Container bind-mounts.** This protocol assumes every participant shares one filesystem **and**
+  one pid namespace. Where they do not, the verdict is *unknowable* and nothing is broken
+  automatically — correct, but it means a hard-killed container leaves a lock its replacement
+  refuses. Deleting that lock in an entrypoint is only safe if the orchestrator guarantees the old
+  task is gone before the new one starts, which rolling deployments and multi-replica services do
+  **not**. If yours cannot guarantee that, the exclusivity has to come from outside — a
+  single-attachment volume, or a single replica — and this lock is a second line rather than the
+  guarantee.
+- **`release` is not an atomic conditional unlink**, because POSIX has none. It checks the inode
+  and the nonce first, which makes "release after somebody already broke and retook this lock" a
+  no-op instead of a deletion of a live holder's lock. A mitigation, not a proof.
+- **A third acquirer inside the reclaim-and-restore window** can take a lock that the restore then
+  overwrites. It finds out at `assertStillHeld`, which runs immediately before every destructive
+  operation, so the outcome is a refusal rather than a loss.
+
+### Proved by a real second process
+
+`server/lock.test.ts` spawns an actual `node` child that takes the lock through the real module and
+opens a real `DatabaseSync` connection to the target, then sits idle. With it running, the tests
+assert that:
+
+- **no `-wal`, `-shm` or `-journal` file exists** — the premise of the whole finding, asserted
+  rather than described. This is precisely what the old check could not see;
+- the import refuses, naming the holding process id, and the target is **byte-identical by SHA-256
+  before and after**;
+- a `--dry-run` refuses too, rather than rehearsing against a moving database;
+- `--break-stale-lock` is useless against it;
+- after `SIGTERM` (clean release) the import succeeds; after `SIGKILL` the leftover lock is refused
+  as stale, and only then does `--break-stale-lock` take it.
+
+A second Codex round against this implementation is at `.planning/codex-lock-verdict.txt`; its
+findings on the reclaim TOCTOU, pid namespaces, the exit handler, the `openDatabase` failure path,
+and record-parser strictness were adopted and are the reason those parts read as they do.
+
+Not covered by a test, and said rather than hidden: the cleanup path when `writeFileSync` fails on
+a lock file that was just created (reviewed, not exercised — a write failure on a freshly opened
+descriptor cannot be induced portably), and the process `exit` handler, which is reachable only by
+killing a real server mid-flight.

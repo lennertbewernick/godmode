@@ -19,12 +19,18 @@
  *    and tries to upgrade at the first write, which under concurrency fails with SQLITE_BUSY
  *    *after* the check has already passed — the classic lost-update shape. `BEGIN IMMEDIATE`
  *    takes the write lock up front, so the check and the write are one indivisible step.
+ *
+ * 4. **The ownership lock is taken before the file is opened, and held until it is closed.** This
+ *    is one half of the contract in `server/lock.ts`; the migration importer is the other. Without
+ *    it, `server/migrate.ts` can rename a fresh database over the file this process has open, and
+ *    every write this process makes afterwards goes to an inode nothing will ever read again.
  */
 
 import { accessSync, constants, mkdirSync, statSync } from 'node:fs';
 import { homedir as osHomedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { acquireLock, type HeldLock } from './lock.js';
 import { SETTINGS_ROW_ID } from './fields.js';
 import { SETTINGS, bindValues, insertSql, type TableMapping } from './rows.js';
 import { SCHEMA_VERSION, applySchema, armConnection, assertSchemaVersion } from './schema.js';
@@ -120,6 +126,16 @@ export interface OpenOptions {
   readonly dataDir?: string;
   readonly host?: Host;
   readonly filename?: string;
+  /**
+   * Take the exclusive ownership lock. On by default, and the default is the point.
+   *
+   * `false` exists for the one legitimate case: a test that deliberately opens a *second*
+   * connection to the same file to prove SQLite's own write locking. Production never sets it, and
+   * a connection opened this way carries no protection against the importer.
+   */
+  readonly exclusive?: boolean;
+  /** Told when a provably stale lock was reclaimed. Defaults to a warning on stderr. */
+  readonly onStaleLockReclaimed?: (message: string) => void;
 }
 
 export interface OpenedDatabase {
@@ -128,22 +144,64 @@ export interface OpenedDatabase {
   readonly dataDir: string;
   /** True when this call created the schema, rather than opening an existing database. */
   readonly created: boolean;
+  /** The ownership lock, held until `close`. `undefined` only when `exclusive: false`. */
+  readonly lock: HeldLock | undefined;
+  /**
+   * Close the connection and release the lock, in that order.
+   *
+   * Both, always: releasing the lock while the connection is still open would advertise the file
+   * as free while this process still had it, which is precisely the state the lock exists to make
+   * impossible. Safe to call twice.
+   */
+  close(): void;
 }
 
 /**
  * Open — or create — the database and return a connection that is safe to use.
  *
- * "Safe to use" is the whole point of routing every open through here: foreign keys on, a busy
- * timeout so a concurrent writer is waited for rather than crashed into, WAL so a reader never
- * blocks the writer, `synchronous = FULL` because this file is the only copy of months of
- * training and a lost final commit is not an acceptable trade for a few milliseconds, and a
- * schema version that this build actually understands.
+ * "Safe to use" is the whole point of routing every open through here: exclusive ownership of the
+ * file, foreign keys on, a busy timeout so a concurrent writer is waited for rather than crashed
+ * into, WAL so a reader never blocks the writer, `synchronous = FULL` because this file is the
+ * only copy of months of training and a lost final commit is not an acceptable trade for a few
+ * milliseconds, and a schema version that this build actually understands.
+ *
+ * The lock comes first, before the file is touched at all, so a refusal means nothing was opened.
  */
 export function openDatabase(options: OpenOptions = {}): OpenedDatabase {
   const dataDir = ensureDataDir(options.dataDir ?? resolveDataDir(options.host ?? currentHost()));
   const path = join(dataDir, options.filename ?? DATABASE_FILENAME);
 
-  const db = new DatabaseSync(path);
+  const warn =
+    options.onStaleLockReclaimed ??
+    ((message: string) => {
+      console.warn(message);
+    });
+
+  const lock =
+    options.exclusive === false
+      ? undefined
+      : acquireLock({
+          databasePath: path,
+          role: 'server',
+          // The server must come back after a power cut without a human deleting a file. It only
+          // ever breaks a lock whose holder is *provably* gone — see `server/lock.ts`.
+          reclaimStale: true,
+          onReclaim: (info) => {
+            warn(
+              `[godmode] a lock left behind by process ${String(info.holder?.pid ?? 0)} was ` +
+                `reclaimed: ${info.reason}. The old lock file was kept at ${info.sidelinedTo}.`,
+            );
+          },
+        });
+
+  let db: DatabaseSync;
+  try {
+    db = new DatabaseSync(path);
+  } catch (cause) {
+    lock?.release();
+    throw cause;
+  }
+
   try {
     // WAL survives across connections once set, but setting it is idempotent and cheap.
     db.exec('PRAGMA journal_mode = WAL;');
@@ -156,9 +214,32 @@ export function openDatabase(options: OpenOptions = {}): OpenedDatabase {
     } else {
       assertSchemaVersion(db);
     }
-    return { db, path, dataDir, created: fresh };
+    let closed = false;
+    return {
+      db,
+      path,
+      dataDir,
+      created: fresh,
+      lock,
+      close: () => {
+        if (closed) return;
+        closed = true;
+        try {
+          db.close();
+        } finally {
+          lock?.release();
+        }
+      },
+    };
   } catch (cause) {
-    db.close();
+    // `finally`, not a second statement: a `db.close()` that throws would otherwise skip the
+    // release and replace the real startup error with its own, leaving a lock file behind that
+    // nothing ever cleans up.
+    try {
+      db.close();
+    } finally {
+      lock?.release();
+    }
     throw cause;
   }
 }

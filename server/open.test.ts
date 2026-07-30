@@ -6,7 +6,7 @@
 // that was never issued, and a directory that cannot be written to.
 
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -24,6 +24,7 @@ import {
   writeSettings,
   type Host,
 } from './db.js';
+import { acquireLock, bootSecondsNow, lockPathFor, readLockRecord } from './lock.js';
 import { foreignKeysEnabled } from './schema.js';
 
 const temporaries: string[] = [];
@@ -128,7 +129,7 @@ describe('openDatabase', () => {
       expect(opened.path).toBe(join(dir, DATABASE_FILENAME));
       expect(readRevision(opened.db)).toBe(0);
     } finally {
-      opened.db.close();
+      opened.close();
     }
   });
 
@@ -136,14 +137,14 @@ describe('openDatabase', () => {
     const dir = tempDir();
     const first = openDatabase({ dataDir: dir });
     inWriteTransaction(first.db, () => bumpRevision(first.db, '2026-07-30T12:00:00.000Z'));
-    first.db.close();
+    first.close();
 
     const second = openDatabase({ dataDir: dir });
     try {
       expect(second.created).toBe(false);
       expect(readRevision(second.db)).toBe(1);
     } finally {
-      second.db.close();
+      second.close();
     }
   });
 
@@ -159,7 +160,7 @@ describe('openDatabase', () => {
           .run('slot_x', 'no_such_challenge', 'p', '2026-07-30T12:00:00.000Z', '[]', 'available'),
       ).toThrow(/FOREIGN KEY/i);
     } finally {
-      opened.db.close();
+      opened.close();
     }
   });
 
@@ -169,7 +170,7 @@ describe('openDatabase', () => {
       const row = opened.db.prepare('PRAGMA journal_mode').get() as { journal_mode: string };
       expect(row.journal_mode).toBe('wal');
     } finally {
-      opened.db.close();
+      opened.close();
     }
   });
 
@@ -177,7 +178,7 @@ describe('openDatabase', () => {
     const dir = tempDir();
     const opened = openDatabase({ dataDir: dir });
     opened.db.prepare('UPDATE meta SET schema_version = 99').run();
-    opened.db.close();
+    opened.close();
     expect(() => openDatabase({ dataDir: dir })).toThrow(/schema version 99/);
   });
 
@@ -187,8 +188,100 @@ describe('openDatabase', () => {
     try {
       expect(opened.dataDir).toBe(dir);
     } finally {
-      opened.db.close();
+      opened.close();
     }
+  });
+
+  it('leaves a schema-version refusal without a lock file behind', () => {
+    // Every failure path inside `openDatabase` has to give the lock back, or one bad startup
+    // poisons the data directory until somebody deletes a file by hand.
+    const dir = tempDir();
+    const opened = openDatabase({ dataDir: dir });
+    opened.db.prepare('UPDATE meta SET schema_version = 99').run();
+    opened.close();
+    expect(() => openDatabase({ dataDir: dir })).toThrow(/schema version 99/);
+    expect(existsSync(lockPathFor(join(dir, DATABASE_FILENAME)))).toBe(false);
+  });
+});
+
+describe('the ownership lock, from the server side', () => {
+  it('close is idempotent, so the process exit handler can call it after a clean shutdown', () => {
+    const dir = tempDir();
+    const opened = openDatabase({ dataDir: dir });
+    opened.close();
+    expect(() => {
+      opened.close();
+    }).not.toThrow();
+    expect(existsSync(lockPathFor(join(dir, DATABASE_FILENAME)))).toBe(false);
+  });
+
+  it('is taken on open and given back on close', () => {
+    const dir = tempDir();
+    const lockPath = lockPathFor(join(dir, DATABASE_FILENAME));
+    const opened = openDatabase({ dataDir: dir });
+    expect(existsSync(lockPath)).toBe(true);
+    expect(readLockRecord(lockPath)?.role).toBe('server');
+    expect(readLockRecord(lockPath)?.pid).toBe(process.pid);
+    opened.close();
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it('refuses to open a database another holder already owns', () => {
+    const dir = tempDir();
+    const opened = openDatabase({ dataDir: dir });
+    try {
+      expect(() => openDatabase({ dataDir: dir })).toThrow(/locked by the GodMode server/);
+    } finally {
+      opened.close();
+    }
+  });
+
+  it('refuses to open a database an import is holding', () => {
+    const dir = tempDir();
+    const held = acquireLock({ databasePath: join(dir, DATABASE_FILENAME), role: 'import' });
+    try {
+      expect(() => openDatabase({ dataDir: dir })).toThrow(/locked by another import/);
+    } finally {
+      held.release();
+    }
+  });
+
+  it('reclaims a lock left behind by a dead process, and says so out loud', () => {
+    // The power-cut case. A server that refused to start here would train the owner to delete
+    // lock files as a matter of routine, which is the one habit this whole mechanism must not
+    // create — so the server breaks a *provably* stale lock itself, and never a live one.
+    const dir = tempDir();
+    const lockPath = lockPathFor(join(dir, DATABASE_FILENAME));
+    writeFileSync(
+      lockPath,
+      JSON.stringify({
+        kind: 'godmode-database-lock',
+        version: 1,
+        role: 'server',
+        pid: 999_999,
+        host: hostname(),
+        bootSeconds: bootSecondsNow(),
+        acquiredAt: '2026-07-30T12:00:00.000Z',
+        nonce: 'a-dead-server',
+        databasePath: join(dir, DATABASE_FILENAME),
+      }),
+    );
+
+    const said: string[] = [];
+    const opened = openDatabase({ dataDir: dir, onStaleLockReclaimed: (m) => said.push(m) });
+    try {
+      expect(said.join('\n')).toContain('999999');
+      expect(said.join('\n')).toContain('reclaimed');
+      expect(readLockRecord(lockPath)?.nonce).not.toBe('a-dead-server');
+    } finally {
+      opened.close();
+    }
+  });
+
+  it('does not reclaim a lock it cannot judge', () => {
+    const dir = tempDir();
+    writeFileSync(lockPathFor(join(dir, DATABASE_FILENAME)), 'this is not a lock record');
+    expect(() => openDatabase({ dataDir: dir })).toThrow(/by hand/);
   });
 });
 
@@ -204,7 +297,7 @@ describe('transactions', () => {
       ).toThrow('halfway');
       expect(readRevision(opened.db)).toBe(0);
     } finally {
-      opened.db.close();
+      opened.close();
     }
   });
 
@@ -235,7 +328,7 @@ describe('transactions', () => {
       const rows = opened.db.prepare('SELECT COUNT(*) AS n FROM challenges').get() as { n: number };
       expect(rows.n).toBe(0);
     } finally {
-      opened.db.close();
+      opened.close();
     }
   });
 
@@ -244,7 +337,10 @@ describe('transactions', () => {
     // read-check-write between another one's check and its write.
     const dir = tempDir();
     const a = openDatabase({ dataDir: dir });
-    const b = openDatabase({ dataDir: dir });
+    // `exclusive: false` is the *only* legitimate use of that option: this test needs a second
+    // connection to the same file on purpose, and the ownership lock exists precisely to make that
+    // impossible everywhere else. What is under test here is SQLite's own write locking.
+    const b = openDatabase({ dataDir: dir, exclusive: false });
     try {
       // Do not wait five seconds for the lock in a test; the point is that it is held at all.
       b.db.exec('PRAGMA busy_timeout = 50;');
@@ -254,8 +350,8 @@ describe('transactions', () => {
       expect(() => inWriteTransaction(b.db, () => bumpRevision(b.db, '2026-07-30T12:00:00.000Z'))).not.toThrow();
       expect(readRevision(a.db)).toBe(1);
     } finally {
-      a.db.close();
-      b.db.close();
+      a.close();
+      b.close();
     }
   });
 
@@ -272,7 +368,7 @@ describe('transactions', () => {
       ).toThrow(/UNIQUE|PRIMARY KEY|constraint/i);
       expect(readRevision(opened.db)).toBe(0);
     } finally {
-      opened.db.close();
+      opened.close();
     }
   });
 });
@@ -283,7 +379,7 @@ describe('settings', () => {
     try {
       expect(readSettings(opened.db)).toEqual(DEFAULT_SETTINGS_ROW);
     } finally {
-      opened.db.close();
+      opened.close();
     }
   });
 
@@ -307,7 +403,7 @@ describe('settings', () => {
       const rows = opened.db.prepare('SELECT COUNT(*) AS n FROM settings').get() as { n: number };
       expect(rows.n).toBe(1);
     } finally {
-      opened.db.close();
+      opened.close();
     }
   });
 });

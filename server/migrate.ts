@@ -40,6 +40,15 @@
  *    `<target>.pre-import-<timestamp>.sqlite` and left there. Nothing in this module deletes it,
  *    and nothing anywhere in this work calls `indexedDB.deleteDatabase` — the browser copy stays
  *    the fallback.
+ *
+ * 5. **Nothing else owns the database while this runs.** Codex's remaining finding was that a
+ *    sidecar check cannot see an idle SQLite connection, and that a POSIX `rename` over a file a
+ *    server still has open succeeds — leaving that server writing into an unlinked inode. So this
+ *    module no longer relies on the sidecars for that question. It takes `<target>.lock`
+ *    exclusively before its first read and holds it past the rename; `server/db.ts` takes the same
+ *    lock when the server opens the database and holds it for the server's whole lifetime. The
+ *    mechanism, its staleness rules and the three places the guarantee stops are all written down
+ *    in `server/lock.ts`.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -53,11 +62,11 @@ import {
   openSync,
   renameSync,
   rmSync,
-  writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { canonicalJson, canonicalize, isPlainObject } from './canonical.js';
+import { LockUnavailableError, acquireLock, type HeldLock } from './lock.js';
 import {
   COLLECTIONS,
   EMPTY_DATASET,
@@ -268,6 +277,13 @@ export interface ImportOptions {
    * Off by default; every one of the owner's 29 sessions and 36 slots satisfies the invariant.
    */
   readonly allowTotalMismatch?: boolean;
+  /**
+   * Break a `<target>.lock` whose holder is *provably* gone — a dead process on this host.
+   *
+   * Deliberately not a `--force`: `acquireLock` refuses a live holder and refuses one it cannot
+   * judge, so this flag is useless against a running server and useful only after a crash.
+   */
+  readonly breakStaleLock?: boolean;
   readonly hooks?: MigrationHooks;
 }
 
@@ -307,18 +323,14 @@ const SIDECARS = ['-wal', '-shm', '-journal'] as const;
  * silently miss data, and renaming a new file over it would strand the sidecars beside a database
  * they no longer describe. So their presence is a hard refusal.
  *
- * **Their absence proves nothing.** Codex was right about this and it is the one risk this module
- * cannot close on its own: an *idle* SQLite connection leaves no sidecar at all, so a running
- * server passes this check. On POSIX a `rename` over an open file succeeds — the server keeps
- * using the old inode while everything else sees the new one, and whatever the server writes
- * afterwards goes nowhere. There is also a window between this check and the rename in which a
- * server could start.
+ * **Their absence proves nothing**, and this check never claimed otherwise: an *idle* SQLite
+ * connection leaves no sidecar at all, so a running server passes it. That gap is now closed by
+ * something else — `server/lock.ts`, taken exclusively at the top of `importBackup` and held
+ * through the rename, which a running server holds for its whole lifetime. This check is kept
+ * because it catches what the lock cannot: a database left mid-write by a process that never took
+ * the lock at all — `sqlite3`, a copy that was interrupted, a crash before this contract existed.
  *
- * The check is run twice, once before reading and once immediately before the rename, which
- * narrows that window without closing it. Closing it properly needs the server to hold a lock file
- * for its whole lifetime that this importer takes exclusively — a contract that has to be honoured
- * on both sides, and `server/db.ts` does not exist yet. Claiming the guarantee before the other
- * half is written would be worse than stating the limitation. **Stop the server before importing.**
+ * It is still run twice, once before reading and once immediately before the rename.
  */
 function assertNoSidecars(targetPath: string, stage: MigrationStage = 'target'): void {
   for (const suffix of SIDECARS) {
@@ -334,29 +346,45 @@ function assertNoSidecars(targetPath: string, stage: MigrationStage = 'target'):
 }
 
 /**
- * A lock that stops two importers running at once.
+ * Take exclusive ownership of the database, or refuse and say who has it.
  *
- * `wx` fails if the file already exists, which is the whole mechanism. It does **not** stop a
- * running server — see `assertNoSidecars` — and does not pretend to. It is removed in a `finally`,
- * and a stale one after a crash is a plain file the owner can delete, which the message says.
+ * One lock, two holders, and that is the whole point: the server takes `<database>.lock` when it
+ * opens the file and holds it until it closes (`server/db.ts`), and this takes the same lock
+ * before it reads a single byte and holds it through the rename. So "another import is running"
+ * and "the server is running" are the same refusal with different words, and neither can be
+ * mistaken for the other because the record in the file names its role.
+ *
+ * The refusal is re-thrown as a `MigrationError` on the `target` stage so that every way this
+ * command can decline still arrives at the caller as one type carrying one stage — nothing has
+ * been created, opened or written at this point.
  */
-function acquireImportLock(targetPath: string): () => void {
-  const lockPath = `${targetPath}.import-lock`;
-  let fd: number;
+function acquireOwnership(targetPath: string, breakStaleLock: boolean): HeldLock {
   try {
-    fd = openSync(lockPath, 'wx');
-  } catch {
-    throw new MigrationError(
-      'target',
-      `"${lockPath}" already exists, so another import may be running. Nothing has been ` +
-        'written. If no import is running, delete that file and try again.',
-    );
+    return acquireLock({
+      databasePath: targetPath,
+      role: 'import',
+      // Never by itself. `--break-stale-lock` is the owner saying so out loud, and even then
+      // `acquireLock` refuses anything whose holder is not provably gone.
+      reclaimStale: breakStaleLock,
+    });
+  } catch (error) {
+    if (error instanceof LockUnavailableError) {
+      throw new MigrationError('target', `${error.message}\nNothing has been written.`);
+    }
+    throw error;
   }
-  writeFileSync(fd, `${String(process.pid)}\n`);
-  closeSync(fd);
-  return () => {
-    rmSync(lockPath, { force: true });
-  };
+}
+
+/** The same re-throw, at the commit stage: ownership lost between taking the lock and the rename. */
+function assertStillOwned(lock: HeldLock): void {
+  try {
+    lock.assertStillHeld();
+  } catch (error) {
+    if (error instanceof LockUnavailableError) {
+      throw new MigrationError('commit', `${error.message}\nNothing has been replaced.`);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -403,13 +431,36 @@ function timestampSuffix(now: Date): string {
  */
 export function importBackup(options: ImportOptions): ImportReport {
   const { targetPath } = options;
-  const dryRun = options.dryRun === true;
 
-  // 1. Validate. Nothing has been created yet, so a rejection here costs nothing.
+  // 1. Validate. Nothing has been created yet, so a rejection here costs nothing — and it costs
+  //    nothing to anybody else either, which is why it happens before the lock is taken.
   const backup = validateBackupStrict(options.backup);
   const incoming = datasetOfBackup(backup);
 
-  // 2. Read whatever is already there — read-only. The live file is never opened for writing.
+  // 2. Take exclusive ownership, before anything is read.
+  //
+  //    Earlier than it needs to be for the rename alone, on purpose. Codex's finding named the
+  //    rename, but the same reasoning condemns the two reads that precede it: a dataset decoded
+  //    out of a database somebody is writing to is a dataset that was never in the file at one
+  //    instant, and a safety copy taken from underneath a live writer is an inconsistent copy of
+  //    the one artefact whose whole job is to be usable afterwards. So the lock spans all of it.
+  //
+  //    A dry run takes it too. It reads the target, and a rehearsal against a moving database is
+  //    a rehearsal of nothing — worse, it would pass and then the real run would refuse.
+  const lock = acquireOwnership(targetPath, options.breakStaleLock === true);
+  try {
+    return importUnderLock(options, incoming, lock);
+  } finally {
+    lock.release();
+  }
+}
+
+/** Everything from the first read to the rename, with `<target>.lock` held throughout. */
+function importUnderLock(options: ImportOptions, incoming: Dataset, lock: HeldLock): ImportReport {
+  const { targetPath } = options;
+  const dryRun = options.dryRun === true;
+
+  // 3. Read whatever is already there — read-only. The live file is never opened for writing.
   const targetExisted = existsSync(targetPath);
   let existing = EMPTY_DATASET;
   let existingRevision = 0;
@@ -448,7 +499,7 @@ export function importBackup(options: ImportOptions): ImportReport {
     }
   }
 
-  // 3. Plan. A conflict aborts here, before a temporary file has even been created.
+  // 4. Plan. A conflict aborts here, before a temporary file has even been created.
   const plan = planImport(existing, incoming);
   if (plan.conflicts.length > 0) throw new ImportConflictError(plan.conflicts);
 
@@ -457,9 +508,8 @@ export function importBackup(options: ImportOptions): ImportReport {
   const revision = existingRevision + (plan.insertedTotal > 0 ? 1 : 0);
   const expectedState: ExpectedState = { dataset: plan.expected, revision };
 
-  // 4. Build — in the target's own directory, so the rename at the end is a same-filesystem move
+  // 5. Build — in the target's own directory, so the rename at the end is a same-filesystem move
   //    and therefore atomic. A temporary file under /tmp would make it a copy, which is not.
-  const releaseLock = acquireImportLock(targetPath);
   const workDir = mkdtempSync(join(dirname(targetPath), '.godmode-import-'));
   const temporaryPath = join(workDir, basename(targetPath));
   let renamed = false;
@@ -476,7 +526,7 @@ export function importBackup(options: ImportOptions): ImportReport {
 
       options.hooks?.afterInsert?.(fresh);
 
-      // 5. Verify. Every check can fail; any failure means the target is never touched.
+      // 6. Verify. Every check can fail; any failure means the target is never touched.
       checksRun = verifyDatabase(fresh, expectedState, {
         ...(options.allowDanglingChainHead === true ? { allowDanglingChainHead: true } : {}),
         ...(options.allowTotalMismatch === true ? { allowTotalMismatch: true } : {}),
@@ -505,16 +555,24 @@ export function importBackup(options: ImportOptions): ImportReport {
 
     if (dryRun || nothingToDo) return report;
 
-    // 6. Put it in place. Copy the old file aside first, and leave that copy there for good.
+    // 7. Put it in place. Copy the old file aside first, and leave that copy there for good.
     fsyncPath(temporaryPath);
     let safetyCopyPath: string | undefined;
     if (targetExisted) safetyCopyPath = copyAside(targetPath, new Date());
 
     options.hooks?.beforeRename?.(temporaryPath);
 
-    // Last look before the point of no return. It cannot prove no server is running — see
-    // `assertNoSidecars` — but a sidecar that appeared while this import was building is a
-    // definite writer, and stopping here costs nothing.
+    // Two last looks before the point of no return, and they answer different questions.
+    //
+    // The lock answers "does anything that honours this contract still own the file" — including
+    // the case the sidecars are blind to, an idle server connection. It is re-checked rather than
+    // assumed because a stale-lock reclaim by somebody else, or a hand-deleted lock file, would
+    // have taken ownership away from this process while it was building; better to find that out
+    // for free here than after the rename.
+    //
+    // The sidecar check answers "was this database left mid-write by anything at all", including
+    // processes that never heard of the lock. Both are cheap and neither implies the other.
+    assertStillOwned(lock);
     if (targetExisted) assertNoSidecars(targetPath, 'commit');
 
     renameSync(temporaryPath, targetPath);
@@ -547,7 +605,6 @@ export function importBackup(options: ImportOptions): ImportReport {
     // because a post-rename failure throws rather than returns.
     void renamed;
     rmSync(workDir, { recursive: true, force: true });
-    releaseLock();
   }
 }
 

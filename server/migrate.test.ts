@@ -29,6 +29,7 @@ import {
   planImport,
 } from './migrate.js';
 import { parseArguments, run } from './import-backup.js';
+import { lockPathFor } from './lock.js';
 import { applySchema } from './schema.js';
 import { BackupValidationError } from './validate.js';
 import { VerificationFailure } from './verify.js';
@@ -518,7 +519,11 @@ describe('importBackup — the boundaries Codex named', () => {
     ).toThrow('stop here');
 
     expect(inner).toBeInstanceOf(MigrationError);
-    expect((inner as MigrationError).message).toMatch(/another import may be running/);
+    expect((inner as MigrationError).stage).toBe('target');
+    // One lock, two kinds of holder. The record names the role, so the refusal can say which.
+    expect((inner as MigrationError).message).toMatch(/locked by another import/);
+    expect((inner as MigrationError).message).toContain('Two imports must not touch the same');
+    expect((inner as MigrationError).message).toContain('Nothing has been written.');
     expect(hash(target)).toBe(before);
   });
 
@@ -526,12 +531,13 @@ describe('importBackup — the boundaries Codex named', () => {
     const dir = tempDir();
     const target = join(dir, 'godmode.sqlite');
     importBackup({ backup: clone(MAXIMAL_BACKUP), targetPath: target });
-    expect(existsSync(`${target}.import-lock`)).toBe(false);
+    expect(existsSync(lockPathFor(target))).toBe(false);
+    expect(strays(dir, 'godmode.sqlite')).toEqual([]);
 
     expect(() =>
       importBackup({ backup: { format: 'not-a-backup' }, targetPath: target }),
     ).toThrow(BackupValidationError);
-    expect(existsSync(`${target}.import-lock`)).toBe(false);
+    expect(existsSync(lockPathFor(target))).toBe(false);
   });
 
   it('refuses an integer too large to have survived JSON.parse intact', () => {
