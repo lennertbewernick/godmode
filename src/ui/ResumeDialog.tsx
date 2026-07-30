@@ -124,33 +124,52 @@ export function LeaveRunnerDialog({
     <Modal title="Leave this workout?" onClose={onStay}>
       <div className="flex flex-col gap-4">
         {/*
-          Each label states its own consequence, so nothing below has to explain it. "Leave and
-          keep it" needed a caption to be understood beside "Keep going"; "Pause — resume from
-          Today" says where the session goes and how to get it back, in the label itself. The
-          only prose left is the one fact a label cannot carry: how much is at stake.
-        */}
-        <p className="text-sm leading-relaxed text-slate-300">
-          {progress.setsDone === 0
-            ? 'Nothing recorded yet.'
-            : `${progress.repsDone} rep${progress.repsDone === 1 ? '' : 's'} across ` +
-              `${progress.setsDone} set${progress.setsDone === 1 ? '' : 's'} saved.`}
-        </p>
+          Two shapes, because the decision genuinely differs — and no prose in either, because
+          the user just performed the sets and does not need them read back.
 
-        <div className="flex flex-col gap-2 sm:flex-row">
-          <Button className="flex-1" onClick={onStay}>
-            Carry on training
-          </Button>
-          <Button variant="ghost" onClick={onKeep}>
-            Pause — resume from Today
-          </Button>
-        </div>
-        <button
-          type="button"
-          className="self-start text-xs text-amber-300 underline"
-          onClick={onDiscard}
-        >
-          Discard — these reps are gone
-        </button>
+          With nothing recorded there is nothing to keep and nothing to lose, so pause and
+          discard are the same act described two ways. Offering all three there is what made
+          this screen hard to read: three buttons, one real outcome. It asks a plain yes/no
+          instead, and cancelling deletes the empty draft so Today does not later offer back a
+          session in which nothing happened.
+
+          Once reps exist the three-way choice is real, and each label carries its own
+          consequence so nothing underneath has to explain it.
+
+          "Reset workout", not "Discard" — the owner said a discard word made him fear losing
+          the DAY, not just the attempt. Nothing here can: the draft and the plan slot are
+          separate records, `deleteDraft` touches only the draft, and the day stays planned and
+          startable. "Reset" says back-to-the-start, which is exactly what happens. Do not
+          rename this to discard/delete/throw away.
+        */}
+        {progress.setsDone === 0 ? (
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <Button className="flex-1" onClick={onStay}>
+              Carry on training
+            </Button>
+            <Button variant="ghost" onClick={onDiscard}>
+              Cancel this workout
+            </Button>
+          </div>
+        ) : (
+          <>
+            <div className="flex flex-col gap-2 sm:flex-row">
+              <Button className="flex-1" onClick={onStay}>
+                Carry on training
+              </Button>
+              <Button variant="ghost" onClick={onKeep}>
+                Pause — resume from Today
+              </Button>
+            </div>
+            <button
+              type="button"
+              className="self-start text-xs text-amber-300 underline"
+              onClick={onDiscard}
+            >
+              Reset workout
+            </button>
+          </>
+        )}
       </div>
     </Modal>
   );
