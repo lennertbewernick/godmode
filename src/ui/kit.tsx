@@ -3,7 +3,7 @@
  * and no chart dependency.
  */
 
-import type { ReactNode } from 'react';
+import { useEffect, useId, useRef, type ReactNode } from 'react';
 
 export function Card({
   children,
@@ -264,9 +264,118 @@ export function Banner({
   );
 }
 
-export function Spinner({ label }: { label: string }) {
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), ' +
+  'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * The app's only dialog. Everything modal goes through it, so there is one dismissal
+ * behaviour, one focus behaviour and one shape to learn.
+ *
+ * Below `sm` it is a bottom sheet rather than a centred box. That is deliberate rather than
+ * decorative: the trigger sits in the top-right chrome, and the phone's thumb zone is the
+ * bottom of the screen — a centred dialog would put the actions out of reach of the hand that
+ * opened it. `max-h-[85vh]` with its own scroll is what guarantees it cannot outgrow a phone
+ * viewport no matter how tall its contents get.
+ */
+export function Modal({
+  title,
+  onClose,
+  children,
+  wide = false,
+}: {
+  title: string;
+  onClose: () => void;
+  children: ReactNode;
+  wide?: boolean;
+}) {
+  const titleId = useId();
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    // Whatever had focus when the dialog opened — usually the trigger. Without restoring it,
+    // closing the sheet drops a keyboard user back at the top of the document every time.
+    const previous = document.activeElement as HTMLElement | null;
+    panelRef.current?.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+
+      const panel = panelRef.current;
+      if (!panel) return;
+      const focusable = [...panel.querySelectorAll<HTMLElement>(FOCUSABLE)];
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (!first || !last) return;
+
+      // A plain wrap is enough — this app has no nested dialogs.
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      previous?.focus?.();
+    };
+  }, [onClose]);
+
   return (
-    <div className="flex min-h-screen items-center justify-center text-slate-400">
+    <div
+      className="fixed inset-0 z-50 flex items-end justify-center bg-[#0b1220]/80 backdrop-blur-sm sm:items-center"
+      onMouseDown={(event) => {
+        // Only a press on the backdrop itself closes; one that bubbled out of the panel does not.
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        className={[
+          'max-h-[85vh] w-full overflow-y-auto rounded-t-2xl border border-[#26324b] bg-[#131c2e]',
+          'p-4 shadow-2xl shadow-black/50 outline-none sm:rounded-2xl safe-b',
+          wide ? 'sm:max-w-lg' : 'sm:max-w-md',
+        ].join(' ')}
+      >
+        <div className="flex items-center justify-between gap-3">
+          <h2 id={titleId} className="text-lg font-semibold text-slate-100">
+            {title}
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="min-h-11 shrink-0 px-2 text-slate-400 hover:text-slate-200"
+          >
+            ✕
+          </button>
+        </div>
+        <div className="mt-4">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * `className` overrides the height, because the full-screen default is wrong inside a dialog:
+ * a `min-h-screen` box within an `85vh` panel makes the panel scroll for no reason.
+ */
+export function Spinner({ label, className = 'min-h-screen' }: { label: string; className?: string }) {
+  return (
+    <div className={`flex items-center justify-center text-slate-400 ${className}`}>
       <span className="animate-pulse">{label}</span>
     </div>
   );
