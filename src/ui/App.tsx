@@ -1092,8 +1092,6 @@ export function App() {
           <History
             workouts={state.workouts}
             slots={state.slots}
-            exerciseLabel={state.exerciseLabel}
-            scopedToOneWorkout={state.active.length > 1}
             daysPerWeek={daysPerWeek(state.challenge)}
             onShare={() => setShareOpen(true)}
           />

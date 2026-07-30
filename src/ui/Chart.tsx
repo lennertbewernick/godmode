@@ -18,25 +18,46 @@
  * follow the width.
  */
 
-import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
+import { useCallback, useRef, useState, type ReactNode } from 'react';
 import type { CumulativePoint, SessionPoint } from '../core/stats.js';
 // Shared with the canvas share card, so the two renderings of the same graph cannot drift.
 import { OUTCOME_DOT, niceScale, shortDate, tickIndices } from './chartScale.js';
 
-/** Observe an element's content width. Returns 0 until the first measurement lands. */
-function useElementWidth<T extends HTMLElement>(): [RefObject<T | null>, number] {
-  const ref = useRef<T>(null);
+/**
+ * Observe an element's content width. Returns 0 until the first measurement lands.
+ *
+ * A **callback ref**, not a `useRef` + `useEffect([])`. That combination had a bug worth
+ * remembering: these charts return `<Empty />` when they have no points, so the measured
+ * container is not rendered at all. The mount effect then ran with `ref.current === null`,
+ * bailed, and — having no dependencies — never ran again. When points arrived the element
+ * appeared but nothing was observing it, so `width` stayed 0 and the chart rendered blank
+ * for good. Switching between two workouts hit this whenever the incoming one rendered
+ * empty for a beat; toggling per-session/running-total appeared to "fix" it only because
+ * that mounts a different component.
+ *
+ * A callback ref is invoked with the node every time it attaches and with `null` when it
+ * detaches, so the observer follows the element instead of a single moment in time. The
+ * synchronous `getBoundingClientRect` is what makes the first paint correct rather than
+ * waiting for the observer's first callback.
+ */
+function useElementWidth<T extends HTMLElement>(): [(node: T | null) => void, number] {
   const [width, setWidth] = useState(0);
+  const observer = useRef<ResizeObserver | null>(null);
 
-  useEffect(() => {
-    const el = ref.current;
-    if (!el || typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver((entries) => {
+  const ref = useCallback((node: T | null) => {
+    observer.current?.disconnect();
+    observer.current = null;
+    if (!node) return;
+
+    setWidth(Math.round(node.getBoundingClientRect().width));
+    if (typeof ResizeObserver === 'undefined') return;
+
+    const next = new ResizeObserver((entries) => {
       const measured = entries[0]?.contentRect.width;
       if (measured !== undefined) setWidth(Math.round(measured));
     });
-    observer.observe(el);
-    return () => observer.disconnect();
+    next.observe(node);
+    observer.current = next;
   }, []);
 
   return [ref, width];
@@ -190,7 +211,7 @@ function Plot({
   note,
 }: {
   width: number;
-  containerRef: RefObject<HTMLDivElement | null>;
+  containerRef: (node: HTMLDivElement | null) => void;
   label: string;
   children: (g: Geometry) => ReactNode;
   legend: ReactNode;

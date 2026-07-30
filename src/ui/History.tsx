@@ -37,16 +37,11 @@ const OUTCOME_STYLE: Record<WorkoutOutcome, string> = {
 export function History({
   workouts,
   slots,
-  exerciseLabel,
-  scopedToOneWorkout,
   daysPerWeek,
   onShare,
 }: {
   workouts: WorkoutRecord[];
   slots: PlanSlotRecord[];
-  exerciseLabel: string;
-  /** True when more than one workout exists, so the scope needs stating. */
-  scopedToOneWorkout: boolean;
   /** Sets the streak's rest-day tolerance. See `rhythmGapDays`. */
   daysPerWeek: number;
   /** Opens the one export sheet. History keeps the affordance, not a second implementation. */
@@ -96,9 +91,11 @@ export function History({
               sub={totals.kcal > 0 ? kcalNote : 'set bodyweight'}
             />
           </div>
-          {scopedToOneWorkout ? (
-            <p className="mt-3 text-xs text-slate-400">{exerciseLabel} only.</p>
-          ) : null}
+          {/*
+            No "<exercise> only." caption. The workout row above already names the selected
+            exercise, and every number on this screen is scoped to it — restating that under
+            the totals is the same fact in a second place.
+          */}
         </Card>
 
         <Card>
