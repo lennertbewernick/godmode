@@ -213,9 +213,21 @@ the round-trip surface where a field can be lost, which is the risk this documen
 estimates (`src/db/schema.ts:101-107`), and the estimator version that stops history being
 silently rewritten when the formula changes.
 
-`actualTotal` is **not** constrained to equal the sum of `sets[].actual`. It is a recorded fact
-from the source export's own total column, not a derived one, and a constraint that recomputed it
-would reject any session where the incumbent's arithmetic differs from ours.
+`actualTotal` is **not constrained in SQL** to equal the sum of `sets[].actual` — SQLite cannot
+express a CHECK over a JSON array's elements without a trigger, and a trigger that recomputed a
+stored fact is the wrong shape for an immutable log.
+
+An earlier version of this paragraph went further and said `actualTotal` is "a recorded fact from
+the source export's own total column, not a derived one". **That was wrong about the code**, and
+Codex caught the contradiction when the migration verifier began enforcing the invariant. Every
+write path derives it: `Runner.tsx:310` sums the actuals, `App.tsx:513-515` logs zeros and a zero
+total for a manual advance, and the CSV import at `pipeline.ts:389,411` stores `computedTotal` —
+the sum of the parsed sets — while merely *warning* when the incumbent file's own stated total
+disagrees. Nothing in this codebase stores a total it did not compute.
+
+So the invariant holds, and the migration importer verifies it in JavaScript, where it can. It
+holds on all 29 real sessions. `--allow-total-mismatch` is the named way past it, because refusing
+to migrate irreplaceable history over an arithmetic disagreement would be the worse failure.
 
 ---
 
@@ -400,11 +412,12 @@ difference. `insertSql()` in `server/rows.ts` emits a plain `INSERT` and has no 
 
 ## 12. What this does not cover
 
-- The importer itself, the temp-file-then-atomic-rename procedure, and the count/id-set
-  comparisons against the source. That is the next step; this one is its foundation.
 - The server, its routes, and how `meta.revision` is bumped per accepted command.
 - The in-progress workout draft, which stays in IndexedDB as a write-ahead buffer and is not part
   of this schema.
+
+(The importer, the temp-file-then-atomic-rename procedure and the verification checks were the
+next step and are now built — see §14.)
 
 ## 13. Verified against the real data, 2026-07-30
 
@@ -436,3 +449,97 @@ What remains genuinely unverified is narrower than before: the REAL-versus-INTEG
 a judgement about what *future* values could be, not a claim about the 29 sessions, whose numbers
 are all integral today. The migration still imports into a temporary file and verifies before
 anything is renamed into place.
+
+---
+
+## 14. The importer, and what it proves — 2026-07-30
+
+`server/migrate.ts` + `server/verify.ts` + `server/import-backup.ts`. Run it with:
+
+```
+npm run import-backup -- <backup.json> --target <database.sqlite> --dry-run
+```
+
+That compiles `server/` first, because Node's type stripping does not rewrite a `./migrate.js`
+specifier to the `./migrate.ts` file beside it and every module here uses that spelling. The
+compiled command is `node dist-server/server/import-backup.js`.
+
+### The procedure
+
+1. `validateBackupStrict` — every field of every record, unknown format versions refused.
+2. Read the existing target **read-only**, decoding every row through `rows.ts` (which
+   re-validates it). Refuse if a `-wal`, `-shm` or `-journal` sidecar is present.
+3. Plan: absent id → insert; present and canonically identical → no-op; present and different →
+   **abort, naming the ids and the differing fields**. Never `INSERT OR REPLACE`.
+4. Build a **fresh** database in a temporary file inside the target's own directory, holding
+   stored ∪ incoming, in one transaction.
+5. Verify it — 13 checks, below. Any failure discards the temporary file.
+6. `fsync`; copy the old database to `<target>.pre-import-<timestamp>.sqlite` with
+   `COPYFILE_EXCL`; re-check for sidecars; `renameSync`; `fsync` the directory.
+
+Nothing is ever deleted. Not the safety copy, not the backup JSON, and not the browser's
+IndexedDB — no code in this work calls `indexedDB.deleteDatabase`.
+
+The output is **rebuilt, not patched**: an existing target's records go back in through the same
+gate the import came through, rather than being carried forward as bytes. A true no-op — nothing
+new in the backup — skips the rename entirely, so the file is not touched at all.
+
+### The 13 checks
+
+| # | Check | What only it can see |
+|---|---|---|
+| 1 | `PRAGMA integrity_check` | page/B-tree corruption |
+| 2 | `PRAGMA foreign_key_check` | a declared reference that does not resolve in SQL |
+| 3 | meta | one row, this build's schema version, the expected revision |
+| 4 | row counts | a record that did not land |
+| 5 | id sets | a *swapped* id, which leaves the count intact |
+| 6 | record-by-record canonical equality | a coerced number, a dropped field |
+| 7 | **columns physically hold what the record says** | a *symmetric* encode/decode defect |
+| 8 | duplicate primary keys | a PRIMARY KEY that went missing from the DDL |
+| 9 | references resolve | `chainId` and friends, which have no foreign key |
+| 10 | attempt-number uniqueness | a lost unique index |
+| 11 | slot belongs to the workout's challenge | a cross-challenge link every FK accepts |
+| 12 | totals equal the sum of their parts | a set silently dropped from a JSON array |
+| 13 | settings is a single expected row | a lost or duplicated preferences row |
+
+Check 7 is the answer to the hardest form of Codex's original objection. Checks 4–6 all speak
+through `rows.ts` and `fields.ts`, so an encoder and a decoder that are wrong **in the same way**
+agree with each other and pass — a round trip is symmetric, and symmetry is not meaning. Codex's
+example: `encode` writes `chainId` into the `challenge_id` column while `decode` reads it back the
+same way round. Integrity passes, the foreign key resolves, the record reconstructs perfectly — and
+every SQL query, index and join on `challenge_id` returns the wrong rows. So `COLUMN_ORACLE` in
+`server/verify.ts` states the record-to-column mapping a **second time**, independently, and reads
+the columns with SQL that never touches `rows.ts`. It also refuses any column it does not name, so
+the schema cannot grow past it in silence.
+
+Two checks fail closed with a named door: `--allow-dangling-chain-head` (§9 explains why `chain_id`
+has no foreign key) and `--allow-total-mismatch` (§6). Neither is needed for the owner's data.
+
+### Verified against the real data, again
+
+The 29-session export (2 exercises, 2 challenges, 1 max test, 36 plan slots, 29 workouts,
+**3134 reps**) was driven through the whole importer:
+
+- a dry run built and verified a complete database and left nothing behind;
+- a real import created the file and passed all 13 checks;
+- the `sqlite3` CLI — a connection that knows nothing about this codebase — reads 29 workouts and
+  3134 reps out of it, and answers `ok` to `integrity_check` and nothing to `foreign_key_check`;
+- **re-running with the same file is byte-identical**: nothing inserted, no rename, no safety copy;
+- re-running with one session's `actualTotal` altered **aborts**, names the workout id and the two
+  differing fields, and leaves the database byte-identical.
+
+The tests in the repository use `server/fixtures.ts`, not that export: a test reading an absolute
+path outside the repository would fail for everyone else and rot.
+
+### The limit this cannot close, stated plainly
+
+**Stop the server before importing.** The sidecar refusal catches a database that was not closed
+cleanly, and a lock file stops two importers colliding — but an *idle* SQLite connection leaves no
+trace at all, so neither proves the server is stopped. On POSIX, renaming a file over one that a
+process still has open succeeds: that process keeps writing to the old inode, and those writes go
+nowhere. Closing this properly needs a lock file the server holds for its whole lifetime and the
+importer takes exclusively. That is a contract with two sides, and `server/db.ts` is not written
+yet. Claiming the guarantee before the other half exists would be worse than recording the gap.
+
+Also unverified: crash-recovery behaviour on the eventual deploy filesystem, and the safety copy's
+collision retry (guarded by `COPYFILE_EXCL` plus a random suffix, but not exercised by a test).
