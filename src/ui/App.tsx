@@ -48,6 +48,11 @@ import { Today } from './Today.js';
 import { AddWorkout, Welcome } from './Welcome.js';
 import { buildShareCard, toStatWorkouts } from './shareCardData.js';
 import { Banner, Button, Card, NumberField, Segmented, Spinner } from './kit.js';
+// The update seam only. Nothing here imports ../pwa/lifecycle.js: that module owns the
+// `virtual:pwa-register` import, which does not resolve under Vitest, and pulling it into this
+// file's module graph would take every App test down with it.
+import { shouldOfferUpdate } from '../pwa/policy.js';
+import { applyUpdate, subscribeUpdateReady } from '../pwa/updateStore.js';
 
 type Tab = 'today' | 'history' | 'settings';
 type View =
@@ -119,6 +124,7 @@ export function App() {
   } | null>(null);
   const [backupDismissed, setBackupDismissed] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [updateReady, setUpdateReady] = useState(false);
 
   const load = useCallback(async () => {
     const [active, challenge, settings, totalWorkouts] = await Promise.all([
@@ -171,6 +177,10 @@ export function App() {
       setError(e instanceof Error ? e.message : 'Could not open your data.'),
     );
   }, [load]);
+
+  // Fires immediately with the current value, so an update that landed before React mounted
+  // is not lost.
+  useEffect(() => subscribeUpdateReady(setUpdateReady), []);
 
   /**
    * The card's data, assembled from state the shell already holds. Built here rather than in
@@ -444,6 +454,31 @@ export function App() {
         <div className="pb-3">
           <Banner tone="warn" onDismiss={() => setError(null)}>
             {error}
+          </Banner>
+        </div>
+      ) : null}
+
+      {/*
+        This app never reloads itself. Runner.tsx keeps the session's `actuals` in React state
+        and writes nothing until the workout is saved, so an unattended reload would silently
+        destroy reps the user has already done. The reload is always the user's tap.
+
+        `workoutInProgress` is passed even though this render site already sits after the
+        `view.kind === 'runner'` early return, so the banner is structurally unreachable during
+        a workout. Stating the guarantee in code — and pinning it in policy.test.ts — is worth
+        more than trusting the ordering of early returns in a 700-line file to stay put.
+
+        No onDismiss: a dismissed update is an update the user never gets, and this app is
+        handed out once as a link.
+      */}
+      {shouldOfferUpdate({ updateReady, workoutInProgress: view.kind === 'runner' }) ? (
+        <div className="pb-3">
+          <Banner tone="info">
+            A newer version is ready.{' '}
+            <button type="button" className="underline" onClick={() => applyUpdate()}>
+              Reload to update
+            </button>
+            .
           </Banner>
         </div>
       ) : null}
