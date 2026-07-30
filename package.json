@@ -9,6 +9,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
+    "preview:pwa": "GODMODE_SW_LOCAL=1 npm run build && vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -b --noEmit"

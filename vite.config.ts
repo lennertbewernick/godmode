@@ -48,6 +48,19 @@ export default defineConfig(({ mode }) => {
 
   return {
     base: './',
+    define: {
+      /**
+       * The deliberate-verification escape hatch: `npm run preview:pwa` sets GODMODE_SW_LOCAL=1
+       * so a local build registers a real service worker and offline can be tested.
+       *
+       * A plain `npm run preview` registers nothing. That is the fix for the dev-server
+       * shadowing bug — see the port comment above: `dev` and `preview` share one origin on
+       * purpose, so a worker installed by preview would otherwise serve the previous build's
+       * precached index.html to the dev server, and the developer would edit code the browser
+       * never fetches.
+       */
+      __SW_ON_LOCALHOST__: JSON.stringify(env.GODMODE_SW_LOCAL === '1'),
+    },
     resolve: {
       alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
     },
@@ -57,7 +70,23 @@ export default defineConfig(({ mode }) => {
       react(),
       tailwindcss(),
       VitePWA({
-        registerType: 'autoUpdate',
+        /**
+         * 'prompt', not 'autoUpdate'.
+         *
+         * Under 'autoUpdate' the plugin sets skipWaiting + clientsClaim, so a new worker takes
+         * over a live page on its own schedule, and the plugin's own register client calls
+         * window.location.reload() on activation with no idea whether a workout is running.
+         * Runner.tsx holds the session's reps in React state until the workout is saved, so
+         * that reload silently destroys them. Under 'prompt' the new worker waits until the app
+         * asks — which only happens on the user's tap — so the guard is structural.
+         */
+        registerType: 'prompt',
+        /**
+         * The app registers the worker itself (src/pwa/lifecycle.ts). Letting the plugin also
+         * inject registerSW.js would give us two registration paths that disagree about the
+         * policy, and the injected one runs first.
+         */
+        injectRegister: false,
         includeAssets: ['favicon.svg'],
         manifest: {
           name: 'GodMode: No More Later',
@@ -77,6 +106,21 @@ export default defineConfig(({ mode }) => {
         workbox: {
           globPatterns: ['**/*.{js,css,html,svg,png,woff2}'],
           navigateFallback: 'index.html',
+          /**
+           * Already the plugin's default and already present in dist/sw.js — restated so a
+           * future default change cannot silently strand a previous build's precache on a
+           * group member's phone, where storage is scarce and eviction is the real risk.
+           */
+          cleanupOutdatedCaches: true,
+          /**
+           * reset-sw.html must never be answered from the precache. It is the recovery page,
+           * so it is needed exactly when the installed worker is the problem; navigateFallback
+           * would otherwise hand back index.html and the page would be unreachable.
+           * Suffix-anchored and prefix-free, so it holds at any deploy subpath.
+           */
+          navigateFallbackDenylist: [/reset-sw\.html$/],
+          /** Same reason: it is a network tool and has no offline job. */
+          globIgnores: ['reset-sw.html'],
         },
       }),
     ],
