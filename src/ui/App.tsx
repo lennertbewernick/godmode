@@ -650,8 +650,11 @@ function WorkoutBar({
   onSelect: (challengeId: string) => void;
   onAddWorkout: () => void;
 }) {
+  // items-stretch, not items-center: the add button below has no line box of its own, so it
+  // would sit at its min-h-9 floor while the chips are pushed past it by their 24px line box.
+  // Stretching lets it inherit whatever height the chips settle at instead of restating it.
   return (
-    <div className="flex flex-wrap items-center gap-2">
+    <div className="flex flex-wrap items-stretch gap-2">
       <div className="flex flex-wrap gap-2" role="tablist" aria-label="Workout">
         {active.map((challenge) => {
           const isSelected = challenge.id === selectedId;
@@ -677,8 +680,10 @@ function WorkoutBar({
 
       {/*
         Deliberately a plain button carrying the chip's own geometry rather than the kit Button:
-        it sits in the chip row and should read as one of them, so the row is 36px because the
-        chips are. It stays outside the tablist above — it selects nothing.
+        it sits in the chip row and should read as one of them. Its own inline-flex centres the
+        glyph inside the height the row hands it. It stays outside the tablist — it selects
+        nothing. If the chips wrap, this drops to its own flex line rather than stretching to
+        the wrapped block, which is why stretching is safe here.
       */}
       <button
         type="button"
