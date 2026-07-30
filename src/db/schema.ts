@@ -15,6 +15,7 @@
  */
 
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import { canonicalProfileId } from '../import/profiles.js';
 import type {
   AdjustmentType,
   Baseline,
@@ -28,7 +29,16 @@ import type {
 } from '../core/types.js';
 
 export const DB_NAME = 'fitness-companion';
-export const DB_VERSION = 1;
+
+/**
+ * Bump this and add a guarded branch in `upgrade` below. Never edit an existing branch:
+ * a database that already ran it will not run it again, so a retroactive edit only ever
+ * applies to some users.
+ *
+ * v1 initial stores. v2 normalised the retired vendor-derived import-source id
+ * (see `LEGACY_PROFILE_IDS` in `src/import/profiles.ts`).
+ */
+export const DB_VERSION = 2;
 
 export interface ExerciseRecord {
   id: string;
@@ -169,27 +179,54 @@ export type Database = IDBPDatabase<FitnessDB>;
 
 export function openFitnessDB(name = DB_NAME): Promise<Database> {
   return openDB<FitnessDB>(name, DB_VERSION, {
-    upgrade(db) {
-      db.createObjectStore('exercises', { keyPath: 'id' });
+    // `oldVersion` is 0 for a brand-new database and the stored version otherwise. Every
+    // branch must be guarded: an unguarded `createObjectStore` throws ConstraintError on an
+    // existing database, which aborts the upgrade transaction and leaves the app unable to
+    // open the database at all. On a device that holds the only copy of the data, that is
+    // indistinguishable from data loss.
+    upgrade(db, oldVersion, _newVersion, tx) {
+      if (oldVersion < 1) {
+        db.createObjectStore('exercises', { keyPath: 'id' });
 
-      const challenges = db.createObjectStore('challenges', { keyPath: 'id' });
-      challenges.createIndex('byChain', 'chainId');
-      challenges.createIndex('byStatus', 'status');
+        const challenges = db.createObjectStore('challenges', { keyPath: 'id' });
+        challenges.createIndex('byChain', 'chainId');
+        challenges.createIndex('byStatus', 'status');
 
-      const tests = db.createObjectStore('performanceTests', { keyPath: 'id' });
-      tests.createIndex('byExercise', 'exerciseId');
+        const tests = db.createObjectStore('performanceTests', { keyPath: 'id' });
+        tests.createIndex('byExercise', 'exerciseId');
 
-      const slots = db.createObjectStore('planSlots', { keyPath: 'id' });
-      slots.createIndex('byChallenge', 'challengeId');
-      slots.createIndex('byChallengeOrdinal', ['challengeId', 'ordinal']);
+        const slots = db.createObjectStore('planSlots', { keyPath: 'id' });
+        slots.createIndex('byChallenge', 'challengeId');
+        slots.createIndex('byChallengeOrdinal', ['challengeId', 'ordinal']);
 
-      const workouts = db.createObjectStore('workouts', { keyPath: 'id' });
-      workouts.createIndex('byChallenge', 'challengeId');
-      workouts.createIndex('bySlot', 'planSlotId');
-      workouts.createIndex('byChain', 'chainId');
-      workouts.createIndex('byPerformedAt', 'performedAt');
+        const workouts = db.createObjectStore('workouts', { keyPath: 'id' });
+        workouts.createIndex('byChallenge', 'challengeId');
+        workouts.createIndex('bySlot', 'planSlotId');
+        workouts.createIndex('byChain', 'chainId');
+        workouts.createIndex('byPerformedAt', 'performedAt');
 
-      db.createObjectStore('settings', { keyPath: 'id' });
+        db.createObjectStore('settings', { keyPath: 'id' });
+      }
+
+      // v2: the import profile was renamed off the incumbent's brand. Rewrite the provenance
+      // string in place so no record is left carrying a retired id.
+      //
+      // The work runs inside the upgrade transaction: every await is on a request belonging
+      // to `tx`, which keeps the transaction alive across them, and `openDB` does not resolve
+      // until `tx` completes. So this is atomic — a failure aborts the upgrade and the
+      // database stays at v1 rather than half-migrated.
+      if (oldVersion >= 1 && oldVersion < 2) {
+        const workouts = tx.objectStore('workouts');
+        void (async () => {
+          for (const record of await workouts.getAll()) {
+            if (record.importSource === undefined) continue;
+            const canonical = canonicalProfileId(record.importSource);
+            if (canonical !== record.importSource) {
+              await workouts.put({ ...record, importSource: canonical });
+            }
+          }
+        })();
+      }
     },
   });
 }

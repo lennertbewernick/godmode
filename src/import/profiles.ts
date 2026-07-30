@@ -40,8 +40,11 @@ export interface ImportProfile {
 export type DateFormatId = 'd.M.yyyy HH:mm' | 'M/d/yyyy HH:mm' | 'd/M/yyyy HH:mm';
 
 /**
- * The Just 6 Weeks export, verified against a real German file
+ * The incumbent six-week challenge app's CSV export, verified against a real German file
  * (`example/incumbent-history-sample.csv`, 29 sessions).
+ *
+ * The profile is named for the format, not for the vendor. The mapping is positional, so
+ * translated headers do not need their own profile — only differing value formats would.
  *
  * Header, for reference:
  *   Datum;Workout;Ziel;Zeit;Woche;Tag;Zeit;Set 1;...;Set 5;Summe der Sets;Kcal
@@ -49,7 +52,7 @@ export type DateFormatId = 'd.M.yyyy HH:mm' | 'M/d/yyyy HH:mm' | 'd/M/yyyy HH:mm
  */
 export const INCUMBENT_CSV_V1: ImportProfile = {
   id: 'incumbent-csv-v1',
-  label: 'Just 6 Weeks (CSV export)',
+  label: 'Six-week challenge app (CSV export)',
   delimiter: ';',
   dateFormats: ['d.M.yyyy HH:mm', 'M/d/yyyy HH:mm', 'd/M/yyyy HH:mm'],
   durationFormat: 'mm:ss',
@@ -70,6 +73,26 @@ export const INCUMBENT_CSV_V1: ImportProfile = {
 
 export const PROFILES: ImportProfile[] = [INCUMBENT_CSV_V1];
 
+/**
+ * Profile ids that shipped under an earlier name, mapped to their current id.
+ *
+ * This map is the one place the retired vendor-derived id still appears, and it exists only
+ * in order to erase it: `importSource` is persisted on every imported workout, so renaming
+ * the profile leaves records carrying the old string. A rename that cannot name the old
+ * value cannot rewrite it. The v2 database migration rewrites stored records, and restore
+ * normalises anything arriving from an older backup, so no old value survives either entry
+ * point. The map has to outlive the migration because old backup files are forever.
+ */
+export const LEGACY_PROFILE_IDS: Readonly<Record<string, string>> = {
+  'incumbent-csv-v1': 'incumbent-csv-v1',
+};
+
+/** The current id for a possibly-legacy profile id. */
+export function canonicalProfileId(id: string): string {
+  return LEGACY_PROFILE_IDS[id] ?? id;
+}
+
 export function findProfile(id: string): ImportProfile | undefined {
-  return PROFILES.find((p) => p.id === id);
+  const canonical = canonicalProfileId(id);
+  return PROFILES.find((p) => p.id === canonical);
 }

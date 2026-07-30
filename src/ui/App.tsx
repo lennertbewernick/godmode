@@ -10,6 +10,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { AdjustmentType, WorkoutPerformance } from '../core/types.js';
 import {
   backupFilename,
+  backupIsEmpty,
   buildBackup,
   buildCsv,
   csvFilename,
@@ -202,7 +203,19 @@ export function App() {
     async (file: File) => {
       setError(null);
       try {
-        const result = await restoreBackup(JSON.parse(await file.text()));
+        const parsed = JSON.parse(await file.text());
+
+        // A well-formed but empty backup landing on a device that has history is almost
+        // always the wrong file, and restore is not undoable — it clears every store first.
+        if (backupIsEmpty(parsed) && (state?.workouts.length ?? 0) > 0) {
+          setError(
+            'That backup contains no sessions, and this device has history that restoring ' +
+              'would erase. Nothing has been changed. Check you picked the right file.',
+          );
+          return;
+        }
+
+        const result = await restoreBackup(parsed);
         await load();
         goToTab('today');
         setMessage(
@@ -212,7 +225,7 @@ export function App() {
         setError(e instanceof Error ? e.message : 'That backup could not be restored.');
       }
     },
-    [load, goToTab],
+    [load, goToTab, state],
   );
 
   const finishWorkout = useCallback(

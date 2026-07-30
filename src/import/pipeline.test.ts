@@ -19,9 +19,13 @@ const FIXTURE_CSV = readFileSync(
 );
 
 /**
- * The real 29-session export. Personal data, so it is gitignored — these assertions only
- * run on a machine that has it. `describe.skipIf` keeps CI and other clones honest rather
- * than silently passing.
+ * The real 29-session export. It is committed, so these assertions normally do run;
+ * `describe.skipIf` exists so the suite still passes in a tree where the file has been
+ * removed, rather than silently pretending to have verified the real data.
+ *
+ * It is one real person's activity history — dates, times, reps, calories. Treat it as
+ * personal data when deciding whether to publish it, and do not assume it is protected:
+ * `.gitignore` covers the incumbent's screenshots, not this file.
  */
 const REAL_PATH = resolve(process.cwd(), 'example/incumbent-history-sample.csv');
 const HAS_REAL = existsSync(REAL_PATH);

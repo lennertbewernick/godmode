@@ -11,6 +11,7 @@
  */
 
 import { getDB } from '../db/repo.js';
+import { canonicalProfileId } from '../import/profiles.js';
 import { DB_VERSION, DEFAULT_SETTINGS, type SettingsRecord } from '../db/schema.js';
 import type {
   ChallengeRecord,
@@ -69,14 +70,40 @@ export interface RestoreResult {
   performanceTests: number;
 }
 
-/** Validate and load a backup, replacing everything currently stored. */
-export async function restoreBackup(json: unknown): Promise<RestoreResult> {
-  const backup = json as Partial<BackupFile>;
-  if (backup?.format !== 'godmode-backup') {
+/**
+ * The collections a backup must carry. Absence is rejected rather than defaulted to empty:
+ * restore clears the database first, so treating a missing collection as "zero records" turns
+ * a truncated or hand-edited file into total, silent data loss on the only copy that exists.
+ */
+const REQUIRED_COLLECTIONS = [
+  'exercises',
+  'challenges',
+  'performanceTests',
+  'planSlots',
+  'workouts',
+] as const;
+
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Reject anything that is not a structurally intact backup, before the database is touched.
+ *
+ * This is deliberately more than a header check. A file carrying only
+ * `{"format":"godmode-backup","formatVersion":1}` is well-formed JSON and passes any
+ * header-only guard, and restoring it would clear every store and commit successfully.
+ */
+function validateBackup(json: unknown): BackupFile {
+  if (!isRecordObject(json)) {
     throw new Error('That file is not a GodMode backup.');
   }
-  if (typeof backup.formatVersion !== 'number') {
-    throw new Error('The backup is missing a format version.');
+  const backup = json as Partial<BackupFile>;
+  if (backup.format !== 'godmode-backup') {
+    throw new Error('That file is not a GodMode backup.');
+  }
+  if (typeof backup.formatVersion !== 'number' || !Number.isFinite(backup.formatVersion)) {
+    throw new Error('The backup is missing a usable format version.');
   }
   if (backup.formatVersion > BACKUP_FORMAT_VERSION) {
     throw new Error(
@@ -85,6 +112,54 @@ export async function restoreBackup(json: unknown): Promise<RestoreResult> {
         'Update the app before restoring, so nothing is silently dropped.',
     );
   }
+
+  for (const key of REQUIRED_COLLECTIONS) {
+    const value = backup[key];
+    if (!Array.isArray(value)) {
+      throw new Error(
+        `The backup is incomplete: "${key}" is missing or is not a list. ` +
+          'Nothing has been changed. Restoring it would have erased what is on this device.',
+      );
+    }
+    if (value.some((record) => !isRecordObject(record) || typeof record['id'] !== 'string')) {
+      throw new Error(
+        `The backup is damaged: "${key}" contains an entry without an id. ` +
+          'Nothing has been changed.',
+      );
+    }
+  }
+
+  if (backup.settings !== undefined && !isRecordObject(backup.settings)) {
+    throw new Error('The backup is damaged: "settings" is not an object. Nothing has been changed.');
+  }
+
+  return backup as BackupFile;
+}
+
+/**
+ * A restore that would leave the device with no history at all, from a file that claims to be
+ * a backup, is far more likely to be a damaged file than an intentional wipe.
+ */
+export function backupIsEmpty(json: unknown): boolean {
+  try {
+    const backup = validateBackup(json);
+    return backup.workouts.length === 0 && backup.challenges.length === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Validate and load a backup, replacing everything currently stored. */
+export async function restoreBackup(json: unknown): Promise<RestoreResult> {
+  const backup = validateBackup(json);
+
+  // An older backup can carry the retired import-source id; the v2 database migration only
+  // reaches records already stored, so normalise on the way in too.
+  const workouts = backup.workouts.map((workout) =>
+    workout.importSource === undefined
+      ? workout
+      : { ...workout, importSource: canonicalProfileId(workout.importSource) },
+  );
 
   const db = await getDB();
   const stores = [
@@ -97,22 +172,27 @@ export async function restoreBackup(json: unknown): Promise<RestoreResult> {
   ] as const;
   const tx = db.transaction(stores, 'readwrite');
 
-  for (const store of stores) await tx.objectStore(store).clear();
-
-  for (const r of backup.exercises ?? []) await tx.objectStore('exercises').put(r);
-  for (const r of backup.challenges ?? []) await tx.objectStore('challenges').put(r);
-  for (const r of backup.performanceTests ?? []) await tx.objectStore('performanceTests').put(r);
-  for (const r of backup.planSlots ?? []) await tx.objectStore('planSlots').put(r);
-  for (const r of backup.workouts ?? []) await tx.objectStore('workouts').put(r);
-  await tx.objectStore('settings').put(backup.settings ?? DEFAULT_SETTINGS);
-  await tx.done;
+  // Issue every request up front and await them together with `tx.done`, rather than awaiting
+  // each one in sequence. Sequentially awaiting hundreds of writes risks the transaction
+  // auto-committing between them — which on iOS Safari, the platform this app is built for,
+  // surfaces as TransactionInactiveError partway through a restore.
+  await Promise.all([
+    ...stores.map((store) => tx.objectStore(store).clear()),
+    ...backup.exercises.map((r) => tx.objectStore('exercises').put(r)),
+    ...backup.challenges.map((r) => tx.objectStore('challenges').put(r)),
+    ...backup.performanceTests.map((r) => tx.objectStore('performanceTests').put(r)),
+    ...backup.planSlots.map((r) => tx.objectStore('planSlots').put(r)),
+    ...workouts.map((r) => tx.objectStore('workouts').put(r)),
+    tx.objectStore('settings').put(backup.settings ?? DEFAULT_SETTINGS),
+    tx.done,
+  ]);
 
   return {
-    exercises: backup.exercises?.length ?? 0,
-    challenges: backup.challenges?.length ?? 0,
-    planSlots: backup.planSlots?.length ?? 0,
-    workouts: backup.workouts?.length ?? 0,
-    performanceTests: backup.performanceTests?.length ?? 0,
+    exercises: backup.exercises.length,
+    challenges: backup.challenges.length,
+    planSlots: backup.planSlots.length,
+    workouts: workouts.length,
+    performanceTests: backup.performanceTests.length,
   };
 }
 

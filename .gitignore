@@ -18,3 +18,6 @@ example/*.png
 example/*.webp
 example/*.jpg
 example/*.jpeg
+
+# TypeScript incremental build artifacts — reproducible output, machine-dependent diffs.
+*.tsbuildinfo

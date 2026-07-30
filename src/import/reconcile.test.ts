@@ -7,7 +7,7 @@ import { commitImport, estimateBaselineFromImport, reconcile } from './reconcile
 import { __setDB, getCurrentSlot, listSlots, listWorkouts } from '../db/repo.js';
 import { openFitnessDB } from '../db/schema.js';
 
-/** Real personal export; gitignored, so these assertions are conditional. */
+/** Real personal export. Committed, not gitignored — the skip only covers a tree without it. */
 const REAL_PATH = resolve(process.cwd(), 'example/incumbent-history-sample.csv');
 const HAS_REAL = existsSync(REAL_PATH);
 const REAL_CSV = HAS_REAL ? readFileSync(REAL_PATH, 'utf8') : '';
