@@ -46,7 +46,7 @@ import { Runner } from './Runner.js';
 import { Settings } from './Settings.js';
 import { Today } from './Today.js';
 import { AddWorkout, Welcome } from './Welcome.js';
-import { TABS, type Tab } from './nav.js';
+import { TABS, shouldShowWorkoutBar, type Tab } from './nav.js';
 import { buildShareCard, toStatWorkouts } from './shareCardData.js';
 import { Banner, Button, Card, NumberField, Segmented, Spinner } from './kit.js';
 // The update seam only. Nothing here imports ../pwa/lifecycle.js: that module owns the
@@ -438,13 +438,14 @@ export function App() {
         </div>
       </header>
 
-      {state.active.length > 1 ? (
+      {shouldShowWorkoutBar({ tab: activeTab, activeCount: state.active.length }) ? (
         <div className="pb-3">
-          <ExerciseSwitcher
+          <WorkoutBar
             active={state.active}
             labels={state.labels}
             selectedId={state.challenge.id}
             onSelect={(id) => void selectChallenge(id)}
+            onAddWorkout={() => setView({ kind: 'add-workout' })}
           />
         </div>
       ) : null}
@@ -609,40 +610,83 @@ function ShareGlyph() {
   );
 }
 
-/** A chip per active workout. Only rendered when there is a choice to make. */
-function ExerciseSwitcher({
+/** Two strokes. Drawn inline, for the same reason as ShareGlyph. */
+function PlusGlyph() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      className="size-5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+    >
+      <path d="M12 5v14" />
+      <path d="M5 12h14" />
+    </svg>
+  );
+}
+
+/**
+ * A chip per active workout, plus the app's only "add a workout" control.
+ *
+ * Renders from one workout upward — not only when there is a choice to make — precisely
+ * because it hosts that control: hiding the row from a user with a single workout would leave
+ * them no route to a second. With one workout the chip stays and the `+` sits beside it. A
+ * bare `+` floating above the content would name nothing, and the row's layout would jump the
+ * instant a second workout appeared.
+ *
+ * The add button is a *sibling* of the tablist, never a child. A non-tab inside
+ * `role="tablist"` is invalid ARIA and misreads to assistive tech.
+ */
+function WorkoutBar({
   active,
   labels,
   selectedId,
   onSelect,
+  onAddWorkout,
 }: {
   active: ChallengeRecord[];
   labels: Map<string, string>;
   selectedId: string;
   onSelect: (challengeId: string) => void;
+  onAddWorkout: () => void;
 }) {
   return (
-    <div className="flex flex-wrap gap-2" role="tablist" aria-label="Workout">
-      {active.map((challenge) => {
-        const isSelected = challenge.id === selectedId;
-        return (
-          <button
-            key={challenge.id}
-            type="button"
-            role="tab"
-            aria-selected={isSelected}
-            onClick={() => onSelect(challenge.id)}
-            className={[
-              'min-h-9 rounded-xl border px-3 py-1.5 text-sm transition-colors',
-              isSelected
-                ? 'border-teal-400/50 bg-teal-300/10 font-semibold text-teal-200'
-                : 'border-[#33405c] text-slate-300 hover:bg-[#1c2740]',
-            ].join(' ')}
-          >
-            {labels.get(challenge.exerciseId) ?? 'Exercise'}
-          </button>
-        );
-      })}
+    <div className="flex flex-wrap items-center gap-2">
+      <div className="flex flex-wrap gap-2" role="tablist" aria-label="Workout">
+        {active.map((challenge) => {
+          const isSelected = challenge.id === selectedId;
+          return (
+            <button
+              key={challenge.id}
+              type="button"
+              role="tab"
+              aria-selected={isSelected}
+              onClick={() => onSelect(challenge.id)}
+              className={[
+                'min-h-9 rounded-xl border px-3 py-1.5 text-sm transition-colors',
+                isSelected
+                  ? 'border-teal-400/50 bg-teal-300/10 font-semibold text-teal-200'
+                  : 'border-[#33405c] text-slate-300 hover:bg-[#1c2740]',
+              ].join(' ')}
+            >
+              {labels.get(challenge.exerciseId) ?? 'Exercise'}
+            </button>
+          );
+        })}
+      </div>
+
+      {/*
+        Keeps Button's default min-h-11 rather than matching the 36px chips: 44px is the
+        thumb-reachability floor, and the small height mismatch is the cheaper trade. `ghost`
+        matches the unselected chip's border, so this reads as part of the row instead of
+        competing with Today's Start button.
+      */}
+      <Button variant="ghost" ariaLabel="Add a workout" className="px-3" onClick={onAddWorkout}>
+        <PlusGlyph />
+      </Button>
     </div>
   );
 }
