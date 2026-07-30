@@ -163,6 +163,56 @@ export function SetRow({
   );
 }
 
+/**
+ * A small segmented control. Used for the chart's two views, the desktop tab row, and the
+ * exercise switcher — all the same interaction, so all the same widget.
+ */
+export function Segmented<T extends string>({
+  options,
+  value,
+  onChange,
+  size = 'md',
+  className = '',
+  ariaLabel,
+}: {
+  options: readonly { value: T; label: ReactNode }[];
+  value: T;
+  onChange: (next: T) => void;
+  size?: 'sm' | 'md';
+  className?: string;
+  ariaLabel?: string;
+}) {
+  return (
+    <div
+      role="tablist"
+      aria-label={ariaLabel}
+      className={`inline-flex gap-1 rounded-xl bg-[#0f1728] p-1 ${className}`}
+    >
+      {options.map((option) => {
+        const active = option.value === value;
+        return (
+          <button
+            key={option.value}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(option.value)}
+            className={[
+              'rounded-lg transition-colors',
+              size === 'sm' ? 'px-2.5 py-1 text-xs' : 'min-h-9 px-3 py-1.5 text-sm',
+              active
+                ? 'bg-[#1c2740] font-semibold text-teal-300'
+                : 'text-slate-400 hover:text-slate-200',
+            ].join(' ')}
+          >
+            {option.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 export function Stat({
   label,
   value,

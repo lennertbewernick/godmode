@@ -5,19 +5,20 @@
  * shows the number and says plainly that it is an estimate.
  */
 
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import {
   computeMetrics,
   cumulativeSeries,
   formatDuration,
   lifetimeTotals,
+  sessionSeries,
   type StatSlot,
   type StatWorkout,
 } from '../core/stats.js';
 import type { WorkoutOutcome } from '../core/types.js';
 import type { PlanSlotRecord, WorkoutRecord } from '../db/schema.js';
-import { CumulativeChart } from './Chart.js';
-import { Button, Card, Stat } from './kit.js';
+import { CumulativeChart, SessionChart } from './Chart.js';
+import { Button, Card, Segmented, Stat } from './kit.js';
 
 const OUTCOME_LABEL: Record<WorkoutOutcome, string> = {
   completed_as_planned: 'as planned',
@@ -66,8 +67,10 @@ export function History({
 
   const totals = lifetimeTotals(statWorkouts);
   const metrics = computeMetrics(statWorkouts, statSlots);
-  const series = cumulativeSeries(statWorkouts, statSlots);
+  const perSession = sessionSeries(statWorkouts, statSlots);
+  const cumulative = cumulativeSeries(statWorkouts, statSlots);
   const slotById = useMemo(() => new Map(slots.map((s) => [s.id, s])), [slots]);
+  const [chartView, setChartView] = useState<'session' | 'total'>('session');
 
   const kcalNote = totals.hasExternalKcal && totals.hasEstimatedKcal
     ? 'mixed: imported + estimated'
@@ -90,9 +93,25 @@ export function History({
       </Card>
 
       <Card>
-        <h3 className="font-semibold text-slate-100">Progress</h3>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h3 className="font-semibold text-slate-100">Progress</h3>
+          <Segmented
+            ariaLabel="Chart view"
+            size="sm"
+            value={chartView}
+            onChange={setChartView}
+            options={[
+              { value: 'session', label: 'Per session' },
+              { value: 'total', label: 'Running total' },
+            ]}
+          />
+        </div>
         <div className="mt-3">
-          <CumulativeChart points={series} />
+          {chartView === 'session' ? (
+            <SessionChart points={perSession} />
+          ) : (
+            <CumulativeChart points={cumulative} />
+          )}
         </div>
       </Card>
 

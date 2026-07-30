@@ -6,6 +6,7 @@ import {
   formatClock,
   formatDuration,
   lifetimeTotals,
+  sessionSeries,
   type StatSlot,
   type StatWorkout,
 } from './stats.js';
@@ -191,6 +192,71 @@ describe('STAT-02/STAT-03 — cumulative series', () => {
     const series = cumulativeSeries([w('2026-01-01', 50)], slots);
     expect(series[0]!.planned).toBe(0);
     expect(series[0]!.actual).toBe(50);
+  });
+});
+
+describe('per-session series', () => {
+  const slots = [slot('s1', 1, 100), slot('s2', 2, 110)];
+
+  it('reports each session on its own, not as a running total', () => {
+    const series = sessionSeries(
+      [
+        w('2026-01-01', 90, 'failed', 's1'),
+        w('2026-01-02', 100, 'completed_as_planned', 's1'),
+        w('2026-01-03', 110, 'completed_as_planned', 's2'),
+      ],
+      slots,
+    );
+    expect(series.map((p) => p.actualTotal)).toEqual([90, 100, 110]);
+  });
+
+  it('pairs each session with the total its own day asked for', () => {
+    const series = sessionSeries(
+      [w('2026-01-01', 90, 'failed', 's1'), w('2026-01-03', 110, 'completed_as_planned', 's2')],
+      slots,
+    );
+    expect(series.map((p) => p.targetTotal)).toEqual([100, 110]);
+  });
+
+  it('leaves the target undefined for an unlinked session rather than inventing one', () => {
+    const series = sessionSeries([w('2026-01-01', 50)], slots);
+    expect(series[0]!.targetTotal).toBeUndefined();
+    expect(series[0]!.actualTotal).toBe(50);
+  });
+
+  it('shows the dip a repeated day produces, which a running total cannot', () => {
+    const series = sessionSeries(
+      [
+        w('2026-01-01', 100, 'completed_as_planned', 's1'),
+        w('2026-01-03', 60, 'deload', 's2'),
+        w('2026-01-05', 110, 'completed_as_planned', 's2'),
+      ],
+      slots,
+    );
+    const actuals = series.map((p) => p.actualTotal);
+    expect(actuals).toEqual([100, 60, 110]);
+    // The point of the series: it is not monotonic.
+    expect(actuals[1]!).toBeLessThan(actuals[0]!);
+
+    // The same history as a running total only ever climbs, which is why it looked featureless.
+    const running = cumulativeSeries(
+      [
+        w('2026-01-01', 100, 'completed_as_planned', 's1'),
+        w('2026-01-03', 60, 'deload', 's2'),
+        w('2026-01-05', 110, 'completed_as_planned', 's2'),
+      ],
+      slots,
+    ).map((p) => p.actual);
+    expect(running).toEqual([100, 160, 270]);
+  });
+
+  it('sorts by date regardless of input order', () => {
+    const series = sessionSeries([w('2026-01-03', 30), w('2026-01-01', 10)], []);
+    expect(series.map((p) => p.actualTotal)).toEqual([10, 30]);
+  });
+
+  it('handles an empty history', () => {
+    expect(sessionSeries([], slots)).toEqual([]);
   });
 });
 

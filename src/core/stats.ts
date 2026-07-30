@@ -8,8 +8,10 @@
  *   planCompliance    only completed_as_planned + scaled_up — rewards hitting the number
  *   challengeProgress advanced slots / total slots — rewards moving through the programme
  *
- * Likewise the cumulative chart has two series: `planned` advances once per slot, `actual`
- * includes every attempt and deload (STAT-03).
+ * The chart has two shapes. `sessionSeries` is one point per session and is what shows the
+ * shape of a block — the climb, the repeats, the deloads. `cumulativeSeries` is the running
+ * totals, where `planned` advances once per slot and `actual` includes every attempt and
+ * deload (STAT-03); it answers "how much work in total", and is smooth by construction.
  */
 
 import type { WorkoutOutcome } from './types.js';
@@ -127,6 +129,39 @@ export function computeMetrics(workouts: StatWorkout[], slots: StatSlot[]): Metr
       ? {}
       : { slotsTotal, challengeProgress: slotsAdvanced / slotsTotal }),
   };
+}
+
+export interface SessionPoint {
+  performedAt: string;
+  /** Reps actually performed in this one session. */
+  actualTotal: number;
+  /** Prescribed total for the slot this attempt belonged to. Undefined when unlinked. */
+  targetTotal?: number;
+  outcome: WorkoutOutcome;
+}
+
+/**
+ * One point per session — what was done that day, against what was asked that day.
+ *
+ * This is the series that shows the shape of a training block: the climb, the dip where a
+ * day was repeated, the deloads. A cumulative series cannot show any of it, because a
+ * running total of similar numbers is smooth by construction no matter how uneven the
+ * underlying sessions were.
+ */
+export function sessionSeries(workouts: StatWorkout[], slots: StatSlot[]): SessionPoint[] {
+  const targetBySlot = new Map(slots.map((s) => [s.id, s.targetTotal]));
+
+  return [...workouts]
+    .sort((a, b) => a.performedAt.localeCompare(b.performedAt))
+    .map((w) => {
+      const target = w.planSlotId === undefined ? undefined : targetBySlot.get(w.planSlotId);
+      return {
+        performedAt: w.performedAt,
+        actualTotal: w.actualTotal,
+        outcome: w.outcome,
+        ...(target === undefined ? {} : { targetTotal: target }),
+      };
+    });
 }
 
 export interface CumulativePoint {
