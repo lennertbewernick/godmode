@@ -1,5 +1,8 @@
 /**
- * Export and restore.
+ * Export.
+ *
+ * Restore and merge used to live here too and no longer do — see the note further down, and
+ * `server/import-backup.ts` for what replaced them.
  *
  * The JSON backup is the complete dataset including pattern ids/versions, policy versions,
  * chain links, baseline provenance, and generation decisions — everything needed to
@@ -10,10 +13,8 @@
  * so nobody is locked in here either.
  */
 
-import { getDB } from '../db/repo.js';
-import { canonicalProfileId } from '../import/profiles.js';
-import { MERGE_STORES, planMerge, type MergePlan } from './merge.js';
-import { DB_VERSION, DEFAULT_SETTINGS, type SettingsRecord } from '../db/schema.js';
+import type { Snapshot } from '../api/client.js';
+import { DB_VERSION, type SettingsRecord } from '../db/schema.js';
 import type {
   ChallengeRecord,
   ExerciseRecord,
@@ -41,44 +42,42 @@ export interface BackupFile {
   settings: SettingsRecord;
 }
 
-export async function buildBackup(): Promise<BackupFile> {
-  const db = await getDB();
-  const [exercises, challenges, performanceTests, planSlots, workouts, settings] =
-    await Promise.all([
-      db.getAll('exercises'),
-      db.getAll('challenges'),
-      db.getAll('performanceTests'),
-      db.getAll('planSlots'),
-      db.getAll('workouts'),
-      db.get('settings', 'settings'),
-    ]);
-
+/**
+ * The whole dataset as a file, built from one snapshot.
+ *
+ * It used to read six IndexedDB stores. It now takes the snapshot the app is already holding,
+ * which is both simpler and more honest: a backup assembled from six independent reads could
+ * straddle a write and describe a state that never existed. One `GET /api/snapshot` is one read
+ * transaction on the server (`server/routes.ts:145`), so this file is a real point in time.
+ *
+ * `dbVersion` still names the IndexedDB schema version this build knows, because that is what
+ * the field has always meant and `server/migrate.ts` reads backups written before the cutover
+ * alongside ones written after it.
+ *
+ * **Pass the snapshot the user is being shown, not the raw one from the server.** The app
+ * overlays workouts that are finished but still queued on this device (`applyPending`), and a
+ * backup is the second copy of the history — omitting the sessions that no server holds yet
+ * would leave out precisely the ones with no other copy at all.
+ */
+export function buildBackup(snapshot: Snapshot): BackupFile {
   return {
     format: 'godmode-backup',
     formatVersion: BACKUP_FORMAT_VERSION,
     dbVersion: DB_VERSION,
     exportedAt: new Date().toISOString(),
-    exercises,
-    challenges,
-    performanceTests,
-    planSlots,
-    workouts,
-    settings: settings ?? DEFAULT_SETTINGS,
+    exercises: [...snapshot.exercises],
+    challenges: [...snapshot.challenges],
+    performanceTests: [...snapshot.performanceTests],
+    planSlots: [...snapshot.planSlots],
+    workouts: [...snapshot.workouts],
+    settings: snapshot.settings,
   };
-}
-
-export interface RestoreResult {
-  exercises: number;
-  challenges: number;
-  planSlots: number;
-  workouts: number;
-  performanceTests: number;
 }
 
 /**
  * The collections a backup must carry. Absence is rejected rather than defaulted to empty:
- * restore clears the database first, so treating a missing collection as "zero records" turns
- * a truncated or hand-edited file into total, silent data loss on the only copy that exists.
+ * an importer that treats a missing collection as "zero records" turns a truncated or
+ * hand-edited file into total, silent data loss on the only copy that exists.
  */
 const REQUIRED_COLLECTIONS = [
   'exercises',
@@ -154,148 +153,30 @@ export function backupIsEmpty(json: unknown): boolean {
   }
 }
 
-/** Validate and load a backup, replacing everything currently stored. */
-export async function restoreBackup(json: unknown): Promise<RestoreResult> {
-  const backup = validateBackup(json);
-
-  // An older backup can carry the retired import-source id; the v2 database migration only
-  // reaches records already stored, so normalise on the way in too.
-  const workouts = backup.workouts.map((workout) =>
-    workout.importSource === undefined
-      ? workout
-      : { ...workout, importSource: canonicalProfileId(workout.importSource) },
-  );
-
-  const db = await getDB();
-  const stores = [
-    'exercises',
-    'challenges',
-    'performanceTests',
-    'planSlots',
-    'workouts',
-    'settings',
-  ] as const;
-  const tx = db.transaction(stores, 'readwrite');
-
-  // Issue every request up front and await them together with `tx.done`, rather than awaiting
-  // each one in sequence. Sequentially awaiting hundreds of writes risks the transaction
-  // auto-committing between them — which on iOS Safari, the platform this app is built for,
-  // surfaces as TransactionInactiveError partway through a restore.
-  await Promise.all([
-    ...stores.map((store) => tx.objectStore(store).clear()),
-    ...backup.exercises.map((r) => tx.objectStore('exercises').put(r)),
-    ...backup.challenges.map((r) => tx.objectStore('challenges').put(r)),
-    ...backup.performanceTests.map((r) => tx.objectStore('performanceTests').put(r)),
-    ...backup.planSlots.map((r) => tx.objectStore('planSlots').put(r)),
-    ...workouts.map((r) => tx.objectStore('workouts').put(r)),
-    tx.objectStore('settings').put(backup.settings ?? DEFAULT_SETTINGS),
-    tx.done,
-  ]);
-
-  return {
-    exercises: backup.exercises.length,
-    challenges: backup.challenges.length,
-    planSlots: backup.planSlots.length,
-    workouts: workouts.length,
-    performanceTests: backup.performanceTests.length,
-  };
-}
-
-// ── Merge ───────────────────────────────────────────────────────────────────────
-//
-// Merge is a *sibling* of restore, never a refactor of it. `restoreBackup` above clears every
-// store before writing, which is correct for disaster recovery and catastrophic anywhere else;
-// a regression in it is a wiped device. So nothing below reaches into it, and nothing below
-// clears or deletes anything: `put` is the only write these functions make.
-
-/** What a merge did. The plan, minus the records themselves. */
-export interface MergeResult {
-  counts: MergePlan['counts'];
-  totals: MergePlan['totals'];
-  divergent: MergePlan['divergent'];
-  skipped: MergePlan['skipped'];
-  warnings: MergePlan['warnings'];
-  settingsMerged: false;
-}
-
 /**
- * What a merge *would* do. Display only — it writes nothing, and the plan it returns is
- * deliberately not carried into `mergeBackup`, which recomputes its own.
- */
-export async function previewMergeBackup(json: unknown): Promise<MergePlan> {
-  const backup = validateBackup(json);
-
-  const db = await getDB();
-  const tx = db.transaction(MERGE_STORES, 'readonly');
-  const [exercises, challenges, performanceTests, planSlots, workouts] = await Promise.all([
-    tx.objectStore('exercises').getAll(),
-    tx.objectStore('challenges').getAll(),
-    tx.objectStore('performanceTests').getAll(),
-    tx.objectStore('planSlots').getAll(),
-    tx.objectStore('workouts').getAll(),
-  ]);
-  await tx.done;
-
-  return planMerge({ exercises, challenges, performanceTests, planSlots, workouts }, backup);
-}
-
-/**
- * Validate and load a backup, adding what this device does not already have.
+ * Restoring a backup is a server-side operation now, and there is no client path for it.
  *
- * Nothing is cleared and nothing is deleted. A record that exists here and not in the file is
- * untouched; a record that exists in both and differs keeps the version stored here.
+ * Before the cutover, restore cleared six IndexedDB stores and wrote the file into them, and
+ * merge added what was missing. Neither can be done from the browser any more: the dataset is a
+ * SQLite file the server owns, and **the API has no restore or merge command** — `/api/import`
+ * takes exactly one exercise, one challenge and its history, and refuses a record whose id it
+ * already holds with different content.
+ *
+ * Rather than invent a client-side approximation of a transaction the server does not offer,
+ * the app points at the tool that already does this properly and is tested against the owner's
+ * real data:
+ *
+ *     npm run import-backup -- <backup.json> --target <database.sqlite> --dry-run
+ *
+ * It validates every field of every record, builds a NEW database in a temporary file, verifies
+ * it with SQLite's own integrity and foreign-key pragmas plus a record-by-record comparison, and
+ * only then renames it into place — keeping a copy of whatever was there before. See
+ * `server/import-backup.ts`.
+ *
+ * `planMerge` in `./merge.js` stays, untouched and still tested. It is pure, it takes a dataset
+ * and a backup and returns a plan, and it is exactly what a future `POST /api/merge` would run
+ * inside its transaction. It is deliberately not wired to anything today.
  */
-export async function mergeBackup(json: unknown): Promise<MergeResult> {
-  // Before the database is opened, as restore does — a damaged file is rejected without a
-  // transaction ever existing.
-  const backup = validateBackup(json);
-
-  const db = await getDB();
-  // `settings` is deliberately absent from this list. That is what makes "merge never touches
-  // your bodyweight, rest override or selected workout" structural: the transaction has no
-  // handle on the store, so no future edit to this function can write to it by accident.
-  const tx = db.transaction(MERGE_STORES, 'readwrite');
-
-  // One await, on five requests that all belong to `tx`. Awaiting them together keeps the
-  // transaction alive across the pause — the same reasoning the guarded v2 migration relies on
-  // in `schema.ts`. Awaiting anything *outside* the transaction here would let it auto-commit
-  // out from under the writes below.
-  const [exercises, challenges, performanceTests, planSlots, workouts] = await Promise.all([
-    tx.objectStore('exercises').getAll(),
-    tx.objectStore('challenges').getAll(),
-    tx.objectStore('performanceTests').getAll(),
-    tx.objectStore('planSlots').getAll(),
-    tx.objectStore('workouts').getAll(),
-  ]);
-
-  // Planned here, inside the write transaction, rather than carried over from the preview:
-  // a plan computed minutes ago could otherwise overwrite a session logged in between.
-  const plan = planMerge(
-    { exercises, challenges, performanceTests, planSlots, workouts },
-    backup,
-  );
-
-  // Issue every write up front and await them with `tx.done`, as restore does. Sequential
-  // awaits risk the transaction auto-committing partway through, which on iOS Safari surfaces
-  // as TransactionInactiveError.
-  await Promise.all([
-    ...plan.additions.exercises.map((r) => tx.objectStore('exercises').put(r)),
-    ...plan.additions.challenges.map((r) => tx.objectStore('challenges').put(r)),
-    ...plan.additions.performanceTests.map((r) => tx.objectStore('performanceTests').put(r)),
-    ...plan.additions.planSlots.map((r) => tx.objectStore('planSlots').put(r)),
-    ...plan.additions.workouts.map((r) => tx.objectStore('workouts').put(r)),
-    tx.done,
-  ]);
-
-  return {
-    counts: plan.counts,
-    totals: plan.totals,
-    divergent: plan.divergent,
-    skipped: plan.skipped,
-    warnings: plan.warnings,
-    settingsMerged: plan.settingsMerged,
-  };
-}
 
 function pad(n: number, w = 2): string {
   return String(n).padStart(w, '0');

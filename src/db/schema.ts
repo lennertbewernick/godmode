@@ -1,15 +1,31 @@
 /**
  * IndexedDB schema.
  *
+ * ## What this database is, since the cutover
+ *
+ * It is **no longer the dataset**. The exercises, challenges, plan slots, workouts,
+ * performance tests and settings live in a server-owned SQLite file and reach the client as
+ * one `GET /api/snapshot` — see `.planning/DESIGN-server-sqlite.md` §4. What is left here is a
+ * write-ahead buffer with exactly two jobs:
+ *
+ *   - `workoutDrafts` — the workout being performed right now, written after every material
+ *     action so a killed tab does not cost the user their reps.
+ *   - `workoutOutbox` — finished workouts whose `POST /api/workouts` did not succeed. Each
+ *     entry is deleted the moment the server acknowledges it.
+ *
+ * The five original stores are **deliberately still declared and still populated with whatever
+ * they held before the cutover**. Nothing in this work deletes them and nothing calls
+ * `indexedDB.deleteDatabase`: the owner's months of history sat in this database, the SQLite
+ * file was seeded from a backup of it, and the browser copy stays as a fallback until the
+ * server has proved itself. They are read by no production code any more.
+ *
  * A note on "child rows": PLAN.md §4 calls for set targets to be child rows rather than five
  * fixed columns, so a variable set count never needs a migration. That requirement is
  * relational in origin. IndexedDB is a document store, so a variable-length `targets: []`
  * array *is* the child-row representation — no join table needed, and set count is free.
  *
- * Immutability rules that the repository layer enforces:
- *   - `planSlots` records are never mutated after creation. A future unattempted slot may be
- *     superseded by a new record pointing back via `supersedesId`; the old one is marked
- *     `superseded` and kept.
+ * Immutability rules the server now enforces (`server/routes.ts`):
+ *   - `planSlots` records are never mutated after creation beyond their lifecycle status.
  *   - Per-attempt adjustments live on `workouts`, never on `planSlots`, because one slot can
  *     accumulate attempts that were each adjusted differently.
  */
@@ -37,9 +53,14 @@ export const DB_NAME = 'fitness-companion';
  *
  * v1 created the stores. v2 normalised the persisted import-profile id after the profile was
  * renamed (see `canonicalProfileId` in `src/import/profiles.ts`). v3 added `workoutDrafts`,
- * the in-progress workout buffer.
+ * the in-progress workout buffer. v4 added `workoutOutbox`, the queue of finished workouts the
+ * server has not accepted yet.
+ *
+ * v4 creates a store and touches nothing else. No branch here has ever deleted a store and none
+ * will in this work: the five original stores still hold the owner's pre-cutover history and
+ * that copy is the fallback.
  */
-export const DB_VERSION = 3;
+export const DB_VERSION = 4;
 
 export interface ExerciseRecord {
   id: string;
@@ -206,6 +227,40 @@ export interface WorkoutDraftRecord {
   updatedAt: string;
 }
 
+/**
+ * A finished workout the server has not accepted yet.
+ *
+ * `attemptNo` is absent by construction — the type is `Omit<WorkoutRecord, 'attemptNo'>` —
+ * because the server assigns it as an acceptance sequence and refuses a command that tries to
+ * supply one (`server/routes.ts:317`). A queued workout composed offline cannot know what the
+ * sequence will be, and inventing one would be inventing history.
+ */
+export type PendingWorkout = Omit<WorkoutRecord, 'attemptNo'>;
+
+/**
+ * One entry in the outbox.
+ *
+ * Keyed by the workout's own id, which was minted when the session started
+ * (`WorkoutDraftRecord.id`). That is the idempotency key the server dedupes on, so queueing the
+ * same finished workout twice overwrites one entry rather than producing two sessions.
+ */
+export interface OutboxEntry {
+  /** The workout id. Primary key, and the server's idempotency key. */
+  id: string;
+  /** Monotonic within the queue: assigned as `max(seq) + 1` inside the enqueueing transaction. */
+  seq: number;
+  queuedAt: string;
+  /** How many times a send has been attempted. Display only; the server dedupes regardless. */
+  attempts: number;
+  /**
+   * Set when the server refused this workout for a reason retrying cannot fix — a plan slot it
+   * no longer knows, a challenge ended on another device. The entry is kept, never dropped, and
+   * the drainer steps over it so one unacceptable workout cannot block every later one.
+   */
+  blockedReason?: string;
+  workout: PendingWorkout;
+}
+
 export interface SettingsRecord {
   id: 'settings';
   bodyweightKg?: number | undefined;
@@ -252,6 +307,11 @@ export interface FitnessDB extends DBSchema {
     key: string;
     value: WorkoutDraftRecord;
     indexes: { bySlot: string };
+  };
+  workoutOutbox: {
+    key: string;
+    value: OutboxEntry;
+    indexes: { bySeq: number };
   };
   settings: { key: string; value: SettingsRecord };
 }
@@ -389,6 +449,14 @@ export function openFitnessDB(name = DB_NAME, options: OpenOptions = {}): Promis
       if (oldVersion < 3) {
         const drafts = db.createObjectStore('workoutDrafts', { keyPath: 'id' });
         drafts.createIndex('bySlot', 'planSlotId');
+      }
+
+      // v4: the outbox. Same shape of branch as v3 and for the same reason — creation only,
+      // guarded, reading nothing. The five stores that hold the pre-cutover history are not
+      // named here at all, so this branch cannot touch them even by accident.
+      if (oldVersion < 4) {
+        const outbox = db.createObjectStore('workoutOutbox', { keyPath: 'id' });
+        outbox.createIndex('bySeq', 'seq');
       }
     },
   });

@@ -1,11 +1,12 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { buildCanonicalImport } from './pipeline.js';
 import { INCUMBENT_CSV_V1 } from './profiles.js';
-import { commitImport, estimateBaselineFromImport, reconcile } from './reconcile.js';
-import { __setDB, getCurrentSlot, listSlots, listWorkouts } from '../db/repo.js';
-import { openFitnessDB } from '../db/schema.js';
+import { buildImport, estimateBaselineFromImport, reconcile } from './reconcile.js';
+import { buildChallenge, buildExercise } from '../db/records.js';
+import { pushupParams } from '../core/patterns/percentageRamp.js';
+import type { PlanSlotRecord } from '../db/schema.js';
 
 /** Real personal export. Committed, not gitignored — the skip only covers a tree without it. */
 const REAL_PATH = resolve(process.cwd(), 'example/incumbent-history-sample.csv');
@@ -19,11 +20,15 @@ const FIXTURE_CSV = readFileSync(
 );
 const fixtureCanonical = () => buildCanonicalImport(FIXTURE_CSV, INCUMBENT_CSV_V1).canonical;
 
-let dbCounter = 0;
-beforeEach(() => {
-  dbCounter += 1;
-  __setDB(openFitnessDB(`test-db-${dbCounter}`));
-});
+/**
+ * Nothing here opens a database any more.
+ *
+ * `buildImport` builds the records and `POST /api/import` writes them in one transaction
+ * (`server/routes.ts:610`), so what these tests assert is what the command *carries* — which is
+ * the thing that has to be right. That the server stores it faithfully is `server/api.test.ts`.
+ */
+const firstIncomplete = (slots: readonly PlanSlotRecord[]): PlanSlotRecord | undefined =>
+  slots.find((s) => s.status !== 'completed');
 
 describe.skipIf(!HAS_REAL)('baseline estimation from an import', () => {
   it('recovers the real tested baseline of 18 by inverting the coefficient sum', () => {
@@ -47,7 +52,7 @@ describe.skipIf(!HAS_REAL)('baseline estimation from an import', () => {
 
 describe.skipIf(!HAS_REAL)('IMP-05/IMP-06 — reconciliation reports rather than forces', () => {
   it('matches all 29 sessions onto 18 slots and numbers the attempts', async () => {
-    const { slots } = await seed();
+    const { slots } = seed();
     const { assignments, report } = reconcile(canonical(), slots);
     expect(assignments).toHaveLength(29);
     expect(report.matched).toBe(29);
@@ -57,7 +62,7 @@ describe.skipIf(!HAS_REAL)('IMP-05/IMP-06 — reconciliation reports rather than
   });
 
   it('numbers repeat attempts chronologically', async () => {
-    const { slots } = await seed();
+    const { slots } = seed();
     const { assignments } = reconcile(canonical(), slots);
     const w4d2 = assignments.filter(
       (a) => a.session.week === 4 && a.session.day === 2,
@@ -67,7 +72,7 @@ describe.skipIf(!HAS_REAL)('IMP-05/IMP-06 — reconciliation reports rather than
   });
 
   it('reports divergence where our curve differs, without changing targets', async () => {
-    const { slots } = await seed();
+    const { slots } = seed();
     const before = slots.map((s) => s.targetTotal);
     const { report } = reconcile(canonical(), slots);
 
@@ -82,7 +87,7 @@ describe.skipIf(!HAS_REAL)('IMP-05/IMP-06 — reconciliation reports rather than
   });
 
   it('leaves sessions unlinked when no slot matches, rather than force-fitting', async () => {
-    const { slots } = await seed();
+    const { slots } = seed();
     const orphaned = {
       ...canonical(),
       sessions: [
@@ -104,58 +109,49 @@ describe.skipIf(!HAS_REAL)('IMP-05/IMP-06 — reconciliation reports rather than
   });
 });
 
-describe.skipIf(!HAS_REAL)('commitImport — the end-to-end migration', () => {
-  it('writes 29 workouts and keeps external kcal distinct', async () => {
-    const result = await commit();
-    expect(result.workoutsWritten).toBe(29);
-
-    const workouts = await listWorkouts(result.chainId);
+describe.skipIf(!HAS_REAL)('buildImport — the end-to-end migration', () => {
+  it('carries 29 workouts and keeps external kcal distinct', () => {
+    const { workouts } = commit();
     expect(workouts).toHaveLength(29);
     expect(workouts[0]!.kcal).toMatchObject({ value: 13, source: 'external' });
     expect(workouts.every((w) => w.importSource === 'incumbent-csv-v1')).toBe(true);
   });
 
-  it('preserves every performed rep — 3134 total', async () => {
-    const result = await commit();
-    const workouts = await listWorkouts(result.chainId);
+  it('preserves every performed rep — 3134 total', () => {
+    const { workouts } = commit();
     expect(workouts.reduce((s, w) => s + w.actualTotal, 0)).toBe(3134);
   });
 
-  it('generates the plan from baseline and goal, not from imported actuals', async () => {
-    const result = await commit();
-    const slots = await listSlots(result.challengeId);
+  it('generates the plan from baseline and goal, not from imported actuals', () => {
+    const { slots } = commit();
     expect(slots).toHaveLength(18);
     // The verified endpoints, independent of what was imported.
     expect(slots[0]!.targets.map((t) => t.reps)).toEqual([7, 8, 7, 6, 9]);
     expect(slots[17]!.targets.map((t) => t.reps)).toEqual([37, 47, 37, 33, 51]);
   });
 
-  it('leaves the final slot incomplete, because 202 < 205', async () => {
+  it('leaves the final slot incomplete, because 202 < 205', () => {
     // The real challenge is NOT finished under the verified pass rule.
-    const result = await commit();
-    const slots = await listSlots(result.challengeId);
+    const { slots } = commit();
     expect(slots[17]!.status).toBe('available');
 
-    const current = await getCurrentSlot(result.challengeId);
+    const current = firstIncomplete(slots);
     expect(current?.ordinal).toBe(18);
     expect(current?.targetTotal).toBe(205);
   });
 
-  it('marks slots 1-17 completed by recovering the source app\'s own decisions', async () => {
+  it('marks slots 1-17 completed by recovering the source app\'s own decisions', () => {
     // Our curve prescribes 41 for slot 2 where only 39 was performed and accepted. Judging
     // imported history against our targets would rewind a finished programme to week 1.
-    const result = await commit();
-    const slots = await listSlots(result.challengeId);
+    const { slots } = commit();
     for (let i = 0; i < 17; i += 1) {
       expect(slots[i]!.status, `slot ${i + 1}`).toBe('completed');
     }
     expect(slots[1]!.targetTotal).toBeGreaterThan(39); // the divergence is still visible
   });
 
-  it('labels every repeat attempt except the last as a miss', async () => {
-    const result = await commit();
-    const workouts = await listWorkouts(result.chainId);
-    const slots = await listSlots(result.challengeId);
+  it('labels every repeat attempt except the last as a miss', () => {
+    const { workouts, slots } = commit();
     const w4d2Id = slots.find((s) => s.week === 4 && s.day === 2)!.id;
     const attempts = workouts
       .filter((w) => w.planSlotId === w4d2Id)
@@ -165,28 +161,24 @@ describe.skipIf(!HAS_REAL)('commitImport — the end-to-end migration', () => {
     ]);
   });
 
-  it('labels the unfinished final session as failed, not completed', async () => {
-    const result = await commit();
-    const workouts = await listWorkouts(result.chainId);
+  it('labels the unfinished final session as failed, not completed', () => {
+    const { workouts } = commit();
     expect(workouts.at(-1)!.actualTotal).toBe(202);
     expect(workouts.at(-1)!.outcome).toBe('failed');
   });
 
-  it('records baseline provenance on the challenge', async () => {
-    const result = await commit();
-    const slots = await listSlots(result.challengeId);
+  it('records baseline provenance on the challenge', () => {
+    const { slots, workouts, challenge } = commit();
     expect(slots.length).toBeGreaterThan(0);
-    const workouts = await listWorkouts(result.chainId);
+    expect(challenge.baseline.source).toBe('estimated');
     // Sanity: chain id is set and shared across the imported history.
     expect(new Set(workouts.map((w) => w.chainId)).size).toBe(1);
   });
 });
 
-async function seed() {
-  const { createChallenge, createExercise } = await import('../db/repo.js');
-  const { pushupParams } = await import('../core/patterns/percentageRamp.js');
-  const exercise = await createExercise('Liegestütze');
-  return createChallenge({
+function seed() {
+  const exercise = buildExercise('Liegestütze');
+  return buildChallenge({
     exerciseId: exercise.id,
     baseline: { value: 18, source: 'estimated', recordedAt: '2026-05-29T00:00:00' },
     params: pushupParams(18, 100, 6, 3),
@@ -194,7 +186,7 @@ async function seed() {
 }
 
 function commit() {
-  return commitImport({
+  return buildImport({
     canonical: canonical(),
     baseline: { value: 18, source: 'estimated', recordedAt: '2026-05-29T00:00:00' },
     goal: 100,
@@ -209,33 +201,31 @@ describe('reconciliation on the committed fixture', () => {
     expect(estimateBaselineFromImport(fixtureCanonical()).value).toBe(18);
   });
 
-  it('commits the fixture and preserves both attempts on the repeated slot', async () => {
-    const result = await commitImport({
+  it('builds the fixture and preserves both attempts on the repeated slot', () => {
+    const { slots, workouts } = buildImport({
       canonical: fixtureCanonical(),
       baseline: { value: 18, source: 'estimated', recordedAt: '2026-03-01T00:00:00' },
       goal: 100,
       weeks: 6,
       daysPerWeek: 3,
     });
-    expect(result.workoutsWritten).toBe(8);
+    expect(workouts).toHaveLength(8);
 
-    const slots = await listSlots(result.challengeId);
     const w2d3 = slots.find((s) => s.week === 2 && s.day === 3)!;
-    const workouts = await listWorkouts(result.chainId);
     const attempts = workouts.filter((w) => w.planSlotId === w2d3.id);
     expect(attempts).toHaveLength(2);
     expect(attempts.map((a) => a.outcome)).toEqual(['failed', 'completed_as_planned']);
   });
 
-  it('leaves the furthest slot reached open when it was not satisfied', async () => {
-    const result = await commitImport({
+  it('leaves the furthest slot reached open when it was not satisfied', () => {
+    const { slots } = buildImport({
       canonical: fixtureCanonical(),
       baseline: { value: 18, source: 'estimated', recordedAt: '2026-03-01T00:00:00' },
       goal: 100,
       weeks: 6,
       daysPerWeek: 3,
     });
-    const current = await getCurrentSlot(result.challengeId);
+    const current = firstIncomplete(slots);
     // Fixture stops at W3D1 (62 performed); our curve prescribes more there.
     expect(current!.ordinal).toBe(7);
   });

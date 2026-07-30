@@ -1,8 +1,11 @@
 /**
- * Restore is the only path that deletes data, and the device holds the only copy. These tests
- * exist because the previous implementation validated two header fields and then cleared every
- * store: a file containing nothing but `{"format":"godmode-backup","formatVersion":1}` wiped
- * the database and reported success.
+ * The backup file: what goes into one, and what is refused when one comes back.
+ *
+ * `validateBackup` used to be the gate in front of a restore that cleared every store, which is
+ * why it checks so much. There is no client-side restore any more — see the note in
+ * `exchange.ts` — but the checks stay and stay tested: the same file is handed to
+ * `npm run import-backup`, and a file this build will happily *write* and then refuse to *read*
+ * is a bug either way.
  */
 
 import { openDB } from 'idb';
@@ -11,39 +14,25 @@ import {
   BACKUP_FORMAT_VERSION,
   backupIsEmpty,
   buildBackup,
-  mergeBackup,
-  previewMergeBackup,
-  restoreBackup,
+  validateBackup,
   type BackupFile,
 } from './exchange.js';
-import {
-  __setDB,
-  createChallenge,
-  createExercise,
-  endChallenge,
-  getSettings,
-  putImportedWorkout,
-  saveSettings,
-} from '../db/repo.js';
+import { applyPending } from '../api/snapshot.js';
+import type { Snapshot } from '../api/client.js';
+import { buildChallenge, buildExercise } from '../db/records.js';
 import {
   DB_NAME,
   DB_VERSION,
   DEFAULT_SETTINGS,
   openFitnessDB,
-  type Database,
   type WorkoutRecord,
 } from '../db/schema.js';
 import { pushupParams } from '../core/patterns/percentageRamp.js';
 import type { Baseline } from '../core/types.js';
 
 let dbCounter = 0;
-let dbName = '';
-let myDatabase: Promise<Database>;
 beforeEach(() => {
   dbCounter += 1;
-  dbName = `exchange-test-db-${dbCounter}`;
-  myDatabase = openFitnessDB(dbName);
-  __setDB(myDatabase);
 });
 
 const baseline: Baseline = {
@@ -52,10 +41,10 @@ const baseline: Baseline = {
   recordedAt: new Date(2026, 0, 1).toISOString(),
 };
 
-/** A database with one exercise, one challenge with slots, and one imported workout. */
-async function seed(importSource = 'incumbent-csv-v1') {
-  const exercise = await createExercise('Push-ups');
-  const { challenge, slots } = await createChallenge({
+/** A snapshot with one exercise, one challenge with slots, and one imported workout. */
+function seed(importSource = 'incumbent-csv-v1'): Snapshot {
+  const exercise = buildExercise('Push-ups');
+  const { challenge, slots } = buildChallenge({
     exerciseId: exercise.id,
     baseline,
     params: pushupParams(18, 100),
@@ -73,110 +62,118 @@ async function seed(importSource = 'incumbent-csv-v1') {
     outcome: 'completed_as_planned',
     importSource,
   };
-  await putImportedWorkout(workout);
-  return { exercise, challenge, slots, workout };
+  return {
+    apiVersion: 1,
+    schemaVersion: 1,
+    revision: 12,
+    exercises: [exercise],
+    challenges: [challenge],
+    planSlots: slots,
+    workouts: [workout],
+    performanceTests: [],
+    settings: DEFAULT_SETTINGS,
+  };
 }
 
-describe('restoreBackup — refusing to destroy data', () => {
-  it('round-trips a real backup', async () => {
-    await seed();
-    const backup = await buildBackup();
-    const result = await restoreBackup(JSON.parse(JSON.stringify(backup)));
+describe('buildBackup — one snapshot, one file', () => {
+  it('carries every collection the importer requires', () => {
+    const backup = buildBackup(seed());
 
-    expect(result.workouts).toBe(1);
-    expect(result.exercises).toBe(1);
-    expect(result.challenges).toBe(1);
-    expect(result.planSlots).toBeGreaterThan(0);
+    expect(backup.format).toBe('godmode-backup');
+    expect(backup.formatVersion).toBe(BACKUP_FORMAT_VERSION);
+    expect(backup.dbVersion).toBe(DB_VERSION);
+    expect(backup.exercises).toHaveLength(1);
+    expect(backup.challenges).toHaveLength(1);
+    expect(backup.workouts).toHaveLength(1);
+    expect(backup.planSlots.length).toBeGreaterThan(0);
   });
 
-  it('rejects a header-only file and leaves the database untouched', async () => {
-    const { workout } = await seed();
-
-    await expect(
-      restoreBackup({ format: 'godmode-backup', formatVersion: BACKUP_FORMAT_VERSION }),
-    ).rejects.toThrow(/incomplete/i);
-
-    // The point of the guard: the existing history must still be there.
-    const after = await buildBackup();
-    expect(after.workouts).toHaveLength(1);
-    expect(after.workouts[0]?.id).toBe(workout.id);
-    expect(after.exercises).toHaveLength(1);
+  it('writes a file this build will read back', () => {
+    // The round trip that matters: what we export must survive JSON and pass our own gate.
+    const file = JSON.parse(JSON.stringify(buildBackup(seed()))) as unknown;
+    const validated = validateBackup(file);
+    expect(validated.workouts[0]?.id).toBe('wo-seed');
   });
 
-  it('rejects a backup whose collections are absent rather than treating them as empty', async () => {
-    await seed();
-    const backup = await buildBackup();
-    const { workouts: _omitted, ...withoutWorkouts } = backup;
+  it('carries a workout this device has not managed to send yet', () => {
+    // The backup is the second copy of the history, so it must not be the one that omits the
+    // sessions with no other copy at all. `App.exportJson` passes the snapshot the user is
+    // shown — server state with the outbox overlaid — precisely for this.
+    const server = seed();
+    const { attemptNo: _assigned, ...queued } = {
+      ...server.workouts[0]!,
+      id: 'wo-not-sent-yet',
+      performedAt: new Date(2026, 5, 2, 7, 15).toISOString(),
+    };
+    const shown = applyPending(server, [
+      { id: queued.id, seq: 1, queuedAt: queued.performedAt, attempts: 2, workout: queued },
+    ]);
 
-    await expect(restoreBackup(withoutWorkouts)).rejects.toThrow(/workouts/);
-
-    const after = await buildBackup();
-    expect(after.workouts).toHaveLength(1);
+    const backup = buildBackup(shown);
+    expect(backup.workouts.map((w) => w.id).sort()).toEqual(['wo-not-sent-yet', 'wo-seed']);
   });
 
-  it('rejects a collection that is not a list', async () => {
-    await seed();
-    const backup = await buildBackup();
+  it('carries no revision, no session and nothing about the server', () => {
+    // The token lives in an HttpOnly cookie and is unreachable from here by construction; this
+    // pins the weaker but checkable property that nothing server-side leaks into the file.
+    const serialised = JSON.stringify(buildBackup(seed()));
+    expect(serialised).not.toContain('revision');
+    expect(serialised).not.toContain('apiVersion');
+    expect(serialised).not.toContain('token');
+  });
+});
 
-    await expect(restoreBackup({ ...backup, planSlots: {} })).rejects.toThrow(/planSlots/);
-
-    const after = await buildBackup();
-    expect(after.workouts).toHaveLength(1);
+describe('validateBackup — refusing a file that would destroy data', () => {
+  it('accepts a real backup', () => {
+    const backup = buildBackup(seed());
+    expect(validateBackup(JSON.parse(JSON.stringify(backup))).workouts).toHaveLength(1);
   });
 
-  it('rejects records missing an id', async () => {
-    await seed();
-    const backup = await buildBackup();
-
-    await expect(
-      restoreBackup({ ...backup, workouts: [{ actualTotal: 7 }] }),
-    ).rejects.toThrow(/without an id/i);
-
-    const after = await buildBackup();
-    expect(after.workouts).toHaveLength(1);
+  it('rejects a header-only file', () => {
+    // A file containing nothing but this is well-formed JSON, and the previous implementation
+    // cleared every store on it and reported success.
+    expect(() =>
+      validateBackup({ format: 'godmode-backup', formatVersion: BACKUP_FORMAT_VERSION }),
+    ).toThrow(/incomplete/i);
   });
 
-  it('rejects a non-object and a non-backup', async () => {
-    await expect(restoreBackup(null)).rejects.toThrow(/not a GodMode backup/);
-    await expect(restoreBackup([])).rejects.toThrow(/not a GodMode backup/);
-    await expect(restoreBackup('nope')).rejects.toThrow(/not a GodMode backup/);
-    await expect(restoreBackup({ format: 'something-else' })).rejects.toThrow(
-      /not a GodMode backup/,
+  it('rejects a backup whose collections are absent rather than treating them as empty', () => {
+    const { workouts: _omitted, ...withoutWorkouts } = buildBackup(seed());
+    expect(() => validateBackup(withoutWorkouts)).toThrow(/workouts/);
+  });
+
+  it('rejects a collection that is not a list', () => {
+    expect(() => validateBackup({ ...buildBackup(seed()), planSlots: {} })).toThrow(/planSlots/);
+  });
+
+  it('rejects records missing an id', () => {
+    expect(() =>
+      validateBackup({ ...buildBackup(seed()), workouts: [{ actualTotal: 7 }] }),
+    ).toThrow(/without an id/i);
+  });
+
+  it('rejects a non-object and a non-backup', () => {
+    expect(() => validateBackup(null)).toThrow(/not a GodMode backup/);
+    expect(() => validateBackup([])).toThrow(/not a GodMode backup/);
+    expect(() => validateBackup('nope')).toThrow(/not a GodMode backup/);
+    expect(() => validateBackup({ format: 'something-else' })).toThrow(/not a GodMode backup/);
+  });
+
+  it('refuses a backup from a newer build rather than dropping fields', () => {
+    expect(() =>
+      validateBackup({ ...buildBackup(seed()), formatVersion: BACKUP_FORMAT_VERSION + 1 }),
+    ).toThrow(/newer version/i);
+  });
+
+  it('rejects a missing or unusable format version', () => {
+    expect(() => validateBackup({ format: 'godmode-backup' })).toThrow(/format version/i);
+    expect(() => validateBackup({ format: 'godmode-backup', formatVersion: 'one' })).toThrow(
+      /format version/i,
     );
   });
 
-  it('refuses a backup from a newer build rather than dropping fields', async () => {
-    await seed();
-    const backup = await buildBackup();
-
-    await expect(
-      restoreBackup({ ...backup, formatVersion: BACKUP_FORMAT_VERSION + 1 }),
-    ).rejects.toThrow(/newer version/i);
-  });
-
-  it('rejects a missing or unusable format version', async () => {
-    await expect(restoreBackup({ format: 'godmode-backup' })).rejects.toThrow(/format version/i);
-    await expect(
-      restoreBackup({ format: 'godmode-backup', formatVersion: 'one' }),
-    ).rejects.toThrow(/format version/i);
-  });
-
-  it('normalises an unrecognised import-source id arriving from an older backup', async () => {
-    await seed();
-    const backup = await buildBackup();
-    const legacy = {
-      ...backup,
-      workouts: backup.workouts.map((w) => ({ ...w, importSource: 'retired-profile-id' })),
-    };
-
-    await restoreBackup(legacy);
-
-    const after = await buildBackup();
-    expect(after.workouts[0]?.importSource).toBe('incumbent-csv-v1');
-  });
-
-  it('flags a structurally valid but empty backup so the UI can warn before wiping', async () => {
-    const empty = {
+  it('flags a structurally valid but empty backup', () => {
+    const empty: Partial<BackupFile> = {
       format: 'godmode-backup',
       formatVersion: BACKUP_FORMAT_VERSION,
       dbVersion: DB_VERSION,
@@ -270,6 +267,7 @@ describe('schema migration v1 to v2', () => {
       'planSlots',
       'workouts',
       'workoutDrafts',
+      'workoutOutbox',
       'settings',
     ]) {
       expect(db.objectStoreNames).toContain(store);
@@ -279,237 +277,5 @@ describe('schema migration v1 to v2', () => {
 
   it('uses a stable database name', () => {
     expect(DB_NAME).toBe('fitness-companion');
-  });
-});
-
-let otherCounter = 0;
-
-/**
- * Do some work on a *different* device, and hand back the file it would export.
- *
- * Its records carry ids this device has never seen, which is what a second phone actually
- * looks like — and the file goes through JSON on the way back, as a real one does, so no
- * explicit `undefined` survives and key order is whatever the serialiser chose.
- */
-async function onAnotherDevice<T>(
-  work: () => Promise<T>,
-): Promise<{ made: T; file: BackupFile }> {
-  const mine = myDatabase;
-  otherCounter += 1;
-  __setDB(openFitnessDB(`${dbName}-other-${otherCounter}`));
-  try {
-    const made = await work();
-    const file = JSON.parse(JSON.stringify(await buildBackup())) as BackupFile;
-    return { made, file };
-  } finally {
-    __setDB(mine);
-  }
-}
-
-/** This device's own export, as a file: through JSON, exactly as the user would hand it back. */
-async function exportedFile(): Promise<BackupFile> {
-  return JSON.parse(JSON.stringify(await buildBackup())) as BackupFile;
-}
-
-describe('mergeBackup — adding without destroying', () => {
-  it('writes nothing when a device merges its own backup back into itself', async () => {
-    const { slots } = await seed();
-    const before = await buildBackup();
-    const file = await exportedFile();
-
-    const result = await mergeBackup(file);
-
-    expect(result.totals.added).toBe(0);
-    expect(result.totals.divergent).toBe(0);
-    expect(result.totals.skipped).toBe(0);
-    expect(result.counts.exercises.identical).toBe(1);
-    expect(result.counts.challenges.identical).toBe(1);
-    expect(result.counts.workouts.identical).toBe(1);
-    expect(result.counts.planSlots.identical).toBe(slots.length);
-
-    const after = await buildBackup();
-    expect(after.exercises).toEqual(before.exercises);
-    expect(after.challenges).toEqual(before.challenges);
-    expect(after.planSlots).toEqual(before.planSlots);
-    expect(after.workouts).toEqual(before.workouts);
-  });
-
-  it('adds a workout and its sessions that this device does not have', async () => {
-    const { made, file } = await onAnotherDevice(() => seed());
-
-    const result = await mergeBackup(file);
-
-    expect(result.counts.exercises.added).toBe(1);
-    expect(result.counts.challenges.added).toBe(1);
-    expect(result.counts.planSlots.added).toBe(made.slots.length);
-    expect(result.counts.workouts.added).toBe(1);
-    expect(result.totals.skipped).toBe(0);
-
-    const after = await buildBackup();
-    expect(after.challenges.map((c) => c.id)).toEqual([made.challenge.id]);
-    expect(after.workouts.map((w) => w.id)).toEqual([made.workout.id]);
-    expect(after.planSlots).toHaveLength(made.slots.length);
-  });
-
-  it('leaves a session this device has and the file does not exactly where it is', async () => {
-    const { challenge, workout } = await seed();
-    const file = await exportedFile();
-
-    // Logged after the backup was taken — the phone-only session the old restore would have
-    // destroyed.
-    const later: WorkoutRecord = {
-      ...workout,
-      id: 'wo-after-the-backup',
-      challengeId: challenge.id,
-      chainId: challenge.chainId,
-      attemptNo: 2,
-      performedAt: new Date(2026, 5, 2, 7, 15).toISOString(),
-      actualTotal: 41,
-    };
-    await putImportedWorkout(later);
-
-    const result = await mergeBackup(file);
-
-    expect(result.totals.added).toBe(0);
-    const after = await buildBackup();
-    expect(after.workouts.map((w) => w.id).sort()).toEqual(['wo-after-the-backup', 'wo-seed']);
-  });
-
-  it('cannot reopen a workout this device ended', async () => {
-    const { challenge } = await seed();
-    const file = await exportedFile();
-    expect(file.challenges[0]?.status).toBe('active');
-
-    // Ended through the real path, not a hand-written record.
-    await endChallenge(challenge.id, 'closed_manually');
-
-    const result = await mergeBackup(file);
-
-    expect(result.divergent).toEqual([
-      { store: 'challenges', id: challenge.id, reason: 'local-ended' },
-    ]);
-
-    const after = await buildBackup();
-    expect(after.challenges[0]?.status).toBe('ended');
-    expect(after.challenges[0]?.endReason).toBe('closed_manually');
-    expect(after.challenges[0]?.endedAt).toBeTypeOf('string');
-  });
-
-  it('leaves the local settings alone, including the last backup and the selection', async () => {
-    const { challenge } = await seed();
-    await saveSettings({
-      bodyweightKg: 77,
-      lastBackupAt: '2026-07-01T00:00:00.000Z',
-      selectedChallengeId: challenge.id,
-    });
-
-    const file = await exportedFile();
-    file.settings = {
-      ...file.settings,
-      bodyweightKg: 999,
-      kcalCoefficient: 0.9,
-      lastBackupAt: '2020-01-01T00:00:00.000Z',
-      selectedChallengeId: 'a-challenge-from-another-phone',
-    };
-
-    const result = await mergeBackup(file);
-    expect(result.settingsMerged).toBe(false);
-
-    const settings = await getSettings();
-    expect(settings.bodyweightKg).toBe(77);
-    expect(settings.kcalCoefficient).toBe(DEFAULT_SETTINGS.kcalCoefficient);
-    expect(settings.lastBackupAt).toBe('2026-07-01T00:00:00.000Z');
-    expect(settings.selectedChallengeId).toBe(challenge.id);
-  });
-
-  it('keeps this device version of a session the file disagrees about', async () => {
-    const { workout } = await seed();
-    const file = await exportedFile();
-    expect(file.workouts[0]?.actualTotal).toBe(7);
-
-    // The same id, a different result — two devices that both logged the session.
-    await putImportedWorkout({
-      ...workout,
-      sets: [{ index: 1, effectiveTarget: 7, actual: 42 }],
-      actualTotal: 42,
-    });
-
-    const result = await mergeBackup(file);
-
-    expect(result.counts.workouts.divergent).toBe(1);
-    expect(result.counts.workouts.added).toBe(0);
-
-    const after = await buildBackup();
-    expect(after.workouts).toHaveLength(1);
-    expect(after.workouts[0]?.actualTotal).toBe(42);
-  });
-
-  it('does not write a session whose workout exists in neither place', async () => {
-    await seed();
-    const file = await exportedFile();
-    file.workouts = [
-      ...file.workouts,
-      { ...file.workouts[0]!, id: 'wo-orphan', challengeId: 'cha-that-does-not-exist' },
-    ];
-
-    const result = await mergeBackup(file);
-
-    expect(result.skipped).toEqual([
-      { store: 'workouts', id: 'wo-orphan', missing: 'challenge cha-that-does-not-exist' },
-    ]);
-
-    const after = await buildBackup();
-    expect(after.workouts.map((w) => w.id)).not.toContain('wo-orphan');
-    expect(after.workouts).toHaveLength(1);
-  });
-
-  it('rejects the files restore rejects, and changes nothing when it does', async () => {
-    await seed();
-    const file = await exportedFile();
-    const { workouts: _omitted, ...withoutWorkouts } = file;
-
-    await expect(
-      mergeBackup({ format: 'godmode-backup', formatVersion: BACKUP_FORMAT_VERSION }),
-    ).rejects.toThrow(/incomplete/i);
-    await expect(mergeBackup(withoutWorkouts)).rejects.toThrow(/workouts/);
-    await expect(mergeBackup({ ...file, planSlots: {} })).rejects.toThrow(/planSlots/);
-    await expect(mergeBackup({ ...file, workouts: [{ actualTotal: 7 }] })).rejects.toThrow(
-      /without an id/i,
-    );
-    await expect(
-      mergeBackup({ ...file, formatVersion: BACKUP_FORMAT_VERSION + 1 }),
-    ).rejects.toThrow(/newer version/i);
-    await expect(mergeBackup(null)).rejects.toThrow(/not a GodMode backup/);
-
-    const after = await buildBackup();
-    expect(after.workouts).toHaveLength(1);
-    expect(after.exercises).toHaveLength(1);
-    expect(after.planSlots.length).toBeGreaterThan(0);
-  });
-});
-
-describe('previewMergeBackup — counting without committing', () => {
-  it('reports what a file would add and writes none of it', async () => {
-    await seed();
-    const before = await buildBackup();
-    const { file } = await onAnotherDevice(() => seed());
-
-    const plan = await previewMergeBackup(file);
-
-    expect(plan.totals.added).toBeGreaterThan(0);
-    expect(plan.settingsMerged).toBe(false);
-
-    const after = await buildBackup();
-    expect(after.exercises).toEqual(before.exercises);
-    expect(after.challenges).toEqual(before.challenges);
-    expect(after.planSlots).toEqual(before.planSlots);
-    expect(after.workouts).toEqual(before.workouts);
-  });
-
-  it('rejects a damaged file before it opens the database', async () => {
-    await seed();
-    await expect(
-      previewMergeBackup({ format: 'godmode-backup', formatVersion: BACKUP_FORMAT_VERSION }),
-    ).rejects.toThrow(/incomplete/i);
   });
 });

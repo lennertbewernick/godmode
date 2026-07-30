@@ -20,7 +20,14 @@ import {
 } from './NewWorkout.js';
 import { Banner, Button, Card } from './kit.js';
 
-export function Welcome({ onReady }: { onReady: () => void }) {
+export function Welcome({
+  revision,
+  onReady,
+}: {
+  /** The snapshot revision these screens were composed against. Sent with the command. */
+  revision: number;
+  onReady: () => void;
+}) {
   const [mode, setMode] = useState<NewWorkoutMode>('choose');
   const [report, setReport] = useState<ImportReport | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -66,7 +73,7 @@ export function Welcome({ onReady }: { onReady: () => void }) {
           </Card>
 
           <p className="px-1 text-xs leading-relaxed text-slate-500">
-            Your data stays on this device. No account, nothing to pay for.
+            Your data lives on your own server. No account, nothing to pay for.
           </p>
         </div>
       ) : null}
@@ -83,7 +90,15 @@ export function Welcome({ onReady }: { onReady: () => void }) {
             setBusy(true);
             setError(null);
             try {
-              await createFromImport(report, baselineValue, accepted, goal, weeks, daysPerWeek);
+              await createFromImport(
+                report,
+                baselineValue,
+                accepted,
+                goal,
+                weeks,
+                daysPerWeek,
+                revision,
+              );
               onReady();
             } catch (e) {
               setError(e instanceof Error ? e.message : 'The import could not be saved.');
@@ -101,7 +116,7 @@ export function Welcome({ onReady }: { onReady: () => void }) {
             setBusy(true);
             setError(null);
             try {
-              await createFromMaxTest(label, testedMax, goal, weeks, daysPerWeek);
+              await createFromMaxTest(label, testedMax, goal, weeks, daysPerWeek, revision);
               onReady();
             } catch (e) {
               setError(e instanceof Error ? e.message : 'The challenge could not be created.');
@@ -121,9 +136,11 @@ export function Welcome({ onReady }: { onReady: () => void }) {
  * than one exercise's history sitting in the old app.
  */
 export function AddWorkout({
+  revision,
   onDone,
   onCancel,
 }: {
+  revision: number;
   onDone: () => void;
   onCancel: () => void;
 }) {
@@ -196,7 +213,15 @@ export function AddWorkout({
             setBusy(true);
             setError(null);
             try {
-              await createFromImport(report, baselineValue, accepted, goal, weeks, daysPerWeek);
+              await createFromImport(
+                report,
+                baselineValue,
+                accepted,
+                goal,
+                weeks,
+                daysPerWeek,
+                revision,
+              );
               onDone();
             } catch (e) {
               setError(e instanceof Error ? e.message : 'The import could not be saved.');
@@ -215,7 +240,7 @@ export function AddWorkout({
             setBusy(true);
             setError(null);
             try {
-              await createFromMaxTest(label, testedMax, goal, weeks, daysPerWeek);
+              await createFromMaxTest(label, testedMax, goal, weeks, daysPerWeek, revision);
               onDone();
             } catch (e) {
               setError(e instanceof Error ? e.message : 'The workout could not be created.');

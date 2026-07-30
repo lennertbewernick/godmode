@@ -12,13 +12,14 @@
 
 import { pushupParams, PUSHUP_5SET_TEMPLATE } from '../core/patterns/percentageRamp.js';
 import type { Baseline } from '../core/types.js';
+import { buildChallenge, buildExercise, newId } from '../db/records.js';
 import {
-  buildChallenge,
-  buildExercise,
-  commitImportAtomically,
-  newId,
-} from '../db/repo.js';
-import { KCAL_ESTIMATOR_VERSION, type PlanSlotRecord, type WorkoutRecord } from '../db/schema.js';
+  KCAL_ESTIMATOR_VERSION,
+  type ChallengeRecord,
+  type ExerciseRecord,
+  type PlanSlotRecord,
+  type WorkoutRecord,
+} from '../db/schema.js';
 import type { CanonicalImport, CanonicalSession } from './pipeline.js';
 
 /** Sum of the reference template's coefficients — 2.05 for the 5-set push-up shape. */
@@ -159,11 +160,20 @@ export interface CommitImportInput {
   kcalCoefficient?: number;
 }
 
-export interface CommitImportResult {
-  challengeId: string;
-  chainId: string;
+/**
+ * A whole import, built and ready to be sent as one command.
+ *
+ * `POST /api/import` is a single transaction — "a whole import, or nothing"
+ * (`server/routes.ts:610`) — which is what `commitImportAtomically` used to give us inside one
+ * IndexedDB transaction. So this function stops at the records: it builds them, reports what it
+ * reconciled, and hands the lot to the caller to send. Nothing here writes.
+ */
+export interface ImportCommand {
+  exercise: ExerciseRecord;
+  challenge: ChallengeRecord;
+  slots: PlanSlotRecord[];
+  workouts: WorkoutRecord[];
   report: ReconciliationReport;
-  workoutsWritten: number;
 }
 
 /**
@@ -216,10 +226,12 @@ function resolveAdvancement(
 }
 
 /**
- * Create the exercise, generate a plan, attach imported history, and mark slots that were
- * demonstrably completed. Slot targets are written once from the generator and never edited.
+ * Build the exercise, generate a plan, attach imported history, and mark slots that were
+ * demonstrably completed. Slot targets come once from the generator and are never edited.
+ *
+ * Pure apart from the ids and timestamps it mints. Sending it is `POST /api/import`.
  */
-export async function commitImport(input: CommitImportInput): Promise<CommitImportResult> {
+export function buildImport(input: CommitImportInput): ImportCommand {
   // Validate the numbers before anything is built, let alone written. These used to be checked
   // implicitly by the generator, after the exercise record already existed.
   for (const [name, value] of [
@@ -303,12 +315,5 @@ export async function commitImport(input: CommitImportInput): Promise<CommitImpo
     advancedOrdinals.has(slot.ordinal) ? { ...slot, status: 'completed' as const } : slot,
   );
 
-  await commitImportAtomically({ exercise, challenge, slots: updated, workouts });
-
-  return {
-    challengeId: challenge.id,
-    chainId: challenge.chainId,
-    report,
-    workoutsWritten: workouts.length,
-  };
+  return { exercise, challenge, slots: updated, workouts, report };
 }

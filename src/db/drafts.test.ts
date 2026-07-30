@@ -1,25 +1,31 @@
 /**
  * The in-progress workout buffer, and the one question it must answer without hedging:
- * can a draft put a workout back that has already been logged?
+ * can a draft put back a workout that has already been saved or queued?
+ *
+ * The attempt-numbering and ratchet tests that used to live beside these have moved to
+ * `server/api.test.ts`, because that is where those transactions now happen.
  */
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import { pushupParams } from '../core/patterns/percentageRamp.js';
-import type { Baseline, WorkoutPerformance } from '../core/types.js';
+import type { Baseline } from '../core/types.js';
 import { newDraft } from '../ui/draft.js';
 import {
   __forgetDiscardedDrafts,
-  __setDB,
-  createChallenge,
-  createExercise,
   deleteDraft,
   getDraft,
   listDrafts,
-  logWorkout,
-  newId,
   saveDraft,
-} from './repo.js';
-import { openFitnessDB, type ChallengeRecord, type PlanSlotRecord } from './schema.js';
+} from './drafts.js';
+import { __setDB } from './local.js';
+import { enqueueWorkout, listOutbox } from './outbox.js';
+import { buildChallenge, buildExercise, buildWorkout, newId } from './records.js';
+import {
+  DEFAULT_SETTINGS,
+  openFitnessDB,
+  type ChallengeRecord,
+  type PlanSlotRecord,
+} from './schema.js';
 
 let dbCounter = 0;
 beforeEach(() => {
@@ -34,9 +40,9 @@ const baseline: Baseline = {
   recordedAt: new Date(2026, 0, 1).toISOString(),
 };
 
-async function seed(): Promise<{ challenge: ChallengeRecord; slots: PlanSlotRecord[] }> {
-  const exercise = await createExercise('Push-ups');
-  return createChallenge({
+function seed(): { challenge: ChallengeRecord; slots: PlanSlotRecord[] } {
+  const exercise = buildExercise('Push-ups');
+  return buildChallenge({
     exerciseId: exercise.id,
     baseline,
     params: pushupParams(18, 100, 6, 3),
@@ -56,19 +62,26 @@ function draftFor(challenge: ChallengeRecord, slot: PlanSlotRecord, id = newId('
   });
 }
 
-function performanceFrom(slot: PlanSlotRecord): WorkoutPerformance {
+/** The record the finish path composes and hands to the outbox. */
+function finished(challenge: ChallengeRecord, slot: PlanSlotRecord, workoutId: string) {
   const targets = slot.targets.map((t) => t.reps);
-  return {
-    sets: targets.map((t, i) => ({ index: i + 1, effectiveTarget: t, actual: t })),
-    actualTotal: slot.targetTotal,
-    adjustmentType: 'none',
-    effectiveTotal: slot.targetTotal,
-  };
+  return buildWorkout({
+    workoutId,
+    challenge,
+    slot,
+    performance: {
+      sets: targets.map((t, i) => ({ index: i + 1, effectiveTarget: t, actual: t })),
+      actualTotal: slot.targetTotal,
+      adjustmentType: 'none',
+      effectiveTotal: slot.targetTotal,
+    },
+    settings: DEFAULT_SETTINGS,
+  }).workout;
 }
 
 describe('draft round trip', () => {
   it('survives being written and read back', async () => {
-    const { challenge, slots } = await seed();
+    const { challenge, slots } = seed();
     const slot = slots[0]!;
     const draft = draftFor(challenge, slot);
 
@@ -78,7 +91,7 @@ describe('draft round trip', () => {
   });
 
   it('overwrites in place rather than accumulating a version per tap', async () => {
-    const { challenge, slots } = await seed();
+    const { challenge, slots } = seed();
     const draft = draftFor(challenge, slots[0]!);
 
     await saveDraft(draft);
@@ -90,7 +103,7 @@ describe('draft round trip', () => {
   });
 
   it('deletes idempotently — a second delete is not an error', async () => {
-    const { challenge, slots } = await seed();
+    const { challenge, slots } = seed();
     const draft = draftFor(challenge, slots[0]!);
     await saveDraft(draft);
 
@@ -100,53 +113,38 @@ describe('draft round trip', () => {
   });
 });
 
-describe('logging a workout clears its draft', () => {
-  it('deletes the draft in the same transaction that writes the workout', async () => {
-    const { challenge, slots } = await seed();
+describe('queueing a workout clears its draft', () => {
+  it('retires the draft in the same transaction that queues the workout', async () => {
+    const { challenge, slots } = seed();
     const slot = slots[0]!;
     const draft = draftFor(challenge, slot);
     await saveDraft(draft);
 
-    const { workout, written } = await logWorkout({
-      challenge,
-      slot,
-      performance: performanceFrom(slot),
-      workoutId: draft.id,
-    });
+    await enqueueWorkout(finished(challenge, slot, draft.id), slot.id);
 
-    expect(written).toBe(true);
-    expect(workout.id).toBe(draft.id);
     expect(await listDrafts()).toEqual([]);
+    expect((await listOutbox()).map((e) => e.id)).toEqual([draft.id]);
   });
 
   it('clears every draft for that slot, not only the one it was given', async () => {
-    const { challenge, slots } = await seed();
+    const { challenge, slots } = seed();
     const slot = slots[0]!;
     const abandoned = draftFor(challenge, slot);
     const current = draftFor(challenge, slot);
     await saveDraft(abandoned);
     await saveDraft(current);
 
-    await logWorkout({
-      challenge,
-      slot,
-      performance: performanceFrom(slot),
-      workoutId: current.id,
-    });
+    await enqueueWorkout(finished(challenge, slot, current.id), slot.id);
 
     expect(await listDrafts()).toEqual([]);
   });
 
   it('leaves a draft for a different slot alone', async () => {
-    const { challenge, slots } = await seed();
+    const { challenge, slots } = seed();
     const other = draftFor(challenge, slots[1]!);
     await saveDraft(other);
 
-    await logWorkout({
-      challenge,
-      slot: slots[0]!,
-      performance: performanceFrom(slots[0]!),
-    });
+    await enqueueWorkout(finished(challenge, slots[0]!, newId('wo')), slots[0]!.id);
 
     expect((await listDrafts()).map((d) => d.id)).toEqual([other.id]);
   });
@@ -154,7 +152,7 @@ describe('logging a workout clears its draft', () => {
 
 describe('a write that would undo a decision is refused', () => {
   it('refuses to write back a draft that was discarded', async () => {
-    const { challenge, slots } = await seed();
+    const { challenge, slots } = seed();
     const draft = draftFor(challenge, slots[0]!);
     await saveDraft(draft);
     await deleteDraft(draft.id);
@@ -166,17 +164,12 @@ describe('a write that would undo a decision is refused', () => {
     expect(await listDrafts()).toEqual([]);
   });
 
-  it('refuses to write a draft whose workout is already logged', async () => {
-    const { challenge, slots } = await seed();
+  it('refuses to write a draft whose workout is already queued for the server', async () => {
+    const { challenge, slots } = seed();
     const slot = slots[0]!;
     const draft = draftFor(challenge, slot);
     await saveDraft(draft);
-    await logWorkout({
-      challenge,
-      slot,
-      performance: performanceFrom(slot),
-      workoutId: draft.id,
-    });
+    await enqueueWorkout(finished(challenge, slot, draft.id), slot.id);
 
     // A second tab, still holding the session, writes it again. The check is inside the write
     // transaction rather than in this tab's memory, which is the only way it can see the
@@ -187,7 +180,7 @@ describe('a write that would undo a decision is refused', () => {
   });
 
   it('refuses a write that has completed fewer sets than the one already stored', async () => {
-    const { challenge, slots } = await seed();
+    const { challenge, slots } = seed();
     const draft = draftFor(challenge, slots[0]!);
     const stamp = { startedAt: 'a', endedAt: 'b' };
 
@@ -202,7 +195,7 @@ describe('a write that would undo a decision is refused', () => {
   });
 
   it('still accepts a write that is level with, or ahead of, what is stored', async () => {
-    const { challenge, slots } = await seed();
+    const { challenge, slots } = seed();
     const draft = draftFor(challenge, slots[0]!);
     const stamp = { startedAt: 'a', endedAt: 'b' };
 
@@ -214,60 +207,5 @@ describe('a write that would undo a decision is refused', () => {
     expect((await listDrafts())[0]!.actuals).toEqual([7, 12, 8]);
 
     expect(await saveDraft({ ...draft, stamps: [stamp, stamp, null] })).toBe('saved');
-  });
-});
-
-describe('a draft cannot resurrect a workout that was already logged', () => {
-  it('saving the same session twice writes one workout and counts one attempt', async () => {
-    const { challenge, slots } = await seed();
-    const slot = slots[0]!;
-    const draft = draftFor(challenge, slot);
-    const performance = performanceFrom(slot);
-
-    const first = await logWorkout({ challenge, slot, performance, workoutId: draft.id });
-    // The same draft, replayed: a retry after a failed-looking save, or a second tab that
-    // still had the session on screen.
-    await saveDraft(draft);
-    const second = await logWorkout({ challenge, slot, performance, workoutId: draft.id });
-
-    expect(second.written).toBe(false);
-    expect(second.workout.id).toBe(first.workout.id);
-    expect(second.workout.attemptNo).toBe(1);
-    expect(second.workout.performedAt).toBe(first.workout.performedAt);
-
-    const { listWorkouts } = await import('./repo.js');
-    expect(await listWorkouts(challenge.chainId)).toHaveLength(1);
-    // The replayed draft is gone too, so the offer cannot come back on the next launch.
-    expect(await listDrafts()).toEqual([]);
-  });
-
-  it('still counts a genuinely separate attempt as a second one', async () => {
-    const { challenge, slots } = await seed();
-    const slot = slots[0]!;
-    const weak: WorkoutPerformance = {
-      sets: [{ index: 1, effectiveTarget: slot.targetTotal, actual: 1 }],
-      actualTotal: 1,
-      adjustmentType: 'none',
-      effectiveTotal: slot.targetTotal,
-    };
-
-    const first = await logWorkout({ challenge, slot, performance: weak, workoutId: newId('wo') });
-    const second = await logWorkout({ challenge, slot, performance: weak, workoutId: newId('wo') });
-
-    expect(first.workout.attemptNo).toBe(1);
-    expect(second.workout.attemptNo).toBe(2);
-    expect(second.written).toBe(true);
-  });
-
-  it('mints an id when none is supplied, exactly as it always did', async () => {
-    const { challenge, slots } = await seed();
-    const slot = slots[0]!;
-    const { workout, written } = await logWorkout({
-      challenge,
-      slot,
-      performance: performanceFrom(slot),
-    });
-    expect(written).toBe(true);
-    expect(workout.id).toMatch(/^wo_/);
   });
 });

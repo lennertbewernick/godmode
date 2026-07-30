@@ -1,5 +1,19 @@
 /**
- * App shell: loads state, routes between screens, and owns the write paths.
+ * App shell: signs in, loads one snapshot, routes between screens, and owns the write paths.
+ *
+ * ## What changed at the cutover
+ *
+ * `load()` used to make five independent IndexedDB reads and then three more. It is now one
+ * `GET /api/snapshot`, and the `revision` it carries goes back out with every ordinary command
+ * so a stale client gets a `409` with fresh state instead of overwriting the other device
+ * (`.planning/DESIGN-server-sqlite.md` §6, §7).
+ *
+ * `finishWorkout` used to assume `logWorkout` either succeeded or threw. It cannot assume that
+ * any more, and the states it can land in are named rather than collapsed: **saved · queued
+ * offline · conflict · unauthorised · server unreachable · draft recovered**. The one rule that
+ * outranks all of them: a finished workout is never dropped. If the POST does not succeed for
+ * any reason at all, the workout goes into the IndexedDB outbox and the user is told plainly
+ * that it is on this device and not yet on the server.
  *
  * More than one exercise can be on the go at once. The shell resolves which challenge is
  * showing (a stored preference with a fall-back), and everything below it is scoped to that
@@ -9,41 +23,49 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { AdjustmentType, WorkoutPerformance } from '../core/types.js';
 import {
+  ApiError,
+  closeSession,
+  endChallenge as endChallengeCommand,
+  getSnapshot,
+  patchSettings,
+  postWorkout,
+  sessionState,
+  startNextBlock as startNextBlockCommand,
+  type Snapshot,
+} from '../api/client.js';
+import { drainOutbox } from '../api/drain.js';
+import {
+  activeChallenges,
+  applyPending,
+  attemptsOn,
+  currentSlot as pickCurrentSlot,
+  exerciseLabels,
+  resolveSelectedChallenge,
+  slotsFor,
+  workoutsForChain,
+} from '../api/snapshot.js';
+import {
   backupFilename,
-  backupIsEmpty,
   buildBackup,
   buildCsv,
   csvFilename,
   downloadFile,
-  mergeBackup,
-  previewMergeBackup,
-  restoreBackup,
   shouldPromptBackup,
 } from '../data/exchange.js';
-import type { MergePlan } from '../data/merge.js';
 import {
-  countAllWorkouts,
-  countAttempts,
+  clearDraftsForSlot,
   deleteDraft,
-  endChallenge,
-  exerciseLabels,
-  getCurrentSlot,
-  getDB,
-  getSettings,
-  listActiveChallenges,
   listDrafts,
-  listSlots,
-  listWorkouts,
-  logWorkout,
-  newId,
-  resolveSelectedChallenge,
+  markWorkoutSettled,
   saveDraft,
-  saveSettings,
-  startNextBlock,
-} from '../db/repo.js';
+} from '../db/drafts.js';
+import { requestPersistentStorage } from '../db/local.js';
+import { enqueueWorkout, listOutbox, OutboxWriteError, unblockAll } from '../db/outbox.js';
+import { buildNextBlock, buildWorkout, newId } from '../db/records.js';
 import type {
   ChallengeRecord,
   DatabaseConflict,
+  OutboxEntry,
   PlanSlotRecord,
   SettingsRecord,
   WorkoutDraftRecord,
@@ -52,10 +74,10 @@ import type {
 import { onDatabaseConflict } from '../db/schema.js';
 import { ExportSheet } from './ExportSheet.js';
 import { History } from './History.js';
-import { RestoreDialog } from './RestoreDialog.js';
 import { Runner } from './Runner.js';
 import { LeaveRunnerDialog, ResumeDialog } from './ResumeDialog.js';
 import { Settings } from './Settings.js';
+import { SignIn } from './SignIn.js';
 import { Today } from './Today.js';
 import { AddWorkout, Welcome } from './Welcome.js';
 import { chooseDraftOffer, draftProgress, newDraft } from './draft.js';
@@ -74,6 +96,14 @@ type View =
   | { kind: 'continue' }
   | { kind: 'add-workout' };
 
+/** Where the app stands with its server. Every one of these says something different. */
+type Session =
+  | { kind: 'checking' }
+  | { kind: 'signed-out'; reason?: string | undefined }
+  | { kind: 'signed-in' }
+  /** The server is there but speaks a version this build cannot read. Nothing is attempted. */
+  | { kind: 'incompatible'; message: string };
+
 const TAB_KEY = 'godmode.tab';
 
 /**
@@ -81,8 +111,8 @@ const TAB_KEY = 'godmode.tab';
  *
  * Off deliberately, 2026-07-30. Everything behind this flag works — the flow builds a real
  * challenge — but it can only ever build ONE shape of plan: `percentage-ramp`, parameterised by
- * goal, weeks and days per week. `repo.ts` names that pattern directly rather than resolving the
- * `patternId` it already stores, and the form's fields are that pattern's parameters, not
+ * goal, weeks and days per week. The generator names that pattern directly rather than resolving
+ * the `patternId` it already stores, and the form's fields are that pattern's parameters, not
  * universal ones. A general-looking "+" therefore promises a generality the app does not have.
  *
  * Turning this back to `true` is the whole change. What should come first is in
@@ -97,7 +127,7 @@ const ADD_WORKOUT_ENABLED = false;
 /**
  * The open tab survives a reload. localStorage rather than the settings record because it is a
  * UI position, not user data — it should not travel in a backup or overwrite the tab on another
- * device when one is restored.
+ * device.
  */
 function storedTab(): Tab {
   try {
@@ -139,54 +169,202 @@ interface State {
   attemptNo: number;
   settings: SettingsRecord;
   exerciseLabel: string;
-  /** Across every exercise and every ended chain — durability is a whole-database property. */
+  /** Across every exercise and every ended chain — durability is a whole-dataset property. */
   totalWorkouts: number;
-  /** In-progress workouts found on this device. Normally none, or exactly one. */
-  drafts: WorkoutDraftRecord[];
 }
 
 export function App() {
-  const [state, setState] = useState<State | null>(null);
+  const [session, setSession] = useState<Session>({ kind: 'checking' });
+  /** Exactly as the server last described it. Never edited in place. */
+  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  /** Finished workouts this device is still holding. */
+  const [pending, setPending] = useState<OutboxEntry[]>([]);
+  /** In-progress workouts found on this device. Normally none, or exactly one. */
+  const [drafts, setDrafts] = useState<WorkoutDraftRecord[]>([]);
   const [view, setView] = useState<View>(() => ({ kind: 'tab', tab: storedTab() }));
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  /** The session the runner is driving. Its `id` is the id the workout will be logged under. */
+  /** The last command hit a 409. Its fresh snapshot is already on screen. */
+  const [conflicted, setConflicted] = useState(false);
+  /** The server did not answer. Reads and writes both surface it here. */
+  const [offline, setOffline] = useState(false);
+  /** The session the runner is driving. Its `id` is the id the workout will be saved under. */
   const [run, setRun] = useState<WorkoutDraftRecord | null>(null);
   /** A draft the user has been shown and left alone. Offering it again on every render would nag. */
   const [dismissedDraftId, setDismissedDraftId] = useState<string | null>(null);
   const [leavePrompt, setLeavePrompt] = useState(false);
   /** Writing the draft is failing. The runner says so rather than promising a durability it has lost. */
   const [draftBroken, setDraftBroken] = useState(false);
-  /** The last save attempt threw. The runner re-arms its save button on this. */
+  /** The last save attempt could not be kept anywhere. The runner re-arms its save button on this. */
   const [saveFailed, setSaveFailed] = useState(false);
   const [dbConflict, setDbConflict] = useState<DatabaseConflict | null>(null);
-  /**
-   * A chosen backup file, read and planned but not applied. Holding the parsed file alongside
-   * the plan is what lets the confirmed action work from the file itself — `mergeBackup` plans
-   * again inside its own write transaction, so what is shown here is a report, never a
-   * commitment.
-   */
-  const [restorePrompt, setRestorePrompt] = useState<{
-    plan: MergePlan;
-    parsed: unknown;
-    fileName: string;
-  } | null>(null);
   const [backupDismissed, setBackupDismissed] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [updateReady, setUpdateReady] = useState(false);
 
-  const load = useCallback(async () => {
-    const [active, challenge, settings, totalWorkouts, drafts] = await Promise.all([
-      listActiveChallenges(),
-      resolveSelectedChallenge(),
-      getSettings(),
-      countAllWorkouts(),
-      listDrafts(),
-    ]);
-    const labels = await exerciseLabels(active);
+  /** Whatever this device is still holding, re-read. Cheap, local, and never fails a render. */
+  const readLocal = useCallback(async () => {
+    const [entries, found] = await Promise.all([listOutbox(), listDrafts()]);
+    setPending(entries);
+    setDrafts(found);
+  }, []);
 
+  /**
+   * Turn a failed command into the right screen.
+   *
+   * Returns true when it recognised the failure, so callers can fall through to a generic
+   * message for anything else rather than swallowing it.
+   */
+  const handleFailure = useCallback((cause: unknown): boolean => {
+    if (!(cause instanceof ApiError)) return false;
+    switch (cause.kind) {
+      case 'unauthorised':
+        setSession({
+          kind: 'signed-out',
+          reason: 'Your session has expired. Sign in again — nothing has been lost.',
+        });
+        return true;
+      case 'version':
+        setSession({ kind: 'incompatible', message: cause.message });
+        return true;
+      case 'conflict':
+        // Every 409 carries the current state, so the conflict is shown rather than described.
+        if (cause.snapshot) setSnapshot(cause.snapshot);
+        setConflicted(true);
+        setError(cause.message);
+        return true;
+      case 'unreachable':
+        setOffline(true);
+        setError(cause.message);
+        return true;
+      default:
+        setError(cause.message);
+        return true;
+    }
+  }, []);
+
+  /**
+   * Send what is queued and fold the result into the screen. Never rejects.
+   *
+   * Every caller is fire-and-forget — a load, a reconnect, a button — so a rejection here would
+   * be an unhandled one, and a drain can reject on something that is not an `ApiError` at all
+   * (IndexedDB going away mid-read). Codex found those callers unguarded.
+   */
+  const syncNow = useCallback(
+    async (announce = false): Promise<void> => {
+      try {
+        const result = await drainOutbox();
+        if (result.snapshot) {
+          setSnapshot(result.snapshot);
+          setOffline(false);
+        }
+        if (result.stoppedBy) handleFailure(result.stoppedBy);
+        else if (announce && result.sent > 0) {
+          setMessage(
+            `${String(result.sent)} workout${result.sent === 1 ? '' : 's'} saved to the server.`,
+          );
+        }
+      } catch (cause) {
+        if (!handleFailure(cause)) {
+          setError(
+            cause instanceof Error
+              ? `Could not send what is waiting: ${cause.message}`
+              : 'Could not send what is waiting. Nothing has been lost.',
+          );
+        }
+      }
+      await readLocal().catch(() => undefined);
+    },
+    [handleFailure, readLocal],
+  );
+
+  /**
+   * One snapshot, then whatever is queued.
+   *
+   * The drain happens here rather than only on reconnect because a tab that was closed with a
+   * queued workout has no reconnect event to wait for.
+   */
+  const load = useCallback(async () => {
+    try {
+      const fresh = await getSnapshot();
+      setSnapshot(fresh);
+      setOffline(false);
+      setConflicted(false);
+      setSession({ kind: 'signed-in' });
+
+      await syncNow();
+    } catch (cause) {
+      if (!handleFailure(cause)) {
+        setError(cause instanceof Error ? cause.message : 'Could not load your training.');
+      }
+      // Local buffers are still readable when the server is not, and the unsent count is
+      // exactly what the user needs to see in that situation.
+      await readLocal().catch(() => undefined);
+    }
+  }, [handleFailure, readLocal, syncNow]);
+
+  // First contact: ask whether the cookie is still good before showing anything. A snapshot
+  // request would answer the same question, but with a 401 in the console on every cold start.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const state = await sessionState();
+        if (!state.authenticated) {
+          setSession({ kind: 'signed-out' });
+          await readLocal().catch(() => undefined);
+          return;
+        }
+        await load();
+      } catch (cause) {
+        if (!handleFailure(cause)) setError('Could not reach the server.');
+        setSession((prev) => (prev.kind === 'checking' ? { kind: 'signed-out' } : prev));
+        await readLocal().catch(() => undefined);
+      }
+    })();
+  }, [load, handleFailure, readLocal]);
+
+  // Asked for once, early. Best-effort: the answer is reported in Settings rather than acted on.
+  useEffect(() => {
+    void requestPersistentStorage();
+  }, []);
+
+  /**
+   * Reconnect: send what is queued.
+   *
+   * `drainOutbox` serialises against the load-time drain, so the two cannot overlap however
+   * they interleave — see the note in `src/api/drain.ts`.
+   */
+  useEffect(() => {
+    const onOnline = () => void syncNow(true);
+    window.addEventListener('online', onOnline);
+    return () => window.removeEventListener('online', onOnline);
+  }, [syncNow]);
+
+  // Fires immediately with the current value, so an update that landed before React mounted
+  // is not lost.
+  useEffect(() => subscribeUpdateReady(setUpdateReady), []);
+
+  // Two tabs disagreeing about the local buffer's version. Nothing is done about it
+  // automatically — closing this tab's connection could interrupt a workout — but the user is
+  // told, because otherwise the other tab simply appears to hang on a blank screen.
+  useEffect(() => onDatabaseConflict(setDbConflict), []);
+
+  /**
+   * The dataset as it should be shown: the server's state plus what this device is still
+   * holding. Display only — see `applyPending`.
+   */
+  const shown = useMemo(
+    () => (snapshot === null ? null : applyPending(snapshot, pending)),
+    [snapshot, pending],
+  );
+
+  const state: State | null = useMemo(() => {
+    if (shown === null) return null;
+    const active = activeChallenges(shown);
+    const labels = exerciseLabels(shown);
+    const challenge = resolveSelectedChallenge(shown);
     if (!challenge) {
-      setState({
+      return {
         active,
         challenge: undefined,
         labels,
@@ -194,70 +372,48 @@ export function App() {
         workouts: [],
         currentSlot: undefined,
         attemptNo: 1,
-        settings,
+        settings: shown.settings,
         exerciseLabel: '',
-        totalWorkouts,
-        drafts,
-      });
-      return;
+        totalWorkouts: shown.workouts.length,
+      };
     }
-
-    const [slots, workouts, currentSlot] = await Promise.all([
-      listSlots(challenge.id),
-      listWorkouts(challenge.chainId),
-      getCurrentSlot(challenge.id),
-    ]);
-    const attemptNo = currentSlot ? (await countAttempts(currentSlot.id)) + 1 : 1;
-
-    setState({
+    const slots = slotsFor(shown, challenge.id);
+    const slot = pickCurrentSlot(slots);
+    return {
       active,
       challenge,
       labels,
       slots,
-      workouts,
-      currentSlot,
-      attemptNo,
-      settings,
+      workouts: workoutsForChain(shown, challenge.chainId),
+      currentSlot: slot,
+      attemptNo: slot ? attemptsOn(shown, slot.id) + 1 : 1,
+      settings: shown.settings,
       exerciseLabel: labels.get(challenge.exerciseId) ?? 'Exercise',
-      totalWorkouts,
-      drafts,
-    });
-  }, []);
-
-  useEffect(() => {
-    void load().catch((e) =>
-      setError(e instanceof Error ? e.message : 'Could not open your data.'),
-    );
-  }, [load]);
-
-  // Fires immediately with the current value, so an update that landed before React mounted
-  // is not lost.
-  useEffect(() => subscribeUpdateReady(setUpdateReady), []);
-
-  // Two tabs disagreeing about the database version. Nothing is done about it automatically —
-  // closing this tab's connection could interrupt a workout — but the user is told, because
-  // otherwise the other tab simply appears to hang on a blank screen.
-  useEffect(() => onDatabaseConflict(setDbConflict), []);
+      totalWorkouts: shown.workouts.length,
+    };
+  }, [shown]);
 
   /**
    * Is there a workout to pick back up?
    *
    * Computed rather than stored, so it cannot go stale behind a refresh of the app's state.
    * Two filters do the work, and both are needed: the draft must belong to the session on
-   * screen, and its id must not already be a logged workout. The second is what actually stops
-   * a draft offering to redo finished work — see `chooseDraftOffer`.
+   * screen, and its id must not already be a saved workout — on the server, or queued here.
    */
   const offer = useMemo(
     () =>
       chooseDraftOffer({
-        drafts: state?.drafts ?? [],
+        drafts,
         currentSlot: state?.currentSlot,
         // A draft whose workout is already in the history describes finished work. Matching
         // the current slot does not rule that out: a failed attempt leaves its slot current.
-        loggedWorkoutIds: new Set((state?.workouts ?? []).map((w) => w.id)),
+        loggedWorkoutIds: new Set([
+          ...(state?.workouts ?? []).map((w) => w.id),
+          ...pending.map((e) => e.id),
+        ]),
         nowMs: Date.now(),
       }),
-    [state],
+    [drafts, pending, state],
   );
 
   /**
@@ -284,7 +440,7 @@ export function App() {
     async (targets: number[], adjustment: AdjustmentType) => {
       if (!state?.challenge || !state.currentSlot) return;
       // The workout's id is minted here, before a single rep is recorded, and it travels with
-      // the draft all the way to `logWorkout`. That is what makes saving idempotent.
+      // the draft all the way to the server. That is what makes saving idempotent.
       const draft = newDraft({
         id: newId('wo'),
         challengeId: state.challenge.id,
@@ -322,10 +478,10 @@ export function App() {
       setLeavePrompt(false);
       setDismissedDraftId(null);
       setView({ kind: 'tab', tab: 'today' });
-      await load();
+      await readLocal();
       setMessage('That workout was discarded. Nothing was added to your history.');
     },
-    [load],
+    [readLocal],
   );
 
   /**
@@ -352,17 +508,57 @@ export function App() {
     setView({ kind: 'tab', tab });
   }, []);
 
+  /**
+   * Run an ordinary command: it carries the revision, and its reply is the new truth.
+   *
+   * Nothing here retries and nothing reloads the page. A 409 puts the fresh snapshot on screen
+   * and says so; the user decides what to do next.
+   */
+  const runCommand = useCallback(
+    async (
+      command: (revision: number) => Promise<{ snapshot: Snapshot }>,
+      done?: string,
+    ): Promise<boolean> => {
+      if (snapshot === null) return false;
+      setError(null);
+      setConflicted(false);
+      try {
+        const result = await command(snapshot.revision);
+        setSnapshot(result.snapshot);
+        setOffline(false);
+        if (done !== undefined) setMessage(done);
+        return true;
+      } catch (cause) {
+        if (!handleFailure(cause)) {
+          setError(cause instanceof Error ? cause.message : 'That did not work.');
+        }
+        return false;
+      }
+    },
+    [snapshot, handleFailure],
+  );
+
   const selectChallenge = useCallback(
     async (challengeId: string) => {
-      await saveSettings({ selectedChallengeId: challengeId });
       setMessage(null);
-      await load();
+      await runCommand((revision) => patchSettings({ selectedChallengeId: challengeId }, revision));
     },
-    [load],
+    [runCommand],
   );
 
   const exportJson = useCallback(async () => {
-    const backup = await buildBackup();
+    if (shown === null) return;
+    // Built from `shown`, NOT from the raw snapshot, and this is the difference between a
+    // complete backup and a nearly complete one. Codex caught it: exporting the server's view
+    // while workouts were still queued here would write a file that silently omits exactly the
+    // sessions that are least safe — the ones no server has yet. The backup is the second copy;
+    // it does not get to be the incomplete one.
+    //
+    // The cost is that a queued workout's `attemptNo` in the file is the number `applyPending`
+    // worked out rather than one the server assigned. That is the same `MAX + 1` rule the
+    // server applies, it is stated in `applyPending`, and a guessed sequence number in a
+    // recoverable file is a far smaller problem than a missing session.
+    const backup = buildBackup(shown);
     // Name it from the very data being written, so the breadth in the filename cannot drift
     // from the breadth in the file.
     downloadFile(
@@ -370,11 +566,24 @@ export function App() {
       JSON.stringify(backup, null, 2),
       'application/json',
     );
-    await saveSettings({ lastBackupAt: new Date().toISOString() });
     setBackupDismissed(true);
-    await load();
-    setMessage('Backup exported.');
-  }, [load]);
+    // The file is already on disk. Recording *when* is a server write, and it is allowed to
+    // fail without turning a successful export into an error message.
+    const recorded = await runCommand((revision) =>
+      patchSettings({ lastBackupAt: new Date().toISOString() }, revision),
+    );
+    const queuedNote =
+      pending.length === 0
+        ? ''
+        : ` It includes ${String(pending.length)} workout${pending.length === 1 ? '' : 's'} this ` +
+          'device has not managed to send yet.';
+    setMessage(
+      (recorded
+        ? 'Backup exported.'
+        : 'Backup exported. The server could not record when, so it may nag you again.') +
+        queuedNote,
+    );
+  }, [shown, pending, runCommand]);
 
   const exportCsv = useCallback(() => {
     if (!state?.challenge) return;
@@ -388,84 +597,20 @@ export function App() {
     downloadFile(csvFilename(state.exerciseLabel), csv, 'text/csv');
   }, [state]);
 
-  const handleRestore = useCallback(
-    async (file: File) => {
-      setError(null);
-      try {
-        const parsed = JSON.parse(await file.text());
-
-        // A well-formed but empty backup landing on a device that has history is almost
-        // always the wrong file, and restore is not undoable — it clears every store first.
-        if (backupIsEmpty(parsed) && (state?.totalWorkouts ?? 0) > 0) {
-          setError(
-            'That backup contains no sessions, and this device has history that restoring ' +
-              'would erase. Nothing has been changed. Check you picked the right file.',
-          );
-          return;
-        }
-
-        // Read and counted, written nowhere. The choice between adding and replacing belongs
-        // to the user, and it cannot be made honestly without these numbers.
-        const plan = await previewMergeBackup(parsed);
-        setRestorePrompt({ plan, parsed, fileName: file.name });
-      } catch (e) {
-        setError(e instanceof Error ? e.message : 'That backup could not be restored.');
-      }
-    },
-    [state],
-  );
-
-  const applyMerge = useCallback(async () => {
-    if (!restorePrompt) return;
-    setError(null);
-    try {
-      const result = await mergeBackup(restorePrompt.parsed);
-      setRestorePrompt(null);
-      await load();
-      goToTab('today');
-      // A silent "done" would defeat the point of showing the preview, so the numbers that
-      // actually landed are reported — including the ones that did not.
-      const parts = [
-        result.totals.added === 0
-          ? 'Nothing new in that backup — everything in it was already here.'
-          : `Added ${result.totals.added} record(s). Nothing here was changed or removed.`,
-      ];
-      if (result.totals.skipped > 0) {
-        parts.push(
-          `${result.totals.skipped} were left out: they point at something neither this ` +
-            'device nor the file has.',
-        );
-      }
-      if (result.totals.divergent > 0) {
-        parts.push(
-          `${result.totals.divergent} exist here in a different version; this device's copy ` +
-            'was kept.',
-        );
-      }
-      setMessage(parts.join(' '));
-    } catch (e) {
-      setRestorePrompt(null);
-      setError(e instanceof Error ? e.message : 'That backup could not be merged.');
-    }
-  }, [restorePrompt, load, goToTab]);
-
-  const applyReplace = useCallback(async () => {
-    if (!restorePrompt) return;
-    setError(null);
-    try {
-      const result = await restoreBackup(restorePrompt.parsed);
-      setRestorePrompt(null);
-      await load();
-      goToTab('today');
-      setMessage(
-        `Restored ${result.workouts} sessions across ${result.challenges} challenge(s).`,
-      );
-    } catch (e) {
-      setRestorePrompt(null);
-      setError(e instanceof Error ? e.message : 'That backup could not be restored.');
-    }
-  }, [restorePrompt, load, goToTab]);
-
+  /**
+   * Finish a workout.
+   *
+   * The order below is the whole of the offline promise:
+   *
+   *   1. Compose the record, including its evaluation, from the prescription the user was
+   *      actually shown. The id is the draft's, so a retry is the same command.
+   *   2. Try to POST it. On 201 the server has it; the drafts go and the reply is the new state.
+   *   3. On ANY failure — no network, a 500, an expired session, even a flat refusal — put it in
+   *      the outbox and say so. A 401 queues it too: signing in must not cost a session.
+   *
+   * The only path that loses a workout is IndexedDB refusing the write as well, and that is the
+   * one case the runner is kept on screen for, still holding the reps.
+   */
   const finishWorkout = useCallback(
     async (
       performance: WorkoutPerformance,
@@ -474,36 +619,76 @@ export function App() {
     ) => {
       if (!state?.challenge || !state.currentSlot) return;
       setSaveFailed(false);
+      setError(null);
+
+      const slot = state.currentSlot;
+      const { workout, evaluation } = buildWorkout({
+        workoutId: options.workoutId ?? newId('wo'),
+        challenge: state.challenge,
+        slot,
+        performance,
+        durationSeconds,
+        settings: state.settings,
+        ...(options.manual === true ? { manuallyAdvance: true } : {}),
+      });
+
+      // ONLY the POST is inside this try. It used to also cover the draft cleanup and the local
+      // re-read, which meant an IndexedDB failure *after* a successful save fell into the queue
+      // path and told the user the workout "could not be saved anywhere" while SQLite already
+      // held it. Codex found that; the narrowed scope is the fix.
+      let accepted: Awaited<ReturnType<typeof postWorkout>>;
       try {
-        // `logWorkout` deletes the draft in the same transaction that writes the workout, so
-        // there is no window in which the session exists twice or not at all. Passing the
-        // draft's id also makes a retry safe: the second attempt finds the first one's row and
-        // returns it rather than logging the session again.
-        const { evaluation } = await logWorkout({
-          challenge: state.challenge,
-          slot: state.currentSlot,
-          performance,
-          durationSeconds,
-          manuallyAdvance: options.manual === true,
-          ...(options.workoutId === undefined ? {} : { workoutId: options.workoutId }),
-        });
+        accepted = await postWorkout(workout);
+      } catch (cause) {
+        try {
+          // Queued whatever went wrong, because the alternative is losing training that was
+          // actually performed. The server dedupes on the id, so a workout that in fact landed
+          // before the connection dropped will be recognised as a duplicate, not stored twice.
+          await enqueueWorkout(workout, slot.id);
+        } catch (queueFailure) {
+          setSaveFailed(true);
+          setError(
+            queueFailure instanceof OutboxWriteError
+              ? queueFailure.message
+              : 'That workout could not be saved anywhere. Your reps are still here — try again.',
+          );
+          return;
+        }
+
         setRun(null);
         goToTab('today');
-        setMessage(evaluation.reason);
-      } catch (e) {
-        // The runner stays where it is, with its numbers, and its save button comes back. The
-        // draft is still on the device — the failed transaction did not delete it.
-        setSaveFailed(true);
-        setError(
-          e instanceof Error
-            ? `That workout was not saved: ${e.message} Your reps are still here — try again.`
-            : 'That workout was not saved. Your reps are still here — try again.',
+        await readLocal().catch(() => undefined);
+
+        if (cause instanceof ApiError && cause.kind === 'unauthorised') {
+          setSession({
+            kind: 'signed-out',
+            reason:
+              'Your session expired while saving. The workout is safe on this device and will ' +
+              'be sent the moment you sign in.',
+          });
+          return;
+        }
+        if (cause instanceof ApiError && cause.kind === 'unreachable') setOffline(true);
+        setMessage(
+          `${evaluation.reason} Saved on this device — it is not on the server yet, and will be ` +
+            'sent automatically.',
         );
         return;
       }
-      await load();
+
+      // Saved. Everything below is tidying up after a workout the server already holds, so
+      // nothing here may report a failure to save. A draft that survives a failed cleanup is
+      // filtered out of the resume offer anyway: its id is a workout in the snapshot now.
+      markWorkoutSettled(workout.id);
+      setSnapshot(accepted.snapshot);
+      setOffline(false);
+      setRun(null);
+      goToTab('today');
+      setMessage(evaluation.reason);
+      await clearDraftsForSlot(slot.id).catch(() => undefined);
+      await readLocal().catch(() => undefined);
     },
-    [state, load, goToTab],
+    [state, goToTab, readLocal],
   );
 
   const advanceManually = useCallback(async () => {
@@ -523,30 +708,78 @@ export function App() {
 
   const endWorkout = useCallback(
     async (challengeId: string) => {
-      await endChallenge(challengeId, 'closed_manually');
-      // The ended one may have been the selection; clear it and let the fall-back choose.
-      const settings = await getSettings();
-      if (settings.selectedChallengeId === challengeId) {
-        await saveSettings({ selectedChallengeId: undefined });
-      }
-      await load();
-      setMessage('Workout ended. Its history stays in your backups.');
+      // The selection is deliberately not cleared afterwards. `resolveSelectedChallenge` falls
+      // back to the newest active challenge when the stored one is no longer active, so a
+      // second command here would buy nothing and could fail on its own.
+      await runCommand(
+        (revision) =>
+          endChallengeCommand(challengeId, {
+            expectedRevision: revision,
+            endReason: 'closed_manually',
+            endedAt: new Date().toISOString(),
+          }),
+        'Workout ended. Its history stays in your backups.',
+      );
     },
-    [load],
+    [runCommand],
   );
 
-  if (error && !state) {
+  const signOut = useCallback(async () => {
+    try {
+      await closeSession();
+    } catch {
+      // A sign-out that cannot reach the server still ends this app's session locally: the
+      // cookie is HttpOnly, so the honest thing is to stop using it and say nothing more.
+    }
+    setSnapshot(null);
+    setSession({ kind: 'signed-out' });
+  }, []);
+
+  // ── Screens ───────────────────────────────────────────────────────────────────
+
+  if (session.kind === 'checking') return <Spinner label="Loading…" />;
+
+  if (session.kind === 'incompatible') {
     return (
       <div className="mx-auto w-full px-4 py-10 md:max-w-lg">
-        <Banner tone="warn">{error}</Banner>
+        <Banner tone="warn">{session.message}</Banner>
       </div>
     );
   }
-  if (!state) return <Spinner label="Loading…" />;
 
-  if (!state.challenge) {
-    return <Welcome onReady={() => void load()} />;
+  if (session.kind === 'signed-out') {
+    return (
+      <>
+        <SignIn reason={session.reason} onSignedIn={() => void load()} />
+        {pending.length > 0 ? (
+          <div className="mx-auto w-full px-4 pb-6 md:max-w-md">
+            <Banner tone="info">
+              {pending.length} finished workout{pending.length === 1 ? '' : 's'} waiting on this
+              device. Signing in sends {pending.length === 1 ? 'it' : 'them'}.
+            </Banner>
+          </div>
+        ) : null}
+      </>
+    );
   }
+
+  if (state === null) {
+    return (
+      <div className="mx-auto w-full px-4 py-10 md:max-w-lg">
+        {error ? <Banner tone="warn">{error}</Banner> : <Spinner label="Loading…" />}
+        <div className="mt-4">
+          <Button variant="ghost" className="w-full" onClick={() => void load()}>
+            Try again
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!state.challenge && snapshot) {
+    return <Welcome revision={snapshot.revision} onReady={() => void load()} />;
+  }
+  if (!state.challenge) return <Spinner label="Loading…" />;
 
   if (view.kind === 'runner' && state.currentSlot && run) {
     return (
@@ -582,7 +815,7 @@ export function App() {
               // Shown once and left alone: Today's Start button brings the offer back.
               setDismissedDraftId(run.id);
               goToTab('today');
-              void load();
+              void readLocal();
             }}
             onDiscard={() => void discardRun(run)}
           />
@@ -591,9 +824,10 @@ export function App() {
     );
   }
 
-  if (view.kind === 'add-workout') {
+  if (view.kind === 'add-workout' && snapshot) {
     return (
       <AddWorkout
+        revision={snapshot.revision}
         onCancel={() => goToTab('today')}
         onDone={() => {
           goToTab('today');
@@ -610,26 +844,40 @@ export function App() {
         challenge={state.challenge}
         workouts={state.workouts}
         onCancel={() => goToTab('today')}
-        onConfirm={async (baselineValue, tested, goal, weeks, daysPerWeek) => {
-          // One transaction: ending the old block, recording the max test, creating the
-          // successor and its slots, and moving the selection all land together or not at all.
+        onConfirm={async (baselineValue, tested, goal, weeks, daysPerWeekValue) => {
+          // One command: ending the old block, recording the max test, creating the successor
+          // and its slots, and moving the selection all land together or not at all.
+          let plan: ReturnType<typeof buildNextBlock>;
           try {
-            await startNextBlock({
+            plan = buildNextBlock({
               previous: state.challenge!,
               strategy: tested ? 'retest' : 'user_entered',
               baselineValue,
               goalValue: goal,
               weeks,
-              daysPerWeek,
+              daysPerWeek: daysPerWeekValue,
               tested,
             });
           } catch (e) {
             setError(e instanceof Error ? e.message : 'The next block could not be started.');
             return;
           }
-          goToTab('today');
-          setMessage('New block started.');
-          await load();
+
+          const ok = await runCommand(
+            (revision) =>
+              startNextBlockCommand({
+                expectedRevision: revision,
+                previousChallengeId: state.challenge!.id,
+                endedAt: plan.endedAt,
+                ...(plan.performanceTest === undefined
+                  ? {}
+                  : { performanceTest: plan.performanceTest }),
+                challenge: plan.challenge,
+                slots: plan.slots,
+              }),
+            'New block started.',
+          );
+          if (ok) goToTab('today');
         }}
       />
     );
@@ -638,6 +886,7 @@ export function App() {
   const activeTab = view.kind === 'tab' ? view.tab : 'today';
   const showBackupNag =
     !backupDismissed && shouldPromptBackup(state.settings, state.totalWorkouts);
+  const blocked = pending.filter((entry) => entry.blockedReason !== undefined);
 
   const tabOptions = TABS.map((tab) => ({
     value: tab,
@@ -692,6 +941,67 @@ export function App() {
         </div>
       ) : null}
 
+      {/*
+        The four server states, each said once and in the user's terms. Unsent workouts come
+        first because they are the only one that is about their training rather than about the
+        app's plumbing.
+      */}
+      {pending.length > 0 ? (
+        <div className="pb-3">
+          <Banner tone="info">
+            {pending.length} finished workout{pending.length === 1 ? '' : 's'} saved on this
+            device only.{' '}
+            <button type="button" className="underline" onClick={() => void syncNow(true)}>
+              Send now
+            </button>
+            {blocked.length > 0 ? (
+              <>
+                {' '}
+                {blocked.length} of {pending.length === blocked.length ? 'them' : 'those'} the
+                server refused: {blocked[0]?.blockedReason ?? ''}{' '}
+                {/*
+                  The way back out. A workout is normally refused because of something that can
+                  be put right — the challenge was ended on the other device, so the slot it
+                  names is gone — and once it is, the same command would be accepted. Without
+                  this the entry is kept for ever and unreachable, which is barely better than
+                  losing it.
+                */}
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() =>
+                    void (async () => {
+                      await unblockAll().catch(() => 0);
+                      await syncNow(true);
+                    })()
+                  }
+                >
+                  Try them again
+                </button>
+              </>
+            ) : null}
+          </Banner>
+        </div>
+      ) : null}
+
+      {offline ? (
+        <div className="pb-3">
+          <Banner tone="warn" onDismiss={() => setOffline(false)}>
+            The server is not answering. You can still train — anything you finish is kept here
+            and sent when it comes back.
+          </Banner>
+        </div>
+      ) : null}
+
+      {conflicted ? (
+        <div className="pb-3">
+          <Banner tone="warn" onDismiss={() => setConflicted(false)}>
+            Your other device changed something first. What is on screen is now the latest —
+            check it, then try again.
+          </Banner>
+        </div>
+      ) : null}
+
       {error ? (
         <div className="pb-3">
           <Banner tone="warn" onDismiss={() => setError(null)}>
@@ -715,15 +1025,15 @@ export function App() {
       ) : null}
 
       {/*
-        This app never reloads itself. Runner.tsx now persists a draft as it goes, so a reload
-        no longer destroys the reps — but it still throws away the running session: the rest
-        clock, the set the user is standing in, and anything typed but not yet committed. The
-        reload is always the user's tap.
+        This app never reloads itself. Runner.tsx persists a draft as it goes, so a reload no
+        longer destroys the reps — but it still throws away the running session: the rest clock,
+        the set the user is standing in, and anything typed but not yet committed. The reload is
+        always the user's tap.
 
         `workoutInProgress` is passed even though this render site already sits after the
         `view.kind === 'runner'` early return, so the banner is structurally unreachable during
         a workout. Stating the guarantee in code — and pinning it in policy.test.ts — is worth
-        more than trusting the ordering of early returns in a 700-line file to stay put.
+        more than trusting the ordering of early returns in a long file to stay put.
 
         No onDismiss: a dismissed update is an update the user never gets, and this app is
         handed out once as a link.
@@ -794,18 +1104,15 @@ export function App() {
             settings={state.settings}
             exerciseLabel={state.exerciseLabel}
             workoutCount={state.workouts.length}
+            unsentCount={pending.length}
             active={state.active}
             labels={state.labels}
             onEndWorkout={(id) => void endWorkout(id)}
             onSave={(patch) => {
-              void saveSettings(patch).then(() => {
-                void load();
-                setMessage('Saved.');
-              });
+              void runCommand((revision) => patchSettings(patch, revision), 'Saved.');
             }}
             onOpenExport={() => setShareOpen(true)}
-            onRestoreFile={(file) => void handleRestore(file)}
-            onResetAll={() => void wipeAll().then(() => window.location.reload())}
+            onSignOut={() => void signOut()}
           />
         ) : null}
       </main>
@@ -834,7 +1141,7 @@ export function App() {
         The recovered workout. Offered, never applied — and offered here, over Today, rather
         than by dropping the user into a runner they did not ask for.
       */}
-      {offer.kind === 'offer' && offer.draft.id !== dismissedDraftId && !restorePrompt ? (
+      {offer.kind === 'offer' && offer.draft.id !== dismissedDraftId ? (
         <ResumeDialog
           draft={offer.draft}
           progress={offer.progress}
@@ -843,16 +1150,6 @@ export function App() {
           onResume={() => resumeRun(offer.draft)}
           onDiscard={() => void discardRun(offer.draft)}
           onDismiss={() => setDismissedDraftId(offer.draft.id)}
-        />
-      ) : null}
-
-      {restorePrompt ? (
-        <RestoreDialog
-          plan={restorePrompt.plan}
-          fileName={restorePrompt.fileName}
-          onMerge={() => void applyMerge()}
-          onReplace={() => void applyReplace()}
-          onCancel={() => setRestorePrompt(null)}
         />
       ) : null}
 
@@ -990,22 +1287,6 @@ function WorkoutBar({
       ) : null}
     </div>
   );
-}
-
-async function wipeAll(): Promise<void> {
-  const db = await getDB();
-  const stores = [
-    'exercises',
-    'challenges',
-    'performanceTests',
-    'planSlots',
-    'workouts',
-    'workoutDrafts',
-    'settings',
-  ] as const;
-  const tx = db.transaction(stores, 'readwrite');
-  for (const store of stores) await tx.objectStore(store).clear();
-  await tx.done;
 }
 
 function ContinueBlock({

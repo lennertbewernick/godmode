@@ -13,7 +13,9 @@
 import { openDB } from 'idb';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { newDraft } from '../ui/draft.js';
-import { __setDB, listDrafts, saveDraft } from './repo.js';
+import { listDrafts, saveDraft } from './drafts.js';
+import { __setDB } from './local.js';
+import { countOutbox } from './outbox.js';
 import {
   DB_VERSION,
   openFitnessDB,
@@ -120,7 +122,7 @@ const settings: SettingsRecord = {
  * `openFitnessDB`: the point is to reproduce what is actually on a group member's phone, and
  * `openFitnessDB` only ever creates the current shape.
  */
-async function seedLegacyDatabase(version: 1 | 2): Promise<void> {
+async function seedLegacyDatabase(version: 1 | 2 | 3): Promise<void> {
   const db = await openDB(name, version, {
     upgrade(database) {
       database.createObjectStore('exercises', { keyPath: 'id' });
@@ -143,6 +145,12 @@ async function seedLegacyDatabase(version: 1 | 2): Promise<void> {
       workouts.createIndex('byPerformedAt', 'performedAt');
 
       database.createObjectStore('settings', { keyPath: 'id' });
+
+      // v3's store, so a database seeded at 3 is the shape a phone actually holds.
+      if (version >= 3) {
+        const drafts = database.createObjectStore('workoutDrafts', { keyPath: 'id' });
+        drafts.createIndex('bySlot', 'planSlotId');
+      }
     },
   });
 
@@ -162,16 +170,16 @@ async function seedLegacyDatabase(version: 1 | 2): Promise<void> {
   db.close();
 }
 
-describe('upgrading a populated database to v3', () => {
+describe('upgrading a populated database to v4', () => {
   it('is the version this build claims', () => {
-    expect(DB_VERSION).toBe(3);
+    expect(DB_VERSION).toBe(4);
   });
 
   it('keeps every record when it comes from v2', async () => {
     await seedLegacyDatabase(2);
     const db = await openFitnessDB(name);
 
-    expect(db.version).toBe(3);
+    expect(db.version).toBe(4);
     expect(await db.get('exercises', 'ex_1')).toEqual(exercise);
     expect(await db.get('challenges', 'ch_1')).toEqual(challenge);
     expect(await db.get('planSlots', 'slot_1')).toEqual(planSlot);
@@ -194,16 +202,17 @@ describe('upgrading a populated database to v3', () => {
     db.close();
   });
 
-  it('runs the v2 rewrite and the v3 store creation in one jump from v1', async () => {
+  it('runs the v2 rewrite and both store creations in one jump from v1', async () => {
     await seedLegacyDatabase(1);
     const db = await openFitnessDB(name);
 
-    expect(db.version).toBe(3);
+    expect(db.version).toBe(4);
     // v2's work still happened: the retired profile id was rewritten.
     expect((await db.get('workouts', 'wo_1'))?.importSource).toBe('incumbent-csv-v1');
     // …and the workout that never carried one was left exactly as it was.
     expect(await db.get('workouts', 'wo_2')).toEqual(nativeWorkout);
     expect([...db.objectStoreNames]).toContain('workoutDrafts');
+    expect([...db.objectStoreNames]).toContain('workoutOutbox');
     db.close();
   });
 
@@ -236,7 +245,7 @@ describe('upgrading a populated database to v3', () => {
     second.close();
     const third = await openFitnessDB(name);
 
-    expect(third.version).toBe(3);
+    expect(third.version).toBe(4);
     expect(await third.get('workouts', 'wo_1')).toEqual(importedWorkout);
     expect(await third.count('workouts')).toBe(2);
     third.close();
@@ -251,8 +260,30 @@ describe('upgrading a populated database to v3', () => {
       'planSlots',
       'settings',
       'workoutDrafts',
+      'workoutOutbox',
       'workouts',
     ]);
     db.close();
+  });
+
+  /**
+   * The cutover's own migration, and the assertion that matters most about it: adding the
+   * outbox does not touch the five stores that hold the pre-cutover history. That history is
+   * the fallback copy — nothing in this work deletes it, and nothing calls
+   * `indexedDB.deleteDatabase`.
+   */
+  it('adds an empty outbox to a v3 database without disturbing anything', async () => {
+    await seedLegacyDatabase(3);
+    __setDB(openFitnessDB(name));
+    const db = await openFitnessDB(name);
+
+    expect(db.version).toBe(4);
+    expect(await countOutbox()).toBe(0);
+    expect(await db.get('exercises', 'ex_1')).toEqual(exercise);
+    expect(await db.get('challenges', 'ch_1')).toEqual(challenge);
+    expect(await db.get('planSlots', 'slot_1')).toEqual(planSlot);
+    expect(await db.get('workouts', 'wo_1')).toEqual(importedWorkout);
+    expect(await db.get('workouts', 'wo_2')).toEqual(nativeWorkout);
+    expect(await db.get('settings', 'settings')).toEqual(settings);
   });
 });

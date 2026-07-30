@@ -21,8 +21,15 @@ import { fileURLToPath, URL } from 'node:url'
  */
 const DEFAULT_PORT = 5173
 
-function resolvePort(raw: string | undefined): number {
-  if (raw === undefined || raw.trim() === '') return DEFAULT_PORT
+/**
+ * Where the API server is listening, for the dev proxy below.
+ *
+ * Must match `GODMODE_SERVER_PORT` in `server/DEPLOY.md`, whose default is the same 8787.
+ */
+const DEFAULT_API_PORT = 8787
+
+function resolvePort(raw: string | undefined, fallback = DEFAULT_PORT): number {
+  if (raw === undefined || raw.trim() === '') return fallback
   const port = Number(raw)
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     // Never fall back to the default here: a typo would silently move the whole database.
@@ -64,7 +71,32 @@ export default defineConfig(({ mode }) => {
     resolve: {
       alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
     },
-    server: { port, strictPort: true, ...(host === undefined ? {} : { host }) },
+    /**
+     * `/api` is proxied so the browser sees ONE origin in development.
+     *
+     * This is not a convenience. The session cookie is `HttpOnly; Secure; SameSite=Strict`
+     * (`.planning/DESIGN-server-sqlite.md` §9): a cross-origin `fetch` from `localhost:5173` to
+     * `localhost:8787` would not send it, and the obvious "fix" is `SameSite=None`, which
+     * silently reopens the CSRF hole the same-origin design closes. Proxying keeps the dev
+     * server honest about the shape production has, where `server/index.ts` serves the built
+     * client and the API from one listener.
+     *
+     * `Secure` cookies are accepted over plain HTTP on loopback, which is why this works
+     * without TLS locally and does not work anywhere else — see `server/DEPLOY.md`.
+     *
+     * Run both: `npm run serve` in one terminal, `npm run dev` in another. See the README.
+     */
+    server: {
+      port,
+      strictPort: true,
+      ...(host === undefined ? {} : { host }),
+      proxy: {
+        '/api': {
+          target: `http://127.0.0.1:${String(resolvePort(env.GODMODE_SERVER_PORT, DEFAULT_API_PORT))}`,
+          changeOrigin: false,
+        },
+      },
+    },
     preview: { port, strictPort: true, ...(host === undefined ? {} : { host }) },
     plugins: [
       react(),
@@ -119,7 +151,14 @@ export default defineConfig(({ mode }) => {
            * would otherwise hand back index.html and the page would be unreachable.
            * Suffix-anchored and prefix-free, so it holds at any deploy subpath.
            */
-          navigateFallbackDenylist: [/reset-sw\.html$/],
+          /**
+           * `/api` is on the denylist for the same reason and one more: an API call answered
+           * from the precache with index.html is the single most confusing failure a
+           * same-origin app can have. `.planning/DESIGN-server-sqlite.md` §8 requires that no
+           * runtime caching route touch `/api`, and there is none — this entry is the defence
+           * in depth it also asks for, not the fix.
+           */
+          navigateFallbackDenylist: [/reset-sw\.html$/, /^\/api\//],
           /** Same reason: it is a network tool and has no offline job. */
           globIgnores: ['reset-sw.html'],
         },

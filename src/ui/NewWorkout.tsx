@@ -7,11 +7,12 @@
  */
 
 import { useState } from 'react';
+import { commitImport, createChallenge } from '../api/client.js';
 import { pushupParams } from '../core/patterns/percentageRamp.js';
-import { createChallenge, createExercise, recordMaxTest, saveSettings } from '../db/repo.js';
+import { buildChallenge, buildExercise, buildMaxTest } from '../db/records.js';
 import { buildCanonicalImport, type ImportReport } from '../import/pipeline.js';
 import { INCUMBENT_CSV_V1 } from '../import/profiles.js';
-import { commitImport, estimateBaselineFromImport } from '../import/reconcile.js';
+import { buildImport, estimateBaselineFromImport } from '../import/reconcile.js';
 import { Banner, Button, Card, NumberField, TextField } from './kit.js';
 
 /** Below this baseline the percentage table produces very coarse sets. Worth saying out loud. */
@@ -256,10 +257,19 @@ export function FreshStart({
 }
 
 // ── The write paths, shared by both callers ────────────────────────────────────
+//
+// Each is now ONE command. Creating a workout from a max test used to be three IndexedDB
+// transactions — exercise, then test, then challenge and slots — plus a fourth to move the
+// selection, and a failure between any two left an orphan. `POST /api/challenges` carries all
+// four and applies them together (`server/routes.ts:409-418`), which is why `exercise` and
+// `performanceTest` are optional on that endpoint at all.
+//
+// `select: true` is that fourth write: both creators select what was just made, so the app
+// lands on it rather than on whatever happened to be newest.
 
 /**
- * Both creators select the new challenge, so the app lands on the thing that was just made
- * rather than on whatever happened to be newest.
+ * @param expectedRevision the revision of the snapshot this screen was composed against. A
+ * mismatch comes back as a 409 carrying fresh state rather than overwriting the other device.
  */
 export async function createFromImport(
   report: ImportReport,
@@ -268,8 +278,9 @@ export async function createFromImport(
   goal: number,
   weeks: number,
   daysPerWeek: number,
+  expectedRevision: number,
 ): Promise<void> {
-  const { challengeId } = await commitImport({
+  const command = buildImport({
     canonical: report.canonical,
     baseline: {
       value: baselineValue,
@@ -280,7 +291,15 @@ export async function createFromImport(
     weeks,
     daysPerWeek,
   });
-  await saveSettings({ selectedChallengeId: challengeId });
+
+  await commitImport({
+    expectedRevision,
+    exercise: command.exercise,
+    challenge: command.challenge,
+    slots: command.slots,
+    workouts: command.workouts,
+    select: true,
+  });
 }
 
 export async function createFromMaxTest(
@@ -289,10 +308,11 @@ export async function createFromMaxTest(
   goal: number,
   weeks: number,
   daysPerWeek: number,
+  expectedRevision: number,
 ): Promise<void> {
-  const exercise = await createExercise(label);
-  const test = await recordMaxTest(exercise.id, testedMax);
-  const { challenge } = await createChallenge({
+  const exercise = buildExercise(label);
+  const test = buildMaxTest(exercise.id, testedMax);
+  const { challenge, slots } = buildChallenge({
     exerciseId: exercise.id,
     baseline: {
       value: testedMax,
@@ -302,7 +322,15 @@ export async function createFromMaxTest(
     },
     params: pushupParams(testedMax, goal, weeks, daysPerWeek),
   });
-  await saveSettings({ selectedChallengeId: challenge.id });
+
+  await createChallenge({
+    expectedRevision,
+    exercise,
+    performanceTest: test,
+    challenge,
+    slots,
+    select: true,
+  });
 }
 
 export function readCsv(file: File): Promise<ImportReport> {

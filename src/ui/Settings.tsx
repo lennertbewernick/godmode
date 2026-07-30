@@ -1,9 +1,16 @@
 /**
- * Settings, backup, and restore.
+ * Settings and backup.
  *
- * The device-only-copy explanation lives here and in onboarding (DIST-04), because iOS will
- * evict IndexedDB for sites it considers unused. Data loss is a product concern, not a
- * footnote in a README.
+ * Restore and "delete everything" are gone from this screen, and their absence is deliberate
+ * rather than an omission. Both were IndexedDB operations on a database that is no longer the
+ * dataset: restore cleared six stores and rewrote them, and the reset wiped all seven. The API
+ * has no equivalent command — see the note in `src/data/exchange.ts` — and approximating a
+ * transaction the server does not offer, on the only copy of someone's history, is exactly the
+ * kind of thing that loses it. Restoring is `npm run import-backup`, which verifies the whole
+ * file before it replaces anything.
+ *
+ * What is left of the durability warning still belongs here: an unsent workout lives in this
+ * browser until the server takes it, and iOS can clear that.
  */
 
 import { useState } from 'react';
@@ -15,35 +22,30 @@ export function Settings({
   settings,
   exerciseLabel,
   workoutCount,
+  unsentCount,
   active,
   labels,
   onEndWorkout,
   onSave,
   onOpenExport,
-  onRestoreFile,
-  onResetAll,
+  onSignOut,
 }: {
   settings: SettingsRecord;
   exerciseLabel: string;
   workoutCount: number;
+  /** Finished workouts this device is still holding. Zero, almost always. */
+  unsentCount: number;
   active: ChallengeRecord[];
   labels: Map<string, string>;
   onEndWorkout: (challengeId: string) => void;
   onSave: (patch: Partial<SettingsRecord>) => void;
-  /** Opens the one export sheet. Restore stays here, because it is import. */
   onOpenExport: () => void;
-  /**
-   * Hands the chosen file up. It is not restored on the spot: the shell reads it and shows
-   * what it would change, and the choice between adding and replacing is made there.
-   */
-  onRestoreFile: (file: File) => void;
-  onResetAll: () => void;
+  onSignOut: () => void;
 }) {
   const [bodyweight, setBodyweight] = useState<number | ''>(settings.bodyweightKg ?? '');
   const [restOverride, setRestOverride] = useState<number | ''>(
     settings.restOverrideSeconds ?? '',
   );
-  const [confirmReset, setConfirmReset] = useState(false);
   const [confirmEnd, setConfirmEnd] = useState<string | null>(null);
 
   const days = daysSinceBackup(settings);
@@ -112,8 +114,8 @@ export function Settings({
       <Card>
         <h3 className="font-semibold text-slate-100">Backups</h3>
         <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
-          This phone holds the only copy of your history, and iOS can clear storage for web
-          apps you haven't opened in a while. Export a backup now and then.
+          Your history lives on your server, in a SQLite file you can copy. A backup here is a
+          second copy you hold yourself — take one now and then.
         </p>
         <div className="mt-3 text-xs text-slate-400">
           {days === null
@@ -129,21 +131,28 @@ export function Settings({
             Export…
           </Button>
         </div>
-        <label className="mt-3 block">
-          <span className="text-sm font-medium text-slate-300">Restore from a backup</span>
-          <input
-            type="file"
-            accept=".json,application/json"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) onRestoreFile(file);
-            }}
-            className="mt-1.5 block w-full cursor-pointer rounded-xl border border-dashed border-[#3b4a68] bg-[#0f1728] px-3 py-3 text-sm text-slate-300 file:mr-3 file:rounded-lg file:border-0 file:bg-[#26324b] file:px-3 file:py-1.5 file:text-slate-200"
-          />
-          <span className="mt-1.5 block text-xs text-slate-400">
-            Shows what the file would change before anything is written.
-          </span>
-        </label>
+        <p className="mt-4 text-xs leading-relaxed text-slate-400">
+          Restoring one is done on the server, not here:{' '}
+          <code className="rounded bg-[#0f1728] px-1 py-0.5">
+            npm run import-backup -- backup.json --target godmode.sqlite --dry-run
+          </code>
+          . It checks every record, builds a new database, verifies it, and only then puts it in
+          place — keeping whatever was there before.
+        </p>
+      </Card>
+
+      <Card>
+        <h3 className="font-semibold text-slate-100">Unsent workouts</h3>
+        <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
+          A workout you finish with no connection is kept in this browser until the server takes
+          it. That is the one thing here iOS can still clear, so do not reinstall or clear site
+          data while any are waiting.
+        </p>
+        <div className="tnum mt-3 text-sm text-slate-200">
+          {unsentCount === 0
+            ? 'Nothing waiting — everything is on the server.'
+            : `${unsentCount} waiting to be sent.`}
+        </div>
       </Card>
 
       <Card>
@@ -232,27 +241,24 @@ export function Settings({
       </Card>
 
       <Card>
-        <h3 className="font-semibold text-red-300">Delete everything</h3>
+        <h3 className="font-semibold text-slate-100">This device</h3>
         <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
-          Wipes every session and setting on this device. Export a backup first.
+          Signing out ends the session on the server and forgets it here. Your training is not
+          touched — it is on the server, not in this browser.
         </p>
-        {confirmReset ? (
-          <div className="mt-4 flex flex-col gap-3">
-            <Banner tone="warn">This cannot be undone.</Banner>
-            <div className="flex gap-2">
-              <Button variant="ghost" onClick={() => setConfirmReset(false)}>
-                Keep my data
-              </Button>
-              <Button variant="danger" className="flex-1" onClick={onResetAll}>
-                Delete it all
-              </Button>
-            </div>
-          </div>
-        ) : (
-          <Button variant="danger" className="mt-4 w-full" onClick={() => setConfirmReset(true)}>
-            Delete all data
-          </Button>
-        )}
+        <Button
+          variant="ghost"
+          className="mt-4 w-full"
+          disabled={unsentCount > 0}
+          onClick={onSignOut}
+        >
+          Sign out
+        </Button>
+        {unsentCount > 0 ? (
+          <p className="mt-2 text-xs leading-relaxed text-amber-300">
+            Not while {unsentCount} workout{unsentCount === 1 ? '' : 's'} still needs sending.
+          </p>
+        ) : null}
       </Card>
     </div>
   );
