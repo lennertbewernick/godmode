@@ -74,22 +74,22 @@ export const INCUMBENT_CSV_V1: ImportProfile = {
 export const PROFILES: ImportProfile[] = [INCUMBENT_CSV_V1];
 
 /**
- * Profile ids that shipped under an earlier name, mapped to their current id.
+ * Resolve a stored `importSource` to a current profile id.
  *
- * This map is the one place the retired vendor-derived id still appears, and it exists only
- * in order to erase it: `importSource` is persisted on every imported workout, so renaming
- * the profile leaves records carrying the old string. A rename that cannot name the old
- * value cannot rewrite it. The v2 database migration rewrites stored records, and restore
- * normalises anything arriving from an older backup, so no old value survives either entry
- * point. The map has to outlive the migration because old backup files are forever.
+ * The profile id is persisted on every imported workout, so renaming it leaves records in the
+ * database carrying the id it shipped under. Rather than hard-coding the retired name, this
+ * relies on a fact that is true for the whole period during which any such record could have
+ * been written: exactly one import format has ever existed. So an id that matches no known
+ * profile can only be an earlier name for the one profile there is, and is resolved to it.
+ *
+ * That reasoning is deliberately self-limiting. It holds only while `PROFILES` has a single
+ * entry; the moment a second format ships, an unrecognised id becomes genuinely ambiguous and
+ * is left alone rather than guessed at.
  */
-export const LEGACY_PROFILE_IDS: Readonly<Record<string, string>> = {
-  'incumbent-csv-v1': 'incumbent-csv-v1',
-};
-
-/** The current id for a possibly-legacy profile id. */
 export function canonicalProfileId(id: string): string {
-  return LEGACY_PROFILE_IDS[id] ?? id;
+  if (PROFILES.some((p) => p.id === id)) return id;
+  const only = PROFILES.length === 1 ? PROFILES[0] : undefined;
+  return only ? only.id : id;
 }
 
 export function findProfile(id: string): ImportProfile | undefined {

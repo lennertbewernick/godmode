@@ -35,8 +35,8 @@ export const DB_NAME = 'fitness-companion';
  * a database that already ran it will not run it again, so a retroactive edit only ever
  * applies to some users.
  *
- * v1 initial stores. v2 normalised the retired vendor-derived import-source id
- * (see `LEGACY_PROFILE_IDS` in `src/import/profiles.ts`).
+ * v1 created the stores. v2 normalised the persisted import-profile id after the profile was
+ * renamed (see `canonicalProfileId` in `src/import/profiles.ts`).
  */
 export const DB_VERSION = 2;
 

@@ -141,12 +141,12 @@ describe('restoreBackup — refusing to destroy data', () => {
     ).rejects.toThrow(/format version/i);
   });
 
-  it('normalises a retired import-source id arriving from an older backup', async () => {
+  it('normalises an unrecognised import-source id arriving from an older backup', async () => {
     await seed();
     const backup = await buildBackup();
     const legacy = {
       ...backup,
-      workouts: backup.workouts.map((w) => ({ ...w, importSource: 'incumbent-csv-v1' })),
+      workouts: backup.workouts.map((w) => ({ ...w, importSource: 'retired-profile-id' })),
     };
 
     await restoreBackup(legacy);
@@ -207,7 +207,7 @@ describe('schema migration v1 to v2', () => {
       adjustmentType: 'none',
       effectiveTotal: 37,
       outcome: 'completed_as_planned',
-      importSource: 'incumbent-csv-v1',
+      importSource: 'retired-profile-id',
     });
     await v1.put('workouts', {
       id: 'wo-manual',
