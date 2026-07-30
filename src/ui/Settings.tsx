@@ -20,7 +20,6 @@ import { Banner, Button, Card, NumberField } from './kit.js';
 
 export function Settings({
   settings,
-  exerciseLabel,
   workoutCount,
   unsentCount,
   active,
@@ -31,7 +30,6 @@ export function Settings({
   onSignOut,
 }: {
   settings: SettingsRecord;
-  exerciseLabel: string;
   workoutCount: number;
   /** Finished workouts this device is still holding. Zero, almost always. */
   unsentCount: number;
@@ -51,8 +49,14 @@ export function Settings({
   const days = daysSinceBackup(settings);
 
   return (
-    <div className="flex flex-col gap-4 lg:grid lg:grid-cols-2 lg:items-start">
-      <Card>
+    // Columns, not a grid. A two-column grid puts each card in a row whose height is set by
+    // the taller of the pair, so a short card leaves a gap under it and the column bottoms
+    // drift apart. A multi-column flow packs the cards continuously instead, which is what
+    // suits a stack of unrelated widgets with very different heights. `break-inside-avoid`
+    // on each card is what stops one being split down the middle across the column boundary.
+    // Below lg it stays a single flex column — two columns of this width would be cramped.
+    <div className="flex flex-col gap-4 lg:block lg:columns-2 lg:gap-4">
+      <Card className="lg:mb-4 lg:break-inside-avoid">
         {/*
           An inventory, not a selector. The workout row above Today and History owns selection
           outright, and it hosts the "add a workout" control that used to sit in this header —
@@ -111,7 +115,7 @@ export function Settings({
         ) : null}
       </Card>
 
-      <Card>
+      <Card className="lg:mb-4 lg:break-inside-avoid">
         <h3 className="font-semibold text-slate-100">Backups</h3>
         <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
           Your history lives on your server, in a SQLite file you can copy. A backup here is a
@@ -141,7 +145,7 @@ export function Settings({
         </p>
       </Card>
 
-      <Card>
+      <Card className="lg:mb-4 lg:break-inside-avoid">
         <h3 className="font-semibold text-slate-100">Unsent workouts</h3>
         <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
           A workout you finish with no connection is kept in this browser until the server takes
@@ -155,7 +159,7 @@ export function Settings({
         </div>
       </Card>
 
-      <Card>
+      <Card className="lg:mb-4 lg:break-inside-avoid">
         <h3 className="font-semibold text-slate-100">Calories</h3>
         <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
           A rough estimate, about {settings.kcalCoefficient} kcal per rep per kilo of
@@ -185,7 +189,7 @@ export function Settings({
         </Button>
       </Card>
 
-      <Card>
+      <Card className="lg:mb-4 lg:break-inside-avoid">
         <h3 className="font-semibold text-slate-100">Rest between sets</h3>
         <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
           Rest grows with the size of the session — around 30 seconds early on, about two and
@@ -216,23 +220,13 @@ export function Settings({
         </Button>
       </Card>
 
-      <Card>
+      <Card className="lg:mb-4 lg:break-inside-avoid">
         <h3 className="font-semibold text-slate-100">About</h3>
         <dl className="mt-3 flex flex-col gap-2 text-sm">
-          <div className="flex justify-between gap-3">
-            <dt className="text-slate-400">Exercise</dt>
-            <dd className="text-slate-200">{exerciseLabel}</dd>
-          </div>
-          <div className="flex justify-between gap-3">
-            {/*
-              Scoped, and now said rather than implied. `workoutCount` is the selected
-              challenge's session count, while the app also holds a database-wide total (the
-              backup nag uses it). With no selection control left in Settings, leaning on the
-              adjacent "Exercise" row to carry the scope is weaker than stating it.
-            */}
-            <dt className="text-slate-400">Sessions for this exercise</dt>
-            <dd className="tnum text-slate-200">{workoutCount}</dd>
-          </div>
+          {/*
+            No "Exercise" or session-count rows here. Both restated what the workouts card
+            above already shows, and About is for facts about the app, not about the data.
+          */}
           <div className="flex justify-between gap-3">
             <dt className="text-slate-400">Licence</dt>
             <dd className="text-slate-200">AGPL-3.0</dd>
@@ -240,7 +234,7 @@ export function Settings({
         </dl>
       </Card>
 
-      <Card>
+      <Card className="lg:mb-4 lg:break-inside-avoid">
         <h3 className="font-semibold text-slate-100">This device</h3>
         <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
           Signing out ends the session on the server and forgets it here. Your training is not

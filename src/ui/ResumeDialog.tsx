@@ -123,28 +123,33 @@ export function LeaveRunnerDialog({
   return (
     <Modal title="Leave this workout?" onClose={onStay}>
       <div className="flex flex-col gap-4">
+        {/*
+          Each label states its own consequence, so nothing below has to explain it. "Leave and
+          keep it" needed a caption to be understood beside "Keep going"; "Pause — resume from
+          Today" says where the session goes and how to get it back, in the label itself. The
+          only prose left is the one fact a label cannot carry: how much is at stake.
+        */}
         <p className="text-sm leading-relaxed text-slate-300">
           {progress.setsDone === 0
-            ? 'Nothing has been recorded yet.'
+            ? 'Nothing recorded yet.'
             : `${progress.repsDone} rep${progress.repsDone === 1 ? '' : 's'} across ` +
-              `${progress.setsDone} set${progress.setsDone === 1 ? '' : 's'} are saved on this ` +
-              'device. Leaving keeps them — you can pick the session back up from Today.'}
+              `${progress.setsDone} set${progress.setsDone === 1 ? '' : 's'} saved.`}
         </p>
 
         <div className="flex flex-col gap-2 sm:flex-row">
           <Button className="flex-1" onClick={onStay}>
-            Keep going
+            Carry on training
           </Button>
           <Button variant="ghost" onClick={onKeep}>
-            Leave and keep it
+            Pause — resume from Today
           </Button>
         </div>
         <button
           type="button"
-          className="text-xs text-amber-300 underline"
+          className="self-start text-xs text-amber-300 underline"
           onClick={onDiscard}
         >
-          Leave and throw it away
+          Discard — these reps are gone
         </button>
       </div>
     </Modal>

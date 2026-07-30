@@ -1102,7 +1102,6 @@ export function App() {
         {activeTab === 'settings' ? (
           <Settings
             settings={state.settings}
-            exerciseLabel={state.exerciseLabel}
             workoutCount={state.workouts.length}
             unsentCount={pending.length}
             active={state.active}
