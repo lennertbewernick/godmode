@@ -406,7 +406,33 @@ difference. `insertSql()` in `server/rows.ts` emits a plain `INSERT` and has no 
 - The in-progress workout draft, which stays in IndexedDB as a write-ahead buffer and is not part
   of this schema.
 
-One thing is **unverified**: nobody has read the live IndexedDB on the device that holds the only
-copy. Everything above is derived from the types and from the code that writes them, not from the
-bytes. That is the reason the REAL-versus-INTEGER rule leans the way it does, and the reason the
-migration imports into a temporary file and verifies before anything is renamed into place.
+## 13. Verified against the real data, 2026-07-30
+
+This section previously recorded that nothing here had been checked against the bytes on the
+device holding the only copy — everything was derived from the types and from the code that
+writes them. **That gap is now closed.**
+
+A backup was exported from the live database at `http://localhost:5173` (29 workouts, 36 plan
+slots, 2 challenges, 2 exercises, 1 max test) and driven through this layer end to end:
+
+1. `validateBackupStrict` accepted it — every record and every nested object, against the field
+   specs in `fields.ts`.
+2. Every record was inserted into a database built from `schema.sql`, in one transaction.
+3. `PRAGMA foreign_key_check` returned no rows.
+4. `PRAGMA integrity_check` returned `ok`.
+5. Every record was read back and compared **deep-equal, field for field**, against the source —
+   exercises, challenges, performance tests, plan slots, workouts and settings.
+
+So the matrix, the DDL, the canonical encoder and the validator all hold against real history,
+not only fixtures. In particular the zone-less 19-character timestamps that `toIso()` emits
+(`import/pipeline.ts:175-178`) pass, which is the concrete failure this would most plausibly have
+had — a stricter ISO rule would have rejected all 29 sessions at the migration gate.
+
+The test that proved it was deliberately **not** kept: it reads an absolute path to an export
+outside the repository, so it would fail for anyone else and rot here. It is reproducible from
+this description in a few lines against `rows.ts` and `schema.ts`.
+
+What remains genuinely unverified is narrower than before: the REAL-versus-INTEGER rule is still
+a judgement about what *future* values could be, not a claim about the 29 sessions, whose numbers
+are all integral today. The migration still imports into a temporary file and verifies before
+anything is renamed into place.
