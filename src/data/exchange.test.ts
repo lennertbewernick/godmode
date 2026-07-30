@@ -11,19 +11,39 @@ import {
   BACKUP_FORMAT_VERSION,
   backupIsEmpty,
   buildBackup,
+  mergeBackup,
+  previewMergeBackup,
   restoreBackup,
+  type BackupFile,
 } from './exchange.js';
-import { __setDB, createChallenge, createExercise, putImportedWorkout } from '../db/repo.js';
-import { DB_NAME, DB_VERSION, openFitnessDB, type WorkoutRecord } from '../db/schema.js';
+import {
+  __setDB,
+  createChallenge,
+  createExercise,
+  endChallenge,
+  getSettings,
+  putImportedWorkout,
+  saveSettings,
+} from '../db/repo.js';
+import {
+  DB_NAME,
+  DB_VERSION,
+  DEFAULT_SETTINGS,
+  openFitnessDB,
+  type Database,
+  type WorkoutRecord,
+} from '../db/schema.js';
 import { pushupParams } from '../core/patterns/percentageRamp.js';
 import type { Baseline } from '../core/types.js';
 
 let dbCounter = 0;
 let dbName = '';
+let myDatabase: Promise<Database>;
 beforeEach(() => {
   dbCounter += 1;
   dbName = `exchange-test-db-${dbCounter}`;
-  __setDB(openFitnessDB(dbName));
+  myDatabase = openFitnessDB(dbName);
+  __setDB(myDatabase);
 });
 
 const baseline: Baseline = {
@@ -256,5 +276,237 @@ describe('schema migration v1 to v2', () => {
 
   it('uses a stable database name', () => {
     expect(DB_NAME).toBe('fitness-companion');
+  });
+});
+
+let otherCounter = 0;
+
+/**
+ * Do some work on a *different* device, and hand back the file it would export.
+ *
+ * Its records carry ids this device has never seen, which is what a second phone actually
+ * looks like — and the file goes through JSON on the way back, as a real one does, so no
+ * explicit `undefined` survives and key order is whatever the serialiser chose.
+ */
+async function onAnotherDevice<T>(
+  work: () => Promise<T>,
+): Promise<{ made: T; file: BackupFile }> {
+  const mine = myDatabase;
+  otherCounter += 1;
+  __setDB(openFitnessDB(`${dbName}-other-${otherCounter}`));
+  try {
+    const made = await work();
+    const file = JSON.parse(JSON.stringify(await buildBackup())) as BackupFile;
+    return { made, file };
+  } finally {
+    __setDB(mine);
+  }
+}
+
+/** This device's own export, as a file: through JSON, exactly as the user would hand it back. */
+async function exportedFile(): Promise<BackupFile> {
+  return JSON.parse(JSON.stringify(await buildBackup())) as BackupFile;
+}
+
+describe('mergeBackup — adding without destroying', () => {
+  it('writes nothing when a device merges its own backup back into itself', async () => {
+    const { slots } = await seed();
+    const before = await buildBackup();
+    const file = await exportedFile();
+
+    const result = await mergeBackup(file);
+
+    expect(result.totals.added).toBe(0);
+    expect(result.totals.divergent).toBe(0);
+    expect(result.totals.skipped).toBe(0);
+    expect(result.counts.exercises.identical).toBe(1);
+    expect(result.counts.challenges.identical).toBe(1);
+    expect(result.counts.workouts.identical).toBe(1);
+    expect(result.counts.planSlots.identical).toBe(slots.length);
+
+    const after = await buildBackup();
+    expect(after.exercises).toEqual(before.exercises);
+    expect(after.challenges).toEqual(before.challenges);
+    expect(after.planSlots).toEqual(before.planSlots);
+    expect(after.workouts).toEqual(before.workouts);
+  });
+
+  it('adds a workout and its sessions that this device does not have', async () => {
+    const { made, file } = await onAnotherDevice(() => seed());
+
+    const result = await mergeBackup(file);
+
+    expect(result.counts.exercises.added).toBe(1);
+    expect(result.counts.challenges.added).toBe(1);
+    expect(result.counts.planSlots.added).toBe(made.slots.length);
+    expect(result.counts.workouts.added).toBe(1);
+    expect(result.totals.skipped).toBe(0);
+
+    const after = await buildBackup();
+    expect(after.challenges.map((c) => c.id)).toEqual([made.challenge.id]);
+    expect(after.workouts.map((w) => w.id)).toEqual([made.workout.id]);
+    expect(after.planSlots).toHaveLength(made.slots.length);
+  });
+
+  it('leaves a session this device has and the file does not exactly where it is', async () => {
+    const { challenge, workout } = await seed();
+    const file = await exportedFile();
+
+    // Logged after the backup was taken — the phone-only session the old restore would have
+    // destroyed.
+    const later: WorkoutRecord = {
+      ...workout,
+      id: 'wo-after-the-backup',
+      challengeId: challenge.id,
+      chainId: challenge.chainId,
+      attemptNo: 2,
+      performedAt: new Date(2026, 5, 2, 7, 15).toISOString(),
+      actualTotal: 41,
+    };
+    await putImportedWorkout(later);
+
+    const result = await mergeBackup(file);
+
+    expect(result.totals.added).toBe(0);
+    const after = await buildBackup();
+    expect(after.workouts.map((w) => w.id).sort()).toEqual(['wo-after-the-backup', 'wo-seed']);
+  });
+
+  it('cannot reopen a workout this device ended', async () => {
+    const { challenge } = await seed();
+    const file = await exportedFile();
+    expect(file.challenges[0]?.status).toBe('active');
+
+    // Ended through the real path, not a hand-written record.
+    await endChallenge(challenge.id, 'closed_manually');
+
+    const result = await mergeBackup(file);
+
+    expect(result.divergent).toEqual([
+      { store: 'challenges', id: challenge.id, reason: 'local-ended' },
+    ]);
+
+    const after = await buildBackup();
+    expect(after.challenges[0]?.status).toBe('ended');
+    expect(after.challenges[0]?.endReason).toBe('closed_manually');
+    expect(after.challenges[0]?.endedAt).toBeTypeOf('string');
+  });
+
+  it('leaves the local settings alone, including the last backup and the selection', async () => {
+    const { challenge } = await seed();
+    await saveSettings({
+      bodyweightKg: 77,
+      lastBackupAt: '2026-07-01T00:00:00.000Z',
+      selectedChallengeId: challenge.id,
+    });
+
+    const file = await exportedFile();
+    file.settings = {
+      ...file.settings,
+      bodyweightKg: 999,
+      kcalCoefficient: 0.9,
+      lastBackupAt: '2020-01-01T00:00:00.000Z',
+      selectedChallengeId: 'a-challenge-from-another-phone',
+    };
+
+    const result = await mergeBackup(file);
+    expect(result.settingsMerged).toBe(false);
+
+    const settings = await getSettings();
+    expect(settings.bodyweightKg).toBe(77);
+    expect(settings.kcalCoefficient).toBe(DEFAULT_SETTINGS.kcalCoefficient);
+    expect(settings.lastBackupAt).toBe('2026-07-01T00:00:00.000Z');
+    expect(settings.selectedChallengeId).toBe(challenge.id);
+  });
+
+  it('keeps this device version of a session the file disagrees about', async () => {
+    const { workout } = await seed();
+    const file = await exportedFile();
+    expect(file.workouts[0]?.actualTotal).toBe(7);
+
+    // The same id, a different result — two devices that both logged the session.
+    await putImportedWorkout({
+      ...workout,
+      sets: [{ index: 1, effectiveTarget: 7, actual: 42 }],
+      actualTotal: 42,
+    });
+
+    const result = await mergeBackup(file);
+
+    expect(result.counts.workouts.divergent).toBe(1);
+    expect(result.counts.workouts.added).toBe(0);
+
+    const after = await buildBackup();
+    expect(after.workouts).toHaveLength(1);
+    expect(after.workouts[0]?.actualTotal).toBe(42);
+  });
+
+  it('does not write a session whose workout exists in neither place', async () => {
+    await seed();
+    const file = await exportedFile();
+    file.workouts = [
+      ...file.workouts,
+      { ...file.workouts[0]!, id: 'wo-orphan', challengeId: 'cha-that-does-not-exist' },
+    ];
+
+    const result = await mergeBackup(file);
+
+    expect(result.skipped).toEqual([
+      { store: 'workouts', id: 'wo-orphan', missing: 'challenge cha-that-does-not-exist' },
+    ]);
+
+    const after = await buildBackup();
+    expect(after.workouts.map((w) => w.id)).not.toContain('wo-orphan');
+    expect(after.workouts).toHaveLength(1);
+  });
+
+  it('rejects the files restore rejects, and changes nothing when it does', async () => {
+    await seed();
+    const file = await exportedFile();
+    const { workouts: _omitted, ...withoutWorkouts } = file;
+
+    await expect(
+      mergeBackup({ format: 'godmode-backup', formatVersion: BACKUP_FORMAT_VERSION }),
+    ).rejects.toThrow(/incomplete/i);
+    await expect(mergeBackup(withoutWorkouts)).rejects.toThrow(/workouts/);
+    await expect(mergeBackup({ ...file, planSlots: {} })).rejects.toThrow(/planSlots/);
+    await expect(mergeBackup({ ...file, workouts: [{ actualTotal: 7 }] })).rejects.toThrow(
+      /without an id/i,
+    );
+    await expect(
+      mergeBackup({ ...file, formatVersion: BACKUP_FORMAT_VERSION + 1 }),
+    ).rejects.toThrow(/newer version/i);
+    await expect(mergeBackup(null)).rejects.toThrow(/not a GodMode backup/);
+
+    const after = await buildBackup();
+    expect(after.workouts).toHaveLength(1);
+    expect(after.exercises).toHaveLength(1);
+    expect(after.planSlots.length).toBeGreaterThan(0);
+  });
+});
+
+describe('previewMergeBackup — counting without committing', () => {
+  it('reports what a file would add and writes none of it', async () => {
+    await seed();
+    const before = await buildBackup();
+    const { file } = await onAnotherDevice(() => seed());
+
+    const plan = await previewMergeBackup(file);
+
+    expect(plan.totals.added).toBeGreaterThan(0);
+    expect(plan.settingsMerged).toBe(false);
+
+    const after = await buildBackup();
+    expect(after.exercises).toEqual(before.exercises);
+    expect(after.challenges).toEqual(before.challenges);
+    expect(after.planSlots).toEqual(before.planSlots);
+    expect(after.workouts).toEqual(before.workouts);
+  });
+
+  it('rejects a damaged file before it opens the database', async () => {
+    await seed();
+    await expect(
+      previewMergeBackup({ format: 'godmode-backup', formatVersion: BACKUP_FORMAT_VERSION }),
+    ).rejects.toThrow(/incomplete/i);
   });
 });

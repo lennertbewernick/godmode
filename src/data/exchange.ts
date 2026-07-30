@@ -12,6 +12,7 @@
 
 import { getDB } from '../db/repo.js';
 import { canonicalProfileId } from '../import/profiles.js';
+import { MERGE_STORES, planMerge, type MergePlan } from './merge.js';
 import { DB_VERSION, DEFAULT_SETTINGS, type SettingsRecord } from '../db/schema.js';
 import type {
   ChallengeRecord,
@@ -98,7 +99,7 @@ function isRecordObject(value: unknown): value is Record<string, unknown> {
  * `{"format":"godmode-backup","formatVersion":1}` is well-formed JSON and passes any
  * header-only guard, and restoring it would clear every store and commit successfully.
  */
-function validateBackup(json: unknown): BackupFile {
+export function validateBackup(json: unknown): BackupFile {
   if (!isRecordObject(json)) {
     throw new Error('That file is not a GodMode backup.');
   }
@@ -197,6 +198,102 @@ export async function restoreBackup(json: unknown): Promise<RestoreResult> {
     planSlots: backup.planSlots.length,
     workouts: workouts.length,
     performanceTests: backup.performanceTests.length,
+  };
+}
+
+// ── Merge ───────────────────────────────────────────────────────────────────────
+//
+// Merge is a *sibling* of restore, never a refactor of it. `restoreBackup` above clears every
+// store before writing, which is correct for disaster recovery and catastrophic anywhere else;
+// a regression in it is a wiped device. So nothing below reaches into it, and nothing below
+// clears or deletes anything: `put` is the only write these functions make.
+
+/** What a merge did. The plan, minus the records themselves. */
+export interface MergeResult {
+  counts: MergePlan['counts'];
+  totals: MergePlan['totals'];
+  divergent: MergePlan['divergent'];
+  skipped: MergePlan['skipped'];
+  warnings: MergePlan['warnings'];
+  settingsMerged: false;
+}
+
+/**
+ * What a merge *would* do. Display only — it writes nothing, and the plan it returns is
+ * deliberately not carried into `mergeBackup`, which recomputes its own.
+ */
+export async function previewMergeBackup(json: unknown): Promise<MergePlan> {
+  const backup = validateBackup(json);
+
+  const db = await getDB();
+  const tx = db.transaction(MERGE_STORES, 'readonly');
+  const [exercises, challenges, performanceTests, planSlots, workouts] = await Promise.all([
+    tx.objectStore('exercises').getAll(),
+    tx.objectStore('challenges').getAll(),
+    tx.objectStore('performanceTests').getAll(),
+    tx.objectStore('planSlots').getAll(),
+    tx.objectStore('workouts').getAll(),
+  ]);
+  await tx.done;
+
+  return planMerge({ exercises, challenges, performanceTests, planSlots, workouts }, backup);
+}
+
+/**
+ * Validate and load a backup, adding what this device does not already have.
+ *
+ * Nothing is cleared and nothing is deleted. A record that exists here and not in the file is
+ * untouched; a record that exists in both and differs keeps the version stored here.
+ */
+export async function mergeBackup(json: unknown): Promise<MergeResult> {
+  // Before the database is opened, as restore does — a damaged file is rejected without a
+  // transaction ever existing.
+  const backup = validateBackup(json);
+
+  const db = await getDB();
+  // `settings` is deliberately absent from this list. That is what makes "merge never touches
+  // your bodyweight, rest override or selected workout" structural: the transaction has no
+  // handle on the store, so no future edit to this function can write to it by accident.
+  const tx = db.transaction(MERGE_STORES, 'readwrite');
+
+  // One await, on five requests that all belong to `tx`. Awaiting them together keeps the
+  // transaction alive across the pause — the same reasoning the guarded v2 migration relies on
+  // in `schema.ts`. Awaiting anything *outside* the transaction here would let it auto-commit
+  // out from under the writes below.
+  const [exercises, challenges, performanceTests, planSlots, workouts] = await Promise.all([
+    tx.objectStore('exercises').getAll(),
+    tx.objectStore('challenges').getAll(),
+    tx.objectStore('performanceTests').getAll(),
+    tx.objectStore('planSlots').getAll(),
+    tx.objectStore('workouts').getAll(),
+  ]);
+
+  // Planned here, inside the write transaction, rather than carried over from the preview:
+  // a plan computed minutes ago could otherwise overwrite a session logged in between.
+  const plan = planMerge(
+    { exercises, challenges, performanceTests, planSlots, workouts },
+    backup,
+  );
+
+  // Issue every write up front and await them with `tx.done`, as restore does. Sequential
+  // awaits risk the transaction auto-committing partway through, which on iOS Safari surfaces
+  // as TransactionInactiveError.
+  await Promise.all([
+    ...plan.additions.exercises.map((r) => tx.objectStore('exercises').put(r)),
+    ...plan.additions.challenges.map((r) => tx.objectStore('challenges').put(r)),
+    ...plan.additions.performanceTests.map((r) => tx.objectStore('performanceTests').put(r)),
+    ...plan.additions.planSlots.map((r) => tx.objectStore('planSlots').put(r)),
+    ...plan.additions.workouts.map((r) => tx.objectStore('workouts').put(r)),
+    tx.done,
+  ]);
+
+  return {
+    counts: plan.counts,
+    totals: plan.totals,
+    divergent: plan.divergent,
+    skipped: plan.skipped,
+    warnings: plan.warnings,
+    settingsMerged: plan.settingsMerged,
   };
 }
 
