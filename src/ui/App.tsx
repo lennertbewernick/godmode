@@ -185,7 +185,13 @@ export function App() {
 
   const exportJson = useCallback(async () => {
     const backup = await buildBackup();
-    downloadFile(backupFilename(), JSON.stringify(backup, null, 2), 'application/json');
+    // Name it from the very data being written, so the breadth in the filename cannot drift
+    // from the breadth in the file.
+    downloadFile(
+      backupFilename(backup.exercises.map((e) => e.label)),
+      JSON.stringify(backup, null, 2),
+      'application/json',
+    );
     await saveSettings({ lastBackupAt: new Date().toISOString() });
     setBackupDismissed(true);
     await load();
@@ -201,7 +207,7 @@ export function App() {
       workouts: state.workouts,
       slotsById: new Map(state.slots.map((s) => [s.id, s])),
     });
-    downloadFile(csvFilename(), csv, 'text/csv');
+    downloadFile(csvFilename(state.exerciseLabel), csv, 'text/csv');
   }, [state]);
 
   const handleRestore = useCallback(

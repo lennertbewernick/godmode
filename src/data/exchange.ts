@@ -21,6 +21,10 @@ import type {
 } from '../db/schema.js';
 import type { PerformanceTest } from '../core/types.js';
 
+// The filename builders live in their own dependency-free module so the UI can name a share
+// card without importing the database. Re-exported so existing import sites keep working.
+export { backupFilename, csvFilename, shareImageFilename, slugLabel } from './filenames.js';
+
 export const BACKUP_FORMAT_VERSION = 1;
 
 export interface BackupFile {
@@ -281,8 +285,8 @@ function csvField(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
-export function downloadFile(filename: string, content: string, mime: string): void {
-  const blob = new Blob([content], { type: `${mime};charset=utf-8` });
+/** The object-URL-plus-anchor dance, for content that is already a Blob (the share card). */
+export function downloadBlob(filename: string, blob: Blob): void {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = url;
@@ -291,18 +295,8 @@ export function downloadFile(filename: string, content: string, mime: string): v
   URL.revokeObjectURL(url);
 }
 
-export function backupFilename(now = new Date()): string {
-  const stamp =
-    `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
-    `_${pad(now.getHours())}${pad(now.getMinutes())}`;
-  return `godmode_backup_${stamp}.json`;
-}
-
-export function csvFilename(now = new Date()): string {
-  const stamp =
-    `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
-    `_${pad(now.getHours())}${pad(now.getMinutes())}`;
-  return `godmode_stats_${stamp}.csv`;
+export function downloadFile(filename: string, content: string, mime: string): void {
+  downloadBlob(filename, new Blob([content], { type: `${mime};charset=utf-8` }));
 }
 
 /** Days since the last export, or null if there has never been one. */
