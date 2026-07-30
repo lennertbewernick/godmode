@@ -22,8 +22,7 @@ export function Settings({
   onAddWorkout,
   onEndWorkout,
   onSave,
-  onExportJson,
-  onExportCsv,
+  onOpenExport,
   onRestore,
   onResetAll,
 }: {
@@ -37,8 +36,8 @@ export function Settings({
   onAddWorkout: () => void;
   onEndWorkout: (challengeId: string) => void;
   onSave: (patch: Partial<SettingsRecord>) => void;
-  onExportJson: () => void;
-  onExportCsv: () => void;
+  /** Opens the one export sheet. Restore stays here, because it is import and it destroys. */
+  onOpenExport: () => void;
   onRestore: (file: File) => void;
   onResetAll: () => void;
 }) {
@@ -138,12 +137,9 @@ export function Settings({
               ? 'Last backup: today.'
               : `Last backup: ${days} day${days === 1 ? '' : 's'} ago.`}
         </div>
-        <div className="mt-4 flex flex-col gap-2 sm:flex-row">
-          <Button className="flex-1" onClick={onExportJson}>
-            Export backup
-          </Button>
-          <Button variant="ghost" onClick={onExportCsv}>
-            Export CSV
+        <div className="mt-4">
+          <Button className="w-full" onClick={onOpenExport}>
+            Export…
           </Button>
         </div>
         <label className="mt-3 block">

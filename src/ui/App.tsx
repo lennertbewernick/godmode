@@ -40,6 +40,7 @@ import type {
   SettingsRecord,
   WorkoutRecord,
 } from '../db/schema.js';
+import { ExportSheet } from './ExportSheet.js';
 import { History } from './History.js';
 import { Runner } from './Runner.js';
 import { Settings } from './Settings.js';
@@ -116,6 +117,7 @@ export function App() {
     adjustment: AdjustmentType;
   } | null>(null);
   const [backupDismissed, setBackupDismissed] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
 
   const load = useCallback(async () => {
     const [active, challenge, settings, totalWorkouts] = await Promise.all([
@@ -373,25 +375,38 @@ export function App() {
 
   return (
     <div className="mx-auto flex min-h-screen w-full flex-col px-4 md:max-w-3xl lg:max-w-6xl safe-t">
-      <header className="flex flex-col gap-3 pb-4 md:flex-row md:items-center md:justify-between">
-        <div className="flex items-baseline justify-between gap-3">
-          <h1 className="text-xl font-bold tracking-tight text-slate-100">
-            GODMODE
-            <span className="ml-2 text-xs font-normal uppercase tracking-[0.18em] text-teal-300">
-              No More Later
-            </span>
-          </h1>
-        </div>
+      <header className="flex items-center justify-between gap-3 pb-4">
+        <h1 className="text-xl font-bold tracking-tight text-slate-100">
+          GODMODE
+          <span className="ml-2 text-xs font-normal uppercase tracking-[0.18em] text-teal-300">
+            No More Later
+          </span>
+        </h1>
 
-        {/* Desktop keeps navigation at the top; the phone keeps it under the thumb. */}
-        <nav className="hidden md:block">
-          <Segmented
-            ariaLabel="Sections"
-            value={activeTab}
-            onChange={goToTab}
-            options={tabOptions}
-          />
-        </nav>
+        {/*
+          Below md this wrapper holds only the share icon, so it lands top-right on a phone;
+          from md up the tab row sits beside it. The sheet it opens is a bottom sheet, which is
+          what puts the actions back under the thumb.
+        */}
+        <div className="flex items-center gap-2">
+          {/* Desktop keeps navigation at the top; the phone keeps it under the thumb. */}
+          <nav className="hidden md:block">
+            <Segmented
+              ariaLabel="Sections"
+              value={activeTab}
+              onChange={goToTab}
+              options={tabOptions}
+            />
+          </nav>
+          <Button
+            variant="subtle"
+            ariaLabel="Share and export"
+            className="min-h-11 px-2"
+            onClick={() => setShareOpen(true)}
+          >
+            <ShareGlyph />
+          </Button>
+        </div>
       </header>
 
       {state.active.length > 1 ? (
@@ -453,8 +468,7 @@ export function App() {
             exerciseLabel={state.exerciseLabel}
             scopedToOneWorkout={state.active.length > 1}
             daysPerWeek={daysPerWeek(state.challenge)}
-            onExportCsv={exportCsv}
-            onExportJson={() => void exportJson()}
+            onShare={() => setShareOpen(true)}
           />
         ) : null}
 
@@ -475,8 +489,7 @@ export function App() {
                 setMessage('Saved.');
               });
             }}
-            onExportJson={() => void exportJson()}
-            onExportCsv={exportCsv}
+            onOpenExport={() => setShareOpen(true)}
             onRestore={(file) => void handleRestore(file)}
             onResetAll={() => void wipeAll().then(() => window.location.reload())}
           />
@@ -502,7 +515,41 @@ export function App() {
           ))}
         </div>
       </nav>
+
+      {shareOpen ? (
+        <ExportSheet
+          onClose={() => setShareOpen(false)}
+          onExportCsv={exportCsv}
+          onExportJson={() => void exportJson()}
+          canExportCsv={state.challenge !== undefined}
+        />
+      ) : null}
     </div>
+  );
+}
+
+/**
+ * Three nodes, two strokes. Drawn inline rather than pulled from an icon set — this app has no
+ * icon dependency and is not acquiring one for a single glyph.
+ */
+function ShareGlyph() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      className="size-5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <circle cx="18" cy="5" r="2.5" />
+      <circle cx="6" cy="12" r="2.5" />
+      <circle cx="18" cy="19" r="2.5" />
+      <path d="M8.2 10.8 15.8 6.5" />
+      <path d="M8.2 13.2 15.8 17.5" />
+    </svg>
   );
 }
 

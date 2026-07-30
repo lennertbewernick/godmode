@@ -46,8 +46,7 @@ export function History({
   exerciseLabel,
   scopedToOneWorkout,
   daysPerWeek,
-  onExportCsv,
-  onExportJson,
+  onShare,
 }: {
   workouts: WorkoutRecord[];
   slots: PlanSlotRecord[];
@@ -56,8 +55,8 @@ export function History({
   scopedToOneWorkout: boolean;
   /** Sets the streak's rest-day tolerance. See `rhythmGapDays`. */
   daysPerWeek: number;
-  onExportCsv: () => void;
-  onExportJson: () => void;
+  /** Opens the one export sheet. History keeps the affordance, not a second implementation. */
+  onShare: () => void;
 }) {
   const statWorkouts: StatWorkout[] = useMemo(
     () =>
@@ -174,14 +173,9 @@ export function History({
       <Card>
         <div className="flex items-center justify-between gap-3">
           <h3 className="font-semibold text-slate-100">Sessions</h3>
-          <div className="flex gap-2">
-            <Button variant="ghost" onClick={onExportCsv}>
-              CSV
-            </Button>
-            <Button variant="ghost" onClick={onExportJson}>
-              Backup
-            </Button>
-          </div>
+          <Button variant="ghost" onClick={onShare}>
+            Share
+          </Button>
         </div>
 
         {workouts.length === 0 ? (
