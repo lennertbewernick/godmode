@@ -8,13 +8,19 @@
 
 import { useState } from 'react';
 import { daysSinceBackup } from '../data/exchange.js';
-import type { SettingsRecord } from '../db/schema.js';
+import type { ChallengeRecord, SettingsRecord } from '../db/schema.js';
 import { Banner, Button, Card, NumberField } from './kit.js';
 
 export function Settings({
   settings,
   exerciseLabel,
   workoutCount,
+  active,
+  labels,
+  selectedId,
+  onSelectChallenge,
+  onAddWorkout,
+  onEndWorkout,
   onSave,
   onExportJson,
   onExportCsv,
@@ -24,6 +30,12 @@ export function Settings({
   settings: SettingsRecord;
   exerciseLabel: string;
   workoutCount: number;
+  active: ChallengeRecord[];
+  labels: Map<string, string>;
+  selectedId: string;
+  onSelectChallenge: (challengeId: string) => void;
+  onAddWorkout: () => void;
+  onEndWorkout: (challengeId: string) => void;
   onSave: (patch: Partial<SettingsRecord>) => void;
   onExportJson: () => void;
   onExportCsv: () => void;
@@ -35,11 +47,82 @@ export function Settings({
     settings.restOverrideSeconds ?? '',
   );
   const [confirmReset, setConfirmReset] = useState(false);
+  const [confirmEnd, setConfirmEnd] = useState<string | null>(null);
 
   const days = daysSinceBackup(settings);
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-4 lg:grid lg:grid-cols-2 lg:items-start">
+      <Card>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h3 className="font-semibold text-slate-100">Your workouts</h3>
+          <Button variant="ghost" onClick={onAddWorkout}>
+            Add a workout
+          </Button>
+        </div>
+        <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
+          Anything you can count gets its own plan and its own history. Sit-ups, squats,
+          pull-ups, dips.
+        </p>
+
+        <ul className="mt-4 flex flex-col divide-y divide-[#26324b]">
+          {active.map((challenge) => {
+            const label = labels.get(challenge.exerciseId) ?? 'Exercise';
+            const isSelected = challenge.id === selectedId;
+            return (
+              <li key={challenge.id} className="flex items-center justify-between gap-3 py-3">
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-medium text-slate-100">
+                    {label}
+                    {isSelected ? (
+                      <span className="ml-2 text-xs font-normal text-teal-300">showing</span>
+                    ) : null}
+                  </div>
+                  <div className="tnum mt-0.5 text-xs text-slate-400">
+                    from {challenge.baseline.value} toward {challenge.goalValue ?? '—'} · started{' '}
+                    {challenge.startedAt.slice(0, 10)}
+                  </div>
+                </div>
+                <div className="flex shrink-0 gap-2">
+                  {isSelected ? null : (
+                    <Button variant="ghost" onClick={() => onSelectChallenge(challenge.id)}>
+                      Show
+                    </Button>
+                  )}
+                  <Button variant="subtle" onClick={() => setConfirmEnd(challenge.id)}>
+                    End
+                  </Button>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+
+        {confirmEnd ? (
+          <div className="mt-4 flex flex-col gap-3">
+            <Banner tone="warn">
+              Ending {labels.get(active.find((c) => c.id === confirmEnd)?.exerciseId ?? '') ?? 'it'}{' '}
+              stops its plan. The sessions you have logged stay in your history and your backups.
+            </Banner>
+            <div className="flex gap-2">
+              <Button variant="ghost" onClick={() => setConfirmEnd(null)}>
+                Keep it
+              </Button>
+              <Button
+                variant="danger"
+                className="flex-1"
+                onClick={() => {
+                  onEndWorkout(confirmEnd);
+                  setConfirmEnd(null);
+                }}
+              >
+                End it
+              </Button>
+            </div>
+          </div>
+        ) : null}
+      </Card>
+
       <Card>
         <h3 className="font-semibold text-slate-100">Backups</h3>
         <p className="mt-1.5 text-sm leading-relaxed text-slate-300">

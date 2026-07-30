@@ -1,8 +1,11 @@
 /**
- * History: totals, the three metrics, the cumulative chart, and the session list.
+ * History: totals, the three metrics, the chart, and the session list.
  *
  * Nothing here is gated. The incumbent paywalled its calorie column and showed a dash — this
  * shows the number and says plainly that it is an estimate.
+ *
+ * Everything is scoped to the workout currently showing. Two exercises are not one number, so
+ * they are not added together.
  */
 
 import { useMemo, useState } from 'react';
@@ -39,11 +42,16 @@ const OUTCOME_STYLE: Record<WorkoutOutcome, string> = {
 export function History({
   workouts,
   slots,
+  exerciseLabel,
+  scopedToOneWorkout,
   onExportCsv,
   onExportJson,
 }: {
   workouts: WorkoutRecord[];
   slots: PlanSlotRecord[];
+  exerciseLabel: string;
+  /** True when more than one workout exists, so the scope needs stating. */
+  scopedToOneWorkout: boolean;
   onExportCsv: () => void;
   onExportJson: () => void;
 }) {
@@ -61,7 +69,13 @@ export function History({
   );
 
   const statSlots: StatSlot[] = useMemo(
-    () => slots.map((s) => ({ id: s.id, ordinal: s.ordinal, targetTotal: s.targetTotal, status: s.status })),
+    () =>
+      slots.map((s) => ({
+        id: s.id,
+        ordinal: s.ordinal,
+        targetTotal: s.targetTotal,
+        status: s.status,
+      })),
     [slots],
   );
 
@@ -72,77 +86,86 @@ export function History({
   const slotById = useMemo(() => new Map(slots.map((s) => [s.id, s])), [slots]);
   const [chartView, setChartView] = useState<'session' | 'total'>('session');
 
-  const kcalNote = totals.hasExternalKcal && totals.hasEstimatedKcal
-    ? 'mixed: imported + estimated'
-    : totals.hasExternalKcal
-      ? 'imported'
-      : 'estimated';
+  const kcalNote =
+    totals.hasExternalKcal && totals.hasEstimatedKcal
+      ? 'mixed: imported + estimated'
+      : totals.hasExternalKcal
+        ? 'imported'
+        : 'estimated';
 
   return (
-    <div className="flex flex-col gap-4">
-      <Card>
-        <div className="grid grid-cols-3 gap-3">
-          <Stat label="Time" value={formatDuration(totals.seconds)} />
-          <Stat label="Reps" value={totals.reps} sub={`${totals.workouts} sessions`} />
-          <Stat
-            label="Kcal"
-            value={totals.kcal > 0 ? totals.kcal : '—'}
-            sub={totals.kcal > 0 ? kcalNote : 'set bodyweight'}
-          />
-        </div>
-      </Card>
+    // Mobile stacks. From lg the numbers and chart take the wide left column and the session
+    // list moves into its own scrolling rail, so a 200-session history stops making the page
+    // metres long.
+    <div className="flex flex-col gap-4 lg:grid lg:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)] lg:items-start">
+      <div className="flex flex-col gap-4">
+        <Card>
+          <div className="grid grid-cols-3 gap-3">
+            <Stat label="Time" value={formatDuration(totals.seconds)} />
+            <Stat label="Reps" value={totals.reps} sub={`${totals.workouts} sessions`} />
+            <Stat
+              label="Kcal"
+              value={totals.kcal > 0 ? totals.kcal : '—'}
+              sub={totals.kcal > 0 ? kcalNote : 'set bodyweight'}
+            />
+          </div>
+          {scopedToOneWorkout ? (
+            <p className="mt-3 text-xs text-slate-400">{exerciseLabel} only.</p>
+          ) : null}
+        </Card>
 
-      <Card>
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <h3 className="font-semibold text-slate-100">Progress</h3>
-          <Segmented
-            ariaLabel="Chart view"
-            size="sm"
-            value={chartView}
-            onChange={setChartView}
-            options={[
-              { value: 'session', label: 'Per session' },
-              { value: 'total', label: 'Running total' },
-            ]}
-          />
-        </div>
-        <div className="mt-3">
-          {chartView === 'session' ? (
-            <SessionChart points={perSession} />
-          ) : (
-            <CumulativeChart points={cumulative} />
-          )}
-        </div>
-      </Card>
+        <Card>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h3 className="font-semibold text-slate-100">Progress</h3>
+            <Segmented
+              ariaLabel="Chart view"
+              size="sm"
+              value={chartView}
+              onChange={setChartView}
+              options={[
+                { value: 'session', label: 'Per session' },
+                { value: 'total', label: 'Running total' },
+              ]}
+            />
+          </div>
+          <div className="mt-3">
+            {chartView === 'session' ? (
+              <SessionChart points={perSession} />
+            ) : (
+              <CumulativeChart points={cumulative} />
+            )}
+          </div>
+        </Card>
 
-      <Card>
-        <h3 className="font-semibold text-slate-100">How it's going</h3>
-        <div className="mt-4 grid grid-cols-3 gap-3">
-          <Stat
-            label="Streak"
-            value={`${metrics.activityStreak}d`}
-            sub={`best ${metrics.longestActivityStreak}d`}
-          />
-          <Stat
-            label="Compliance"
-            value={`${Math.round(metrics.planCompliance * 100)}%`}
-            sub={`${metrics.compliantWorkouts}/${metrics.totalAttempts} attempts`}
-          />
-          <Stat
-            label="Progress"
-            value={
-              metrics.challengeProgress === undefined
-                ? '—'
-                : `${Math.round(metrics.challengeProgress * 100)}%`
-            }
-            sub={
-              metrics.slotsTotal === undefined
-                ? 'open-ended'
-                : `${metrics.slotsAdvanced}/${metrics.slotsTotal} days`
-            }
-          />
-        </div>
-      </Card>
+        <Card>
+          <h3 className="font-semibold text-slate-100">How it's going</h3>
+          <div className="mt-4 grid grid-cols-3 gap-3">
+            <Stat
+              label="Streak"
+              value={`${metrics.activityStreak}d`}
+              sub={`best ${metrics.longestActivityStreak}d`}
+            />
+            <Stat
+              label="Compliance"
+              value={`${Math.round(metrics.planCompliance * 100)}%`}
+              sub={`${metrics.compliantWorkouts}/${metrics.totalAttempts} attempts`}
+            />
+            <Stat
+              label="Progress"
+              value={
+                metrics.challengeProgress === undefined
+                  ? '—'
+                  : `${Math.round(metrics.challengeProgress * 100)}%`
+              }
+              sub={
+                metrics.slotsTotal === undefined
+                  ? 'open-ended'
+                  : `${metrics.slotsAdvanced}/${metrics.slotsTotal} days`
+              }
+            />
+          </div>
+        </Card>
+      </div>
 
       <Card>
         <div className="flex items-center justify-between gap-3">
@@ -160,7 +183,7 @@ export function History({
         {workouts.length === 0 ? (
           <p className="mt-4 text-sm text-slate-400">Nothing logged yet.</p>
         ) : (
-          <ul className="mt-3 flex flex-col divide-y divide-[#26324b]">
+          <ul className="mt-3 flex flex-col divide-y divide-[#26324b] lg:max-h-[36rem] lg:overflow-y-auto">
             {[...workouts]
               .sort((a, b) => b.performedAt.localeCompare(a.performedAt))
               .map((w) => {

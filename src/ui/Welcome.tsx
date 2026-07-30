@@ -3,20 +3,25 @@
  *
  * Import is presented first and framed as the default, because migration fidelity is the
  * point — an app that starts empty gives a group member no reason to switch.
+ *
+ * The forms themselves live in NewWorkout.tsx, shared with the add-another-exercise flow.
  */
 
 import { useState } from 'react';
-import { buildCanonicalImport, type ImportReport } from '../import/pipeline.js';
-import { INCUMBENT_CSV_V1 } from '../import/profiles.js';
-import { commitImport, estimateBaselineFromImport } from '../import/reconcile.js';
-import { createChallenge, createExercise, recordMaxTest } from '../db/repo.js';
-import { pushupParams } from '../core/patterns/percentageRamp.js';
-import { Banner, Button, Card, NumberField, TextField } from './kit.js';
-
-type Mode = 'choose' | 'import-review' | 'fresh';
+import type { ImportReport } from '../import/pipeline.js';
+import {
+  createFromImport,
+  createFromMaxTest,
+  CsvDropCard,
+  FreshStart,
+  ImportReview,
+  readCsv,
+  type NewWorkoutMode,
+} from './NewWorkout.js';
+import { Banner, Button, Card } from './kit.js';
 
 export function Welcome({ onReady }: { onReady: () => void }) {
-  const [mode, setMode] = useState<Mode>('choose');
+  const [mode, setMode] = useState<NewWorkoutMode>('choose');
   const [report, setReport] = useState<ImportReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -24,8 +29,7 @@ export function Welcome({ onReady }: { onReady: () => void }) {
   async function handleFile(file: File) {
     setError(null);
     try {
-      const text = await file.text();
-      setReport(buildCanonicalImport(text, INCUMBENT_CSV_V1));
+      setReport(await readCsv(file));
       setMode('import-review');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'That file could not be read.');
@@ -33,7 +37,7 @@ export function Welcome({ onReady }: { onReady: () => void }) {
   }
 
   return (
-    <div className="mx-auto max-w-lg px-4 pb-10 safe-t">
+    <div className="mx-auto max-w-lg px-4 pb-10 md:max-w-2xl safe-t">
       <header className="py-8">
         <h1 className="text-3xl font-bold tracking-tight text-slate-100">GODMODE</h1>
         <p className="mt-1 text-sm uppercase tracking-[0.2em] text-teal-300">No More Later</p>
@@ -49,24 +53,7 @@ export function Welcome({ onReady }: { onReady: () => void }) {
 
       {mode === 'choose' ? (
         <div className="flex flex-col gap-4">
-          <Card>
-            <h2 className="text-lg font-semibold text-slate-100">Bring your history across</h2>
-            <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
-              Export the CSV from your current app and drop it here.
-            </p>
-            <label className="mt-4 block">
-              <span className="sr-only">Choose a CSV file</span>
-              <input
-                type="file"
-                accept=".csv,text/csv"
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) void handleFile(file);
-                }}
-                className="block w-full cursor-pointer rounded-xl border border-dashed border-[#3b4a68] bg-[#0f1728] px-3 py-4 text-sm text-slate-300 file:mr-3 file:rounded-lg file:border-0 file:bg-teal-300 file:px-3 file:py-2 file:font-semibold file:text-[#08111f]"
-              />
-            </label>
-          </Card>
+          <CsvDropCard onFile={(file) => void handleFile(file)} />
 
           <Card>
             <h2 className="text-lg font-semibold text-slate-100">Or start fresh</h2>
@@ -96,17 +83,7 @@ export function Welcome({ onReady }: { onReady: () => void }) {
             setBusy(true);
             setError(null);
             try {
-              await commitImport({
-                canonical: report.canonical,
-                baseline: {
-                  value: baselineValue,
-                  source: accepted ? 'estimated' : 'user_entered',
-                  recordedAt: new Date().toISOString(),
-                },
-                goal,
-                weeks,
-                daysPerWeek,
-              });
+              await createFromImport(report, baselineValue, accepted, goal, weeks, daysPerWeek);
               onReady();
             } catch (e) {
               setError(e instanceof Error ? e.message : 'The import could not be saved.');
@@ -124,18 +101,7 @@ export function Welcome({ onReady }: { onReady: () => void }) {
             setBusy(true);
             setError(null);
             try {
-              const exercise = await createExercise(label);
-              const test = await recordMaxTest(exercise.id, testedMax);
-              await createChallenge({
-                exerciseId: exercise.id,
-                baseline: {
-                  value: testedMax,
-                  source: 'tested',
-                  evidenceId: test.id,
-                  recordedAt: test.performedAt,
-                },
-                params: pushupParams(testedMax, goal, weeks, daysPerWeek),
-              });
+              await createFromMaxTest(label, testedMax, goal, weeks, daysPerWeek);
               onReady();
             } catch (e) {
               setError(e instanceof Error ? e.message : 'The challenge could not be created.');
@@ -148,190 +114,116 @@ export function Welcome({ onReady }: { onReady: () => void }) {
   );
 }
 
-function ImportReview({
-  report,
-  busy,
-  onBack,
-  onConfirm,
+/**
+ * Adding a second (or fifth) exercise once one already exists.
+ *
+ * Same two paths as first run. Import stays offered because someone migrating usually has more
+ * than one exercise's history sitting in the old app.
+ */
+export function AddWorkout({
+  onDone,
+  onCancel,
 }: {
-  report: ImportReport;
-  busy: boolean;
-  onBack: () => void;
-  onConfirm: (
-    baseline: number,
-    acceptedEstimate: boolean,
-    goal: number,
-    weeks: number,
-    daysPerWeek: number,
-  ) => void;
+  onDone: () => void;
+  onCancel: () => void;
 }) {
-  const estimate = estimateBaselineFromImport(report.canonical);
-  const [baseline, setBaseline] = useState<number | ''>(estimate.value);
-  const [goal, setGoal] = useState<number | ''>(report.canonical.goal ?? 100);
-  const [weeks, setWeeks] = useState<number | ''>(6);
-  const [daysPerWeek, setDaysPerWeek] = useState<number | ''>(3);
+  const [mode, setMode] = useState<NewWorkoutMode>('choose');
+  const [report, setReport] = useState<ImportReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
-  const errors = report.issues.filter((i) => i.severity === 'error');
-  const warnings = report.issues.filter((i) => i.severity === 'warning');
-  const repeats = report.stats.sessionsAccepted - report.stats.distinctSlots;
+  async function handleFile(file: File) {
+    setError(null);
+    try {
+      setReport(await readCsv(file));
+      setMode('import-review');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'That file could not be read.');
+    }
+  }
 
   return (
-    <div className="flex flex-col gap-4">
-      <Card>
-        <h2 className="text-lg font-semibold text-slate-100">
-          Found {report.stats.sessionsAccepted} sessions
-        </h2>
-        <dl className="mt-3 grid grid-cols-2 gap-3 text-sm">
-          <div>
-            <dt className="text-slate-400">Exercise</dt>
-            <dd className="text-slate-100">{report.canonical.exerciseLabel}</dd>
-          </div>
-          <div>
-            <dt className="text-slate-400">Total reps</dt>
-            <dd className="tnum text-slate-100">{report.stats.totalReps}</dd>
-          </div>
-          <div>
-            <dt className="text-slate-400">Planned days</dt>
-            <dd className="tnum text-slate-100">{report.stats.distinctSlots}</dd>
-          </div>
-          <div>
-            <dt className="text-slate-400">Repeat attempts</dt>
-            <dd className="tnum text-slate-100">{repeats}</dd>
-          </div>
-        </dl>
-      </Card>
+    <div className="mx-auto max-w-lg px-4 pb-10 md:max-w-2xl safe-t">
+      <header className="flex items-start justify-between gap-3 py-6">
+        <div>
+          <h2 className="text-2xl font-semibold text-slate-100">Add a workout</h2>
+          <p className="mt-1 text-sm text-slate-400">
+            Its own plan, its own history. Nothing you already have is touched.
+          </p>
+        </div>
+        <Button variant="subtle" onClick={onCancel}>
+          Cancel
+        </Button>
+      </header>
 
-      {errors.length > 0 ? (
-        <Banner tone="warn">
-          {errors.length} row{errors.length === 1 ? '' : 's'} could not be read and will be
-          skipped:
-          <ul className="mt-1.5 list-inside list-disc">
-            {errors.slice(0, 3).map((issue, i) => (
-              <li key={i}>
-                Line {issue.line}: {issue.message}
-              </li>
-            ))}
-          </ul>
-        </Banner>
+      {error ? (
+        <div className="pb-4">
+          <Banner tone="warn" onDismiss={() => setError(null)}>
+            {error}
+          </Banner>
+        </div>
       ) : null}
 
-      {warnings.map((issue, i) => (
-        <Banner key={i} tone="info">
-          {issue.message}
-        </Banner>
-      ))}
+      {mode === 'choose' ? (
+        <div className="flex flex-col gap-4">
+          <Card>
+            <h3 className="text-lg font-semibold text-slate-100">From a max test</h3>
+            <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
+              One rested set to failure, then a target to build toward.
+            </p>
+            <Button className="mt-4 w-full" onClick={() => setMode('fresh')}>
+              Take a max test
+            </Button>
+          </Card>
 
-      <Card>
-        <h3 className="font-semibold text-slate-100">Your starting number</h3>
-        <div className="mt-3">
-          <NumberField
-            label="Baseline max"
-            value={baseline}
-            min={1}
-            onChange={setBaseline}
-            suffix="reps"
-            hint={estimate.explanation}
+          <CsvDropCard
+            title="From another CSV"
+            blurb="If you have history for this exercise in your old app too, import it the same way."
+            onFile={(file) => void handleFile(file)}
           />
         </div>
-        <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
-          <NumberField label="Goal" value={goal} min={1} onChange={setGoal} suffix="reps" />
-          <NumberField label="Weeks" value={weeks} min={1} onChange={setWeeks} />
-          <NumberField label="Days / week" value={daysPerWeek} min={1} onChange={setDaysPerWeek} />
-        </div>
-        <p className="mt-3 text-xs leading-relaxed text-slate-400">
-          Your last set on the final day will ask for roughly half your goal in one go.
-        </p>
-      </Card>
+      ) : null}
 
-      <div className="flex gap-3">
-        <Button variant="ghost" onClick={onBack} disabled={busy}>
-          Back
-        </Button>
-        <Button
-          className="flex-1"
-          disabled={busy || baseline === '' || goal === '' || weeks === '' || daysPerWeek === ''}
-          onClick={() =>
-            onConfirm(
-              Number(baseline),
-              Number(baseline) === estimate.value,
-              Number(goal),
-              Number(weeks),
-              Number(daysPerWeek),
-            )
-          }
-        >
-          {busy ? 'Importing…' : 'Import my history'}
-        </Button>
-      </div>
-    </div>
-  );
-}
+      {mode === 'import-review' && report ? (
+        <ImportReview
+          report={report}
+          busy={busy}
+          onBack={() => {
+            setReport(null);
+            setMode('choose');
+          }}
+          onConfirm={async (baselineValue, accepted, goal, weeks, daysPerWeek) => {
+            setBusy(true);
+            setError(null);
+            try {
+              await createFromImport(report, baselineValue, accepted, goal, weeks, daysPerWeek);
+              onDone();
+            } catch (e) {
+              setError(e instanceof Error ? e.message : 'The import could not be saved.');
+              setBusy(false);
+            }
+          }}
+        />
+      ) : null}
 
-function FreshStart({
-  busy,
-  onBack,
-  onConfirm,
-}: {
-  busy: boolean;
-  onBack: () => void;
-  onConfirm: (
-    label: string,
-    testedMax: number,
-    goal: number,
-    weeks: number,
-    daysPerWeek: number,
-  ) => void;
-}) {
-  const [label, setLabel] = useState('Push-ups');
-  const [tested, setTested] = useState<number | ''>('');
-  const [goal, setGoal] = useState<number | ''>(100);
-  const [weeks, setWeeks] = useState<number | ''>(6);
-  const [daysPerWeek, setDaysPerWeek] = useState<number | ''>(3);
-
-  return (
-    <div className="flex flex-col gap-4">
-      <Card>
-        <h2 className="text-lg font-semibold text-slate-100">Max test</h2>
-        <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
-          Rested, one set, good form. Stop when you stop.
-        </p>
-        <div className="mt-4 flex flex-col gap-4">
-          <TextField
-            label="Exercise"
-            value={label}
-            onChange={setLabel}
-            placeholder="Push-ups"
-            hint="Whatever you want to call it."
-          />
-          <NumberField
-            label="How many did you manage?"
-            value={tested}
-            min={1}
-            onChange={setTested}
-            suffix="reps"
-          />
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-            <NumberField label="Goal" value={goal} min={1} onChange={setGoal} suffix="reps" />
-            <NumberField label="Weeks" value={weeks} min={1} onChange={setWeeks} />
-            <NumberField label="Days / week" value={daysPerWeek} min={1} onChange={setDaysPerWeek} />
-          </div>
-        </div>
-      </Card>
-
-      <div className="flex gap-3">
-        <Button variant="ghost" onClick={onBack} disabled={busy}>
-          Back
-        </Button>
-        <Button
-          className="flex-1"
-          disabled={busy || tested === '' || goal === '' || weeks === '' || daysPerWeek === ''}
-          onClick={() =>
-            onConfirm(label, Number(tested), Number(goal), Number(weeks), Number(daysPerWeek))
-          }
-        >
-          {busy ? 'Building your plan…' : 'Build my plan'}
-        </Button>
-      </div>
+      {mode === 'fresh' ? (
+        <FreshStart
+          busy={busy}
+          defaultLabel=""
+          onBack={() => setMode('choose')}
+          onConfirm={async (label, testedMax, goal, weeks, daysPerWeek) => {
+            setBusy(true);
+            setError(null);
+            try {
+              await createFromMaxTest(label, testedMax, goal, weeks, daysPerWeek);
+              onDone();
+            } catch (e) {
+              setError(e instanceof Error ? e.message : 'The workout could not be created.');
+              setBusy(false);
+            }
+          }}
+        />
+      ) : null}
     </div>
   );
 }

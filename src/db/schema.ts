@@ -130,6 +130,14 @@ export interface SettingsRecord {
   lastBackupAt?: string;
   /** Whether the user has seen the "this data lives only on this device" explanation. */
   onboardedAt?: string;
+  /**
+   * Which of several active challenges the app is currently showing.
+   *
+   * A preference, not a source of truth: if it names a challenge that has since ended or been
+   * deleted, the app falls back to the most recently started active one. That keeps restoring
+   * an old backup — or deleting a workout on another device — from producing an empty screen.
+   */
+  selectedChallengeId?: string | undefined;
 }
 
 export interface FitnessDB extends DBSchema {

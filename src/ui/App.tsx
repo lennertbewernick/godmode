@@ -1,5 +1,9 @@
 /**
  * App shell: loads state, routes between screens, and owns the write paths.
+ *
+ * More than one exercise can be on the go at once. The shell resolves which challenge is
+ * showing (a stored preference with a fall-back), and everything below it is scoped to that
+ * one challenge's chain.
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -17,14 +21,16 @@ import {
   continueChallenge,
   countAttempts,
   endChallenge,
-  getActiveChallenge,
+  exerciseLabels,
   getCurrentSlot,
   getDB,
   getSettings,
+  listActiveChallenges,
   listSlots,
   listWorkouts,
   logWorkout,
   recordMaxTest,
+  resolveSelectedChallenge,
   saveSettings,
 } from '../db/repo.js';
 import type {
@@ -37,14 +43,47 @@ import { History } from './History.js';
 import { Runner } from './Runner.js';
 import { Settings } from './Settings.js';
 import { Today } from './Today.js';
-import { Welcome } from './Welcome.js';
-import { Banner, Button, Card, NumberField, Spinner } from './kit.js';
+import { AddWorkout, Welcome } from './Welcome.js';
+import { Banner, Button, Card, NumberField, Segmented, Spinner } from './kit.js';
 
 type Tab = 'today' | 'history' | 'settings';
-type View = { kind: 'tab'; tab: Tab } | { kind: 'runner' } | { kind: 'continue' };
+type View =
+  | { kind: 'tab'; tab: Tab }
+  | { kind: 'runner' }
+  | { kind: 'continue' }
+  | { kind: 'add-workout' };
+
+const TABS: readonly Tab[] = ['today', 'history', 'settings'];
+const TAB_KEY = 'godmode.tab';
+
+/**
+ * The open tab survives a reload. localStorage rather than the settings record because it is a
+ * UI position, not user data — it should not travel in a backup or overwrite the tab on another
+ * device when one is restored.
+ */
+function storedTab(): Tab {
+  try {
+    const raw = window.localStorage.getItem(TAB_KEY);
+    return TABS.includes(raw as Tab) ? (raw as Tab) : 'today';
+  } catch {
+    // Private mode, or storage disabled. Not worth failing over.
+    return 'today';
+  }
+}
+
+function rememberTab(tab: Tab): void {
+  try {
+    window.localStorage.setItem(TAB_KEY, tab);
+  } catch {
+    // Ignored, as above.
+  }
+}
 
 interface State {
+  /** Every active challenge, so the switcher can list them. */
+  active: ChallengeRecord[];
   challenge: ChallengeRecord | undefined;
+  labels: Map<string, string>;
   slots: PlanSlotRecord[];
   workouts: WorkoutRecord[];
   currentSlot: PlanSlotRecord | undefined;
@@ -55,7 +94,7 @@ interface State {
 
 export function App() {
   const [state, setState] = useState<State | null>(null);
-  const [view, setView] = useState<View>({ kind: 'tab', tab: 'today' });
+  const [view, setView] = useState<View>(() => ({ kind: 'tab', tab: storedTab() }));
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [runConfig, setRunConfig] = useState<{
@@ -65,12 +104,18 @@ export function App() {
   const [backupDismissed, setBackupDismissed] = useState(false);
 
   const load = useCallback(async () => {
-    const challenge = await getActiveChallenge();
-    const settings = await getSettings();
+    const [active, challenge, settings] = await Promise.all([
+      listActiveChallenges(),
+      resolveSelectedChallenge(),
+      getSettings(),
+    ]);
+    const labels = await exerciseLabels(active);
 
     if (!challenge) {
       setState({
+        active,
         challenge: undefined,
+        labels,
         slots: [],
         workouts: [],
         currentSlot: undefined,
@@ -87,17 +132,17 @@ export function App() {
       getCurrentSlot(challenge.id),
     ]);
     const attemptNo = currentSlot ? (await countAttempts(currentSlot.id)) + 1 : 1;
-    const db = await getDB();
-    const exercise = await db.get('exercises', challenge.exerciseId);
 
     setState({
+      active,
       challenge,
+      labels,
       slots,
       workouts,
       currentSlot,
       attemptNo,
       settings,
-      exerciseLabel: exercise?.label ?? 'Exercise',
+      exerciseLabel: labels.get(challenge.exerciseId) ?? 'Exercise',
     });
   }, []);
 
@@ -106,6 +151,20 @@ export function App() {
       setError(e instanceof Error ? e.message : 'Could not open your data.'),
     );
   }, [load]);
+
+  const goToTab = useCallback((tab: Tab) => {
+    rememberTab(tab);
+    setView({ kind: 'tab', tab });
+  }, []);
+
+  const selectChallenge = useCallback(
+    async (challengeId: string) => {
+      await saveSettings({ selectedChallengeId: challengeId });
+      setMessage(null);
+      await load();
+    },
+    [load],
+  );
 
   const exportJson = useCallback(async () => {
     const backup = await buildBackup();
@@ -134,7 +193,7 @@ export function App() {
       try {
         const result = await restoreBackup(JSON.parse(await file.text()));
         await load();
-        setView({ kind: 'tab', tab: 'today' });
+        goToTab('today');
         setMessage(
           `Restored ${result.workouts} sessions across ${result.challenges} challenge(s).`,
         );
@@ -142,7 +201,7 @@ export function App() {
         setError(e instanceof Error ? e.message : 'That backup could not be restored.');
       }
     },
-    [load],
+    [load, goToTab],
   );
 
   const finishWorkout = useCallback(
@@ -156,11 +215,11 @@ export function App() {
         manuallyAdvance: manual,
       });
       setRunConfig(null);
-      setView({ kind: 'tab', tab: 'today' });
+      goToTab('today');
       setMessage(evaluation.reason);
       await load();
     },
-    [state, load],
+    [state, load, goToTab],
   );
 
   const advanceManually = useCallback(async () => {
@@ -177,6 +236,20 @@ export function App() {
       true,
     );
   }, [state, finishWorkout]);
+
+  const endWorkout = useCallback(
+    async (challengeId: string) => {
+      await endChallenge(challengeId, 'closed_manually');
+      // The ended one may have been the selection; clear it and let the fall-back choose.
+      const settings = await getSettings();
+      if (settings.selectedChallengeId === challengeId) {
+        await saveSettings({ selectedChallengeId: undefined });
+      }
+      await load();
+      setMessage('Workout ended. Its history stays in your backups.');
+    },
+    [load],
+  );
 
   if (error && !state) {
     return (
@@ -204,7 +277,20 @@ export function App() {
         onFinish={(performance, duration) => void finishWorkout(performance, duration)}
         onCancel={() => {
           setRunConfig(null);
-          setView({ kind: 'tab', tab: 'today' });
+          goToTab('today');
+        }}
+      />
+    );
+  }
+
+  if (view.kind === 'add-workout') {
+    return (
+      <AddWorkout
+        onCancel={() => goToTab('today')}
+        onDone={() => {
+          goToTab('today');
+          setMessage('Workout added.');
+          void load();
         }}
       />
     );
@@ -215,14 +301,14 @@ export function App() {
       <ContinueBlock
         challenge={state.challenge}
         workouts={state.workouts}
-        onCancel={() => setView({ kind: 'tab', tab: 'today' })}
+        onCancel={() => goToTab('today')}
         onConfirm={async (baselineValue, tested, goal, weeks, daysPerWeek) => {
           const challenge = state.challenge!;
           await endChallenge(challenge.id, 'closed_manually');
           const evidence = tested
             ? await recordMaxTest(challenge.exerciseId, baselineValue)
             : undefined;
-          await continueChallenge({
+          const { challenge: next } = await continueChallenge({
             previous: challenge,
             strategy: tested ? 'retest' : 'user_entered',
             baselineValue,
@@ -231,7 +317,8 @@ export function App() {
             daysPerWeek,
             ...(evidence === undefined ? {} : { evidenceId: evidence.id }),
           });
-          setView({ kind: 'tab', tab: 'today' });
+          await saveSettings({ selectedChallengeId: next.id });
+          goToTab('today');
           setMessage('New block started.');
           await load();
         }}
@@ -240,20 +327,47 @@ export function App() {
   }
 
   const activeTab = view.kind === 'tab' ? view.tab : 'today';
-
   const showBackupNag =
     !backupDismissed && shouldPromptBackup(state.settings, state.workouts.length);
 
+  const tabOptions = TABS.map((tab) => ({
+    value: tab,
+    label: <span className="capitalize">{tab}</span>,
+  }));
+
   return (
-    <div className="mx-auto flex min-h-screen max-w-lg flex-col px-4 safe-t">
-      <header className="flex items-baseline justify-between gap-3 pb-4">
-        <h1 className="text-xl font-bold tracking-tight text-slate-100">
-          GODMODE
-          <span className="ml-2 text-xs font-normal uppercase tracking-[0.18em] text-teal-300">
-            No More Later
-          </span>
-        </h1>
+    <div className="mx-auto flex min-h-screen max-w-lg flex-col px-4 md:max-w-3xl lg:max-w-6xl safe-t">
+      <header className="flex flex-col gap-3 pb-4 md:flex-row md:items-center md:justify-between">
+        <div className="flex items-baseline justify-between gap-3">
+          <h1 className="text-xl font-bold tracking-tight text-slate-100">
+            GODMODE
+            <span className="ml-2 text-xs font-normal uppercase tracking-[0.18em] text-teal-300">
+              No More Later
+            </span>
+          </h1>
+        </div>
+
+        {/* Desktop keeps navigation at the top; the phone keeps it under the thumb. */}
+        <nav className="hidden md:block">
+          <Segmented
+            ariaLabel="Sections"
+            value={activeTab}
+            onChange={goToTab}
+            options={tabOptions}
+          />
+        </nav>
       </header>
+
+      {state.active.length > 1 ? (
+        <div className="pb-3">
+          <ExerciseSwitcher
+            active={state.active}
+            labels={state.labels}
+            selectedId={state.challenge.id}
+            onSelect={(id) => void selectChallenge(id)}
+          />
+        </div>
+      ) : null}
 
       {error ? (
         <div className="pb-3">
@@ -267,11 +381,7 @@ export function App() {
         <div className="pb-3">
           <Banner tone="warn" onDismiss={() => setBackupDismissed(true)}>
             No backup yet.{' '}
-            <button
-              type="button"
-              className="underline"
-              onClick={() => void exportJson()}
-            >
+            <button type="button" className="underline" onClick={() => void exportJson()}>
               Export a backup
             </button>
             .
@@ -304,6 +414,8 @@ export function App() {
           <History
             workouts={state.workouts}
             slots={state.slots}
+            exerciseLabel={state.exerciseLabel}
+            scopedToOneWorkout={state.active.length > 1}
             onExportCsv={exportCsv}
             onExportJson={() => void exportJson()}
           />
@@ -314,6 +426,12 @@ export function App() {
             settings={state.settings}
             exerciseLabel={state.exerciseLabel}
             workoutCount={state.workouts.length}
+            active={state.active}
+            labels={state.labels}
+            selectedId={state.challenge.id}
+            onSelectChallenge={(id) => void selectChallenge(id)}
+            onAddWorkout={() => setView({ kind: 'add-workout' })}
+            onEndWorkout={(id) => void endWorkout(id)}
             onSave={(patch) => {
               void saveSettings(patch).then(() => {
                 void load();
@@ -328,13 +446,13 @@ export function App() {
         ) : null}
       </main>
 
-      <nav className="sticky bottom-0 -mx-4 border-t border-[#26324b] bg-[#0b1220]/95 px-4 backdrop-blur safe-b">
+      <nav className="sticky bottom-0 -mx-4 border-t border-[#26324b] bg-[#0b1220]/95 px-4 backdrop-blur md:hidden safe-b">
         <div className="flex gap-1 pt-2">
-          {(['today', 'history', 'settings'] as Tab[]).map((tab) => (
+          {TABS.map((tab) => (
             <button
               key={tab}
               type="button"
-              onClick={() => setView({ kind: 'tab', tab })}
+              onClick={() => goToTab(tab)}
               className={[
                 'min-h-11 flex-1 rounded-xl py-2 text-sm capitalize transition-colors',
                 activeTab === tab
@@ -347,6 +465,44 @@ export function App() {
           ))}
         </div>
       </nav>
+    </div>
+  );
+}
+
+/** A chip per active workout. Only rendered when there is a choice to make. */
+function ExerciseSwitcher({
+  active,
+  labels,
+  selectedId,
+  onSelect,
+}: {
+  active: ChallengeRecord[];
+  labels: Map<string, string>;
+  selectedId: string;
+  onSelect: (challengeId: string) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-2" role="tablist" aria-label="Workout">
+      {active.map((challenge) => {
+        const isSelected = challenge.id === selectedId;
+        return (
+          <button
+            key={challenge.id}
+            type="button"
+            role="tab"
+            aria-selected={isSelected}
+            onClick={() => onSelect(challenge.id)}
+            className={[
+              'min-h-9 rounded-xl border px-3 py-1.5 text-sm transition-colors',
+              isSelected
+                ? 'border-teal-400/50 bg-teal-300/10 font-semibold text-teal-200'
+                : 'border-[#33405c] text-slate-300 hover:bg-[#1c2740]',
+            ].join(' ')}
+          >
+            {labels.get(challenge.exerciseId) ?? 'Exercise'}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -398,7 +554,7 @@ function ContinueBlock({
   const [useTest, setUseTest] = useState(true);
 
   return (
-    <div className="mx-auto max-w-lg px-4 pb-10 safe-t">
+    <div className="mx-auto max-w-lg px-4 pb-10 md:max-w-2xl safe-t">
       <header className="py-6">
         <h2 className="text-2xl font-semibold text-slate-100">Keep going</h2>
         <p className="mt-1 text-sm text-slate-400">Your history carries over.</p>

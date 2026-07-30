@@ -183,10 +183,41 @@ function specToRecord(
   };
 }
 
-export async function getActiveChallenge(): Promise<ChallengeRecord | undefined> {
+/** Every active challenge, newest first. More than one means more than one exercise on the go. */
+export async function listActiveChallenges(): Promise<ChallengeRecord[]> {
   const db = await getDB();
   const active = await db.getAllFromIndex('challenges', 'byStatus', 'active');
-  return active.sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0];
+  return active.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+}
+
+export async function getActiveChallenge(): Promise<ChallengeRecord | undefined> {
+  return (await listActiveChallenges())[0];
+}
+
+/**
+ * The challenge to show: the one the user last selected, or the newest active one.
+ *
+ * The fall-back matters. A stored selection can outlive the challenge it names — the workout
+ * was ended, a backup from another device was restored — and resolving that to "nothing" would
+ * strand the user on an empty screen with their data still intact underneath.
+ */
+export async function resolveSelectedChallenge(): Promise<ChallengeRecord | undefined> {
+  const active = await listActiveChallenges();
+  const settings = await getSettings();
+  return active.find((c) => c.id === settings.selectedChallengeId) ?? active[0];
+}
+
+/** Labels for a set of challenges, so the switcher can name them without an extra round trip. */
+export async function exerciseLabels(
+  challenges: readonly ChallengeRecord[],
+): Promise<Map<string, string>> {
+  const db = await getDB();
+  const labels = new Map<string, string>();
+  for (const id of new Set(challenges.map((c) => c.exerciseId))) {
+    const exercise = await db.get('exercises', id);
+    labels.set(id, exercise?.label ?? 'Exercise');
+  }
+  return labels;
 }
 
 export async function listChallenges(): Promise<ChallengeRecord[]> {
