@@ -27,6 +27,7 @@ export function Settings({
   onEndWorkout,
   onSave,
   onOpenExport,
+  onImportHistory,
   onSignOut,
 }: {
   settings: SettingsRecord;
@@ -38,6 +39,7 @@ export function Settings({
   onEndWorkout: (challengeId: string) => void;
   onSave: (patch: Partial<SettingsRecord>) => void;
   onOpenExport: () => void;
+  onImportHistory: () => void;
   onSignOut: () => void;
 }) {
   const [bodyweight, setBodyweight] = useState<number | ''>(settings.bodyweightKg ?? '');
@@ -113,6 +115,26 @@ export function Settings({
             </div>
           </div>
         ) : null}
+      </Card>
+
+      {/*
+        Import lives here, not behind the hidden "+". Those were one control and are two
+        promises: creating a plan is hidden because it can only build one shape, while bringing
+        history across has nothing to do with plan variety and is the thing this app exists for.
+        Hiding the one silently removed the other, and a friend with months of history in the
+        old app had no way in at all.
+      */}
+      <Card className="lg:mb-4 lg:break-inside-avoid">
+        <h3 className="font-semibold text-slate-100">Bring history across</h3>
+        <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
+          Export the CSV from your old app and load it here. It arrives as its own workout, with
+          its own plan and history — nothing you already have is touched.
+        </p>
+        <div className="mt-4">
+          <Button variant="ghost" className="w-full" onClick={onImportHistory}>
+            Import a CSV…
+          </Button>
+        </div>
       </Card>
 
       <Card className="lg:mb-4 lg:break-inside-avoid">

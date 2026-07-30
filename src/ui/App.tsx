@@ -79,7 +79,7 @@ import { LeaveRunnerDialog, ResumeDialog } from './ResumeDialog.js';
 import { Settings } from './Settings.js';
 import { SignIn } from './SignIn.js';
 import { Today } from './Today.js';
-import { AddWorkout, Welcome } from './Welcome.js';
+import { AddWorkout, ImportHistory, Welcome } from './Welcome.js';
 import { chooseDraftOffer, draftProgress, newDraft } from './draft.js';
 import { TABS, shouldShowWorkoutBar, type Tab } from './nav.js';
 import { buildShareCard, toStatWorkouts } from './shareCardData.js';
@@ -94,7 +94,8 @@ type View =
   | { kind: 'tab'; tab: Tab }
   | { kind: 'runner' }
   | { kind: 'continue' }
-  | { kind: 'add-workout' };
+  | { kind: 'add-workout' }
+  | { kind: 'import-history' };
 
 /** Where the app stands with its server. Every one of these says something different. */
 type Session =
@@ -838,6 +839,20 @@ export function App() {
     );
   }
 
+  if (view.kind === 'import-history' && snapshot) {
+    return (
+      <ImportHistory
+        revision={snapshot.revision}
+        onCancel={() => goToTab('settings')}
+        onDone={() => {
+          goToTab('today');
+          setMessage('History imported.');
+          void load();
+        }}
+      />
+    );
+  }
+
   if (view.kind === 'continue') {
     return (
       <ContinueBlock
@@ -1109,6 +1124,7 @@ export function App() {
               void runCommand((revision) => patchSettings(patch, revision), 'Saved.');
             }}
             onOpenExport={() => setShareOpen(true)}
+            onImportHistory={() => setView({ kind: 'import-history' })}
             onSignOut={() => void signOut()}
           />
         ) : null}

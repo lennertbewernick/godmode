@@ -252,3 +252,90 @@ export function AddWorkout({
     </div>
   );
 }
+
+/**
+ * Bringing existing history across, on its own.
+ *
+ * This exists because hiding the "+" hid the CSV import with it — the two had been bundled
+ * behind one control, and they are not the same promise. Creating a plan is hidden on purpose:
+ * it can only build `percentage-ramp`. Importing history has nothing to do with plan variety,
+ * and it is the thing this project was written to do, so it gets its own way in.
+ *
+ * No "or take a max test" branch here. It is reached from Settings by someone who already has
+ * a file in their hand, so the file input is the whole screen.
+ */
+export function ImportHistory({
+  revision,
+  onDone,
+  onCancel,
+}: {
+  revision: number;
+  onDone: () => void;
+  onCancel: () => void;
+}) {
+  const [report, setReport] = useState<ImportReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function handleFile(file: File) {
+    setError(null);
+    try {
+      setReport(await readCsv(file));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'That file could not be read.');
+    }
+  }
+
+  return (
+    <div className="mx-auto w-full px-4 pb-10 md:max-w-2xl safe-t">
+      <header className="flex items-start justify-between gap-3 py-6">
+        <div>
+          <h2 className="text-2xl font-semibold text-slate-100">Bring history across</h2>
+          <p className="mt-1 text-sm text-slate-400">
+            Its own plan, its own history. Nothing you already have is touched.
+          </p>
+        </div>
+        <Button variant="subtle" onClick={onCancel}>
+          Cancel
+        </Button>
+      </header>
+
+      {error ? (
+        <div className="pb-4">
+          <Banner tone="warn" onDismiss={() => setError(null)}>
+            {error}
+          </Banner>
+        </div>
+      ) : null}
+
+      {report ? (
+        <ImportReview
+          report={report}
+          busy={busy}
+          onBack={() => setReport(null)}
+          onConfirm={async (baselineValue, accepted, goal, weeks, daysPerWeek) => {
+            setBusy(true);
+            setError(null);
+            try {
+              await createFromImport(
+                report,
+                baselineValue,
+                accepted,
+                goal,
+                weeks,
+                daysPerWeek,
+                revision,
+              );
+              onDone();
+            } catch (e) {
+              setError(e instanceof Error ? e.message : 'The import could not be saved.');
+              setBusy(false);
+            }
+          }}
+        />
+      ) : (
+        <CsvDropCard onFile={(file) => void handleFile(file)} />
+      )}
+    </div>
+  );
+}
