@@ -41,8 +41,10 @@ it runs full screen, with no browser bars, and it works without signal.
 
 ### On a computer
 
-Just open the link in any modern browser. Everything works, it is simply designed for a phone
-held in one hand.
+Just open the link in any modern browser. On a wide screen it lays itself out properly — tabs
+along the top, your numbers and chart beside your session list — rather than sitting in a
+phone-shaped column. The workout runner stays narrow on purpose: it is one big number you read
+from the floor.
 
 ## Bringing your history across
 
@@ -88,6 +90,11 @@ Five sets. Do 37, rest, 47, rest, 37, rest, 33, rest, then as many as you can ma
 last one — at least 51. Tap **Start** and it counts you through, running the rest timer between
 sets and beeping when it is time to go again.
 
+The rest timer talks to you, because mid-set your phone is on the floor and you are not looking
+at it: a soft tone at **ten seconds left**, then a click on each of the **last five**, then the
+two-tone chime that means go. The clock turns amber, then teal, and beats once a second over the
+last five. You can add or take 15 seconds at any point, or skip the rest entirely.
+
 If you tap a number wrong, fix it at the end — the review screen lets you correct every set
 before you save.
 
@@ -120,6 +127,22 @@ carries over — the chart keeps climbing across every block you ever do.
 You can also set the new target equal to your current max, which gives you a hold-steady block
 rather than a climb.
 
+## More than one exercise
+
+Push-ups are not the only thing you can count. **Settings → Add a workout** creates another one
+with its own plan and its own history — sit-ups, squats, pull-ups, dips, whatever. If you have
+history for it in your old app, you can import that too, exactly the same way.
+
+Once you have more than one, a row of names appears under the GODMODE wordmark. Tap one to switch.
+Everything below it — today's session, the chart, the totals — belongs to whichever one you picked.
+
+Totals are **per exercise**, never added together: 3000 push-ups and 400 pull-ups are two facts,
+not one number.
+
+One honest limitation. The percentages were worked out from push-up-scale numbers. If you start
+an exercise at four or five reps, the early sets come out very blunt — `2 · 2 · 2 · 2 · 3`. It
+works, and the app tells you when you are in that territory, but it is not tuned for it yet.
+
 ## Your numbers
 
 **History** shows three things that are deliberately kept apart, because they are not the same
@@ -134,8 +157,19 @@ achievement:
 You can deload every session and keep a perfect streak. That is fine — showing up matters — but
 it should not look like you are hitting your numbers, so it doesn't.
 
-The chart has two lines. The solid one is every rep you actually did. The dashed one is what the
-plan asked for. Yours will probably sit *above* the plan, because repeated days mean extra work.
+The chart has two views, and they answer different questions.
+
+**Per session** — the default — is one point per workout: what you did that day against what that
+day asked for. This is the one that shows the shape of your training. Every repeat, every deload,
+every plateau is visible, and coloured dots mark them.
+
+**Running total** adds everything up as you go. Useful for "how much work have I actually done",
+but it can only ever climb, so it is smooth no matter how uneven the sessions underneath were.
+Your line normally sits *above* the plan's here, because a repeated day is extra work the plan
+only counts once.
+
+If the running total looks featureless, that is not a bug — a cumulative curve cannot show
+variation. Switch to per session.
 
 **Calories** are a rough estimate, not a measurement. Set your bodyweight in Settings and it
 works out roughly how much energy the work took. It is shown because there is no reason to hide
@@ -299,7 +333,7 @@ Deliberately absent:
 - **Accounts, sync, a server.** All three would break the one property that matters most.
 - **A leaderboard.** Comparing with the group is a share card you paste into the chat, and it is
   not built yet.
-- **Multiple challenges at once.**
+- **Combined totals across exercises.** Each workout keeps its own numbers, on purpose.
 - **Other languages.** English only. The *importer* handles other languages; the interface
   doesn't.
 
@@ -312,7 +346,7 @@ Deliberately absent:
 ```sh
 npm install
 npm run dev        # http://localhost:5173
-npm test           # 130 tests
+npm test           # 152 tests
 npm run typecheck
 npm run build      # production bundle + service worker into dist/
 ```
@@ -344,6 +378,9 @@ src/db/           IndexedDB schema and repository
 src/import/       the four-stage CSV pipeline + mapping profiles
 src/data/         backup, restore, CSV export
 src/ui/           screens and a small hand-rolled component kit
+  cues.ts           Web Audio rest-timer cues + the pure cue schedule
+  NewWorkout.tsx    creation forms, shared by first run and add-another
+  Chart.tsx         per-session and cumulative SVG charts
 public/llms.txt   install + setup guide written for AI assistants, served at /llms.txt
 ```
 
@@ -441,7 +478,7 @@ because that session came in at 202 against 205.
 npm test
 ```
 
-130 tests, all pure or against a fake IndexedDB. Notable ones:
+152 tests, all pure or against a fake IndexedDB. Notable ones:
 
 - Both verified reference cards reproduce exactly.
 - The set ordering holds for **every integer max from 1 to 200** — non-strictly, with regression
@@ -451,6 +488,13 @@ npm test
 - The real CSV, where present, asserted down to individual sessions. It is personal data, so those
   blocks skip when the file is absent and a committed synthetic fixture covers the structure — the
   suite is green on a fresh clone either way.
+- The cue schedule, including the `<= 5` boundary. A one-beep-off error is genuinely hard to
+  notice by ear, so it gets an assertion rather than a listen.
+- `resolveSelectedChallenge` falling back when the stored selection names a challenge that was
+  ended or never existed here. Without the fall-back that is an empty screen over intact data.
+- `sessionSeries` against `cumulativeSeries` on the same history, asserting the per-session line
+  is *not* monotonic where the cumulative one is. That non-monotonicity is the entire point of
+  the chart, so it is pinned.
 
 ## How this was built
 
@@ -485,8 +529,10 @@ Planned, not built:
 - **A share card** to paste into the group chat. No backend.
 - **User-defined set counts** (4 or 6). Storage already supports it; the prescriptions for those
   counts would be invented rather than derived, so they wait for a real need.
-- **Low-rep exercises** like pull-ups need their own table — at a baseline of 5 the current one
-  yields `2,2,2,2,3` and falls apart.
+- **A low-rep table** for exercises like pull-ups. At a baseline of 5 the current one yields
+  `2 2 2 2 3` — valid, and it satisfies the ordering invariant, but far too coarse to be a good
+  plan. The app warns when you are in that range rather than pretending otherwise.
+- **Combined totals** across exercises, if anyone actually asks for them.
 
 ## Licence
 
