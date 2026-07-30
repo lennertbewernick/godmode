@@ -137,7 +137,7 @@ export function Runner({
     .reduce((s, n) => s + n, 0);
 
   return (
-    <div className="mx-auto flex min-h-screen max-w-lg flex-col px-4 safe-t safe-b">
+    <div className="mx-auto flex min-h-screen w-full flex-col px-4 md:max-w-lg safe-t safe-b">
       <header className="flex items-center justify-between gap-3 pb-3">
         <div className="min-w-0">
           <div className="truncate text-sm text-slate-400">

@@ -37,7 +37,7 @@ export function Welcome({ onReady }: { onReady: () => void }) {
   }
 
   return (
-    <div className="mx-auto max-w-lg px-4 pb-10 md:max-w-2xl safe-t">
+    <div className="mx-auto w-full px-4 pb-10 md:max-w-2xl safe-t">
       <header className="py-8">
         <h1 className="text-3xl font-bold tracking-tight text-slate-100">GODMODE</h1>
         <p className="mt-1 text-sm uppercase tracking-[0.2em] text-teal-300">No More Later</p>
@@ -143,7 +143,7 @@ export function AddWorkout({
   }
 
   return (
-    <div className="mx-auto max-w-lg px-4 pb-10 md:max-w-2xl safe-t">
+    <div className="mx-auto w-full px-4 pb-10 md:max-w-2xl safe-t">
       <header className="flex items-start justify-between gap-3 py-6">
         <div>
           <h2 className="text-2xl font-semibold text-slate-100">Add a workout</h2>

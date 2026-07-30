@@ -253,7 +253,7 @@ export function App() {
 
   if (error && !state) {
     return (
-      <div className="mx-auto max-w-lg px-4 py-10">
+      <div className="mx-auto w-full px-4 py-10 md:max-w-lg">
         <Banner tone="warn">{error}</Banner>
       </div>
     );
@@ -336,7 +336,7 @@ export function App() {
   }));
 
   return (
-    <div className="mx-auto flex min-h-screen max-w-lg flex-col px-4 md:max-w-3xl lg:max-w-6xl safe-t">
+    <div className="mx-auto flex min-h-screen w-full flex-col px-4 md:max-w-3xl lg:max-w-6xl safe-t">
       <header className="flex flex-col gap-3 pb-4 md:flex-row md:items-center md:justify-between">
         <div className="flex items-baseline justify-between gap-3">
           <h1 className="text-xl font-bold tracking-tight text-slate-100">
@@ -554,7 +554,7 @@ function ContinueBlock({
   const [useTest, setUseTest] = useState(true);
 
   return (
-    <div className="mx-auto max-w-lg px-4 pb-10 md:max-w-2xl safe-t">
+    <div className="mx-auto w-full px-4 pb-10 md:max-w-2xl safe-t">
       <header className="py-6">
         <h2 className="text-2xl font-semibold text-slate-100">Keep going</h2>
         <p className="mt-1 text-sm text-slate-400">Your history carries over.</p>
