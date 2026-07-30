@@ -324,6 +324,96 @@ export async function continueChallenge(input: {
   });
 }
 
+/**
+ * End the current block and start the next one, in a single transaction.
+ *
+ * The UI used to do this in four separate writes: end the challenge, record the max test,
+ * create the successor and its slots, then save the selection. A failure after the first left
+ * the user with an ended plan and no successor — their history intact, but no next session and
+ * no obvious way back. Nothing is written until the successor and its slots exist.
+ */
+export async function startNextBlock(input: {
+  previous: ChallengeRecord;
+  strategy: SeedStrategy;
+  baselineValue: number;
+  goalValue: number;
+  weeks: number;
+  daysPerWeek: number;
+  /** Whether the new baseline came from a rested test taken just now. */
+  tested: boolean;
+}): Promise<{ challenge: ChallengeRecord; slots: PlanSlotRecord[] }> {
+  if (!Number.isFinite(input.baselineValue) || input.baselineValue <= 0) {
+    throw new Error('The new baseline must be a positive number. Nothing has been changed.');
+  }
+  if (!Number.isFinite(input.goalValue) || input.goalValue <= 0) {
+    throw new Error('The new goal must be a positive number. Nothing has been changed.');
+  }
+
+  const db = await getDB();
+  const previousParams = input.previous.patternParams as unknown as PercentageRampParams;
+
+  const test: PerformanceTest | undefined = input.tested
+    ? {
+        id: newId('test'),
+        exerciseId: input.previous.exerciseId,
+        performedAt: nowIso(),
+        protocolId: 'single-set-max-v1',
+        protocolVersion: 1,
+        value: input.baselineValue,
+        unit: 'reps',
+      }
+    : undefined;
+
+  const baseline: Baseline = {
+    value: input.baselineValue,
+    source: input.tested ? 'tested' : 'user_entered',
+    recordedAt: nowIso(),
+    ...(test === undefined ? {} : { evidenceId: test.id }),
+  };
+
+  const { challenge, slots } = buildChallenge({
+    exerciseId: input.previous.exerciseId,
+    previousChallengeId: input.previous.id,
+    chainId: input.previous.chainId,
+    baseline,
+    params: {
+      coefficients: [...previousParams.coefficients],
+      roles: [...previousParams.roles],
+      amrapIndices: [...previousParams.amrapIndices],
+      baselineMax: input.baselineValue,
+      goalMax: input.goalValue,
+      weeks: input.weeks,
+      daysPerWeek: input.daysPerWeek,
+    },
+  });
+
+  const ended: ChallengeRecord = {
+    ...input.previous,
+    status: 'ended',
+    endedAt: nowIso(),
+    // Superseded by its successor, not closed by hand — the previous code recorded
+    // 'closed_manually', which is not what happened when a user finishes a block and continues.
+    endReason: 'superseded',
+  };
+
+  const tx = db.transaction(
+    ['challenges', 'planSlots', 'performanceTests', 'settings'],
+    'readwrite',
+  );
+  const settings = (await tx.objectStore('settings').get('settings')) ?? DEFAULT_SETTINGS;
+
+  await Promise.all([
+    tx.objectStore('challenges').put(ended),
+    tx.objectStore('challenges').put(challenge),
+    ...slots.map((slot) => tx.objectStore('planSlots').put(slot)),
+    ...(test === undefined ? [] : [tx.objectStore('performanceTests').put(test)]),
+    tx.objectStore('settings').put({ ...settings, selectedChallengeId: challenge.id }),
+    tx.done,
+  ]);
+
+  return { challenge, slots };
+}
+
 // ── Plan slots ──────────────────────────────────────────────────────────────────
 
 export async function listSlots(challengeId: string): Promise<PlanSlotRecord[]> {
@@ -353,6 +443,18 @@ export async function listWorkouts(chainId?: string): Promise<WorkoutRecord[]> {
 export async function countAttempts(planSlotId: string): Promise<number> {
   const db = await getDB();
   return (await db.getAllFromIndex('workouts', 'bySlot', planSlotId)).length;
+}
+
+/**
+ * Every workout in the database, across all exercises and ended chains.
+ *
+ * Backup prompting has to use this rather than the visible chain's count. Durability is a
+ * property of the whole database: switching to a newly added exercise made the count zero and
+ * silenced the "you have never backed up" warning while months of history sat one tap away.
+ */
+export async function countAllWorkouts(): Promise<number> {
+  const db = await getDB();
+  return db.count('workouts');
 }
 
 export function estimateKcal(
@@ -399,7 +501,15 @@ export async function logWorkout(input: LogWorkoutInput): Promise<{
     settings.kcalCoefficient,
   );
 
-  const attemptNo = (await countAttempts(input.slot.id)) + 1;
+  // Everything below happens inside one transaction. The attempt number used to be read
+  // before it opened, so two tabs — or one impatient double-tap — could both read "2 attempts"
+  // and both write attempt 3.
+  const tx = db.transaction(['workouts', 'planSlots'], 'readwrite');
+  const workoutsStore = tx.objectStore('workouts');
+  const slotsStore = tx.objectStore('planSlots');
+
+  const existingAttempts = await workoutsStore.index('bySlot').getAll(input.slot.id);
+  const attemptNo = existingAttempts.length + 1;
 
   const workout: WorkoutRecord = {
     id: newId('wo'),
@@ -429,14 +539,23 @@ export async function logWorkout(input: LogWorkoutInput): Promise<{
         }),
   };
 
-  const tx = db.transaction(['workouts', 'planSlots'], 'readwrite');
-  await tx.objectStore('workouts').put(workout);
-  // The slot record itself is never edited beyond its lifecycle status.
-  await tx.objectStore('planSlots').put({
-    ...input.slot,
-    status: evaluation.advances ? 'completed' : 'attempted',
-  });
-  await tx.done;
+  // Re-read the slot inside the transaction rather than trusting the copy the caller was
+  // holding, which may be stale by now.
+  const storedSlot = (await slotsStore.get(input.slot.id)) ?? input.slot;
+
+  // `completed` is a ratchet. A slot that has already been passed must never fall back to
+  // `attempted` — a late-arriving failed attempt from another tab, or a deload logged against
+  // a day already cleared, would otherwise re-lock a day the user has finished and send them
+  // back to repeat it.
+  const nextStatus =
+    storedSlot.status === 'completed' || evaluation.advances ? 'completed' : 'attempted';
+
+  await Promise.all([
+    workoutsStore.put(workout),
+    // The slot record itself is never edited beyond its lifecycle status.
+    slotsStore.put({ ...storedSlot, status: nextStatus }),
+    tx.done,
+  ]);
 
   return { workout, evaluation };
 }

@@ -19,7 +19,7 @@ import {
   shouldPromptBackup,
 } from '../data/exchange.js';
 import {
-  continueChallenge,
+  countAllWorkouts,
   countAttempts,
   endChallenge,
   exerciseLabels,
@@ -30,9 +30,9 @@ import {
   listSlots,
   listWorkouts,
   logWorkout,
-  recordMaxTest,
   resolveSelectedChallenge,
   saveSettings,
+  startNextBlock,
 } from '../db/repo.js';
 import type {
   ChallengeRecord,
@@ -102,6 +102,8 @@ interface State {
   attemptNo: number;
   settings: SettingsRecord;
   exerciseLabel: string;
+  /** Across every exercise and every ended chain — durability is a whole-database property. */
+  totalWorkouts: number;
 }
 
 export function App() {
@@ -116,10 +118,11 @@ export function App() {
   const [backupDismissed, setBackupDismissed] = useState(false);
 
   const load = useCallback(async () => {
-    const [active, challenge, settings] = await Promise.all([
+    const [active, challenge, settings, totalWorkouts] = await Promise.all([
       listActiveChallenges(),
       resolveSelectedChallenge(),
       getSettings(),
+      countAllWorkouts(),
     ]);
     const labels = await exerciseLabels(active);
 
@@ -134,6 +137,7 @@ export function App() {
         attemptNo: 1,
         settings,
         exerciseLabel: '',
+        totalWorkouts,
       });
       return;
     }
@@ -155,6 +159,7 @@ export function App() {
       attemptNo,
       settings,
       exerciseLabel: labels.get(challenge.exerciseId) ?? 'Exercise',
+      totalWorkouts,
     });
   }, []);
 
@@ -207,7 +212,7 @@ export function App() {
 
         // A well-formed but empty backup landing on a device that has history is almost
         // always the wrong file, and restore is not undoable — it clears every store first.
-        if (backupIsEmpty(parsed) && (state?.workouts.length ?? 0) > 0) {
+        if (backupIsEmpty(parsed) && (state?.totalWorkouts ?? 0) > 0) {
           setError(
             'That backup contains no sessions, and this device has history that restoring ' +
               'would erase. Nothing has been changed. Check you picked the right file.',
@@ -327,21 +332,22 @@ export function App() {
         workouts={state.workouts}
         onCancel={() => goToTab('today')}
         onConfirm={async (baselineValue, tested, goal, weeks, daysPerWeek) => {
-          const challenge = state.challenge!;
-          await endChallenge(challenge.id, 'closed_manually');
-          const evidence = tested
-            ? await recordMaxTest(challenge.exerciseId, baselineValue)
-            : undefined;
-          const { challenge: next } = await continueChallenge({
-            previous: challenge,
-            strategy: tested ? 'retest' : 'user_entered',
-            baselineValue,
-            goalValue: goal,
-            weeks,
-            daysPerWeek,
-            ...(evidence === undefined ? {} : { evidenceId: evidence.id }),
-          });
-          await saveSettings({ selectedChallengeId: next.id });
+          // One transaction: ending the old block, recording the max test, creating the
+          // successor and its slots, and moving the selection all land together or not at all.
+          try {
+            await startNextBlock({
+              previous: state.challenge!,
+              strategy: tested ? 'retest' : 'user_entered',
+              baselineValue,
+              goalValue: goal,
+              weeks,
+              daysPerWeek,
+              tested,
+            });
+          } catch (e) {
+            setError(e instanceof Error ? e.message : 'The next block could not be started.');
+            return;
+          }
           goToTab('today');
           setMessage('New block started.');
           await load();
@@ -352,7 +358,7 @@ export function App() {
 
   const activeTab = view.kind === 'tab' ? view.tab : 'today';
   const showBackupNag =
-    !backupDismissed && shouldPromptBackup(state.settings, state.workouts.length);
+    !backupDismissed && shouldPromptBackup(state.settings, state.totalWorkouts);
 
   const tabOptions = TABS.map((tab) => ({
     value: tab,
