@@ -676,14 +676,18 @@ function WorkoutBar({
       </div>
 
       {/*
-        Keeps Button's default min-h-11 rather than matching the 36px chips: 44px is the
-        thumb-reachability floor, and the small height mismatch is the cheaper trade. `ghost`
-        matches the unselected chip's border, so this reads as part of the row instead of
-        competing with Today's Start button.
+        Deliberately a plain button carrying the chip's own geometry rather than the kit Button:
+        it sits in the chip row and should read as one of them, so the row is 36px because the
+        chips are. It stays outside the tablist above — it selects nothing.
       */}
-      <Button variant="ghost" ariaLabel="Add a workout" className="px-3" onClick={onAddWorkout}>
+      <button
+        type="button"
+        aria-label="Add a workout"
+        onClick={onAddWorkout}
+        className="inline-flex min-h-9 items-center justify-center rounded-xl border border-[#33405c] px-3 py-1.5 text-sm text-slate-300 transition-colors hover:bg-[#1c2740]"
+      >
         <PlusGlyph />
-      </Button>
+      </button>
     </div>
   );
 }
