@@ -137,9 +137,16 @@ function checkField(value: unknown, spec: FieldSpec, path: string, log: IssueLog
         log.add(path, `expected a whole number, received ${typeName(value)}`);
         return FAILED;
       }
-      if (!Number.isInteger(value)) {
+      if (!Number.isSafeInteger(value)) {
         // Not rounded. An INTEGER column in a STRICT table refuses a fractional value, and
         // rounding here to make the insert succeed would rewrite history to fit the schema.
+        //
+        // `isSafeInteger`, not `isInteger`: `JSON.parse` turns 9007199254740993 into
+        // 9007199254740992 before anything here can see it, and `isInteger` accepts the rounded
+        // result. Every later comparison would then agree with a number the file never contained,
+        // and every verification check would pass. SQLite would store it happily — its INTEGER is
+        // 64-bit, wider than a JavaScript number. So the boundary is stated where the loss
+        // actually happens: past 2^53-1 this build refuses the value rather than pretending.
         log.add(path, `expected a whole number, received ${String(value)}`);
         return FAILED;
       }
