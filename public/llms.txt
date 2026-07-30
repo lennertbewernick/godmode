@@ -160,7 +160,9 @@ Do not promise these. They are absent on purpose:
 
 ## Technical
 
-- Source and licence (AGPL-3.0): https://git.marcushorndt.de/marcushorndt/godmode
+- Source and licence (AGPL-3.0):
+  - https://github.com/marcushorndt/godmode (mirror — usually the easier one to browse)
+  - https://git.marcushorndt.de/marcushorndt/godmode (canonical; the mirror is pushed from here)
 - Stack: Vite, TypeScript, React, Tailwind, IndexedDB via `idb`. No backend of any kind.
 - Self-hosting is a static file copy: `npm ci && npm run build`, then serve `dist/` over HTTPS.
   HTTPS is required — service workers do not run without it.

@@ -6,7 +6,15 @@ dist/
 dev-dist/
 *.local
 
-# Source screenshots: the originals are ~6 MB of PNG. The committed WebP versions
-# (97% smaller, still legible) are the evidence; the raw PNGs stay local.
+# Screenshots of the incumbent app stay local and are never committed, in any format.
+#
+# Two reasons. They are screenshots of somebody else's proprietary interface, which does not
+# belong in an AGPL repository that gets mirrored publicly. And they are photographs of a
+# personal phone, timestamps and all. They were the source material for the reverse-engineering
+# and the derivation records what they showed — the images themselves are not needed to build,
+# test, or run anything.
 example/*.PNG
 example/*.png
+example/*.webp
+example/*.jpg
+example/*.jpeg

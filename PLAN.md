@@ -6,11 +6,19 @@ without a rewrite.
 
 Status: planning. Nothing implemented yet.
 License: AGPL-3.0.
-Source material: `example/` — one CSV export (29 logged sessions), six screenshots — plus
-the confirmed baseline max test of **18**.
+Source material: one CSV export of 29 logged sessions (committed at
+`example/incumbent-history-sample.csv`), six screenshots of the incumbent app, and the
+confirmed baseline max test of **18**.
+
+The screenshots are **not in this repository and never will be** — they are captures of another
+company's proprietary interface, and of a personal phone. They stay on the author's machine. What
+they showed is recorded below claim by claim, so a reader can see exactly which assertions rest on
+an artifact they cannot inspect. That is a real limit on independent verification and is stated
+rather than hidden: the CSV is reproducible evidence, a screenshot citation is testimony.
 
 > **Epistemic status.** This document distinguishes three tiers throughout:
-> **[VERIFIED]** — confirmed against the CSV or a screenshot.
+> **[VERIFIED]** — confirmed against the committed CSV, or against a screenshot held locally
+> (see the note on source material: screenshot-only claims are testimony, not reproducible).
 > **[INFERRED]** — a reasonable reading of the data, not proven.
 > **[OUR CHOICE]** — a transparent design decision of ours, *not* recovered from the
 > incumbent. Earlier drafts of this plan blurred these; a Codex round-0 review

@@ -246,8 +246,13 @@ set_i = round(M(n) × coefficient_i)
 
 ## Where those numbers came from
 
-They were reverse-engineered from one real 29-session CSV export plus six screenshots of the
-original app. The table is **exact at both ends** of a six-week block:
+They were reverse-engineered from one real 29-session CSV export — which is committed, in
+`example/` — plus six screenshots of the original app, which are **not** committed and won't be:
+they are captures of somebody else's proprietary interface and of a personal phone. Claims that
+rest only on a screenshot are flagged as such in `PLAN.md`, because you cannot check those for
+yourself the way you can check the CSV.
+
+The table is **exact at both ends** of a six-week block:
 
 | | Estimated max | Sets | Total |
 |---|---|---|---|
@@ -545,3 +550,15 @@ Planned, not built:
 
 AGPL-3.0-or-later. See `LICENSE`. Fork it, run it, change it — derivatives stay open, including
 hosted ones. That is deliberate, given what it replaces.
+
+## Where this lives
+
+- **Canonical:** [git.marcushorndt.de/marcushorndt/godmode](https://git.marcushorndt.de/marcushorndt/godmode)
+- **Mirror:** [github.com/marcushorndt/godmode](https://github.com/marcushorndt/godmode)
+
+Pushes go to the canonical remote and replicate to the mirror. Open issues and pull requests on
+whichever you prefer.
+
+Screenshots of the app this replaces are **not in either repository** — they were the source
+material for the reverse-engineering, but they are captures of another company's interface and of
+a personal phone, so they stay local. History was rewritten on 2026-07-30 to remove them.
