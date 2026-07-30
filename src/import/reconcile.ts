@@ -12,7 +12,12 @@
 
 import { pushupParams, PUSHUP_5SET_TEMPLATE } from '../core/patterns/percentageRamp.js';
 import type { Baseline } from '../core/types.js';
-import { createChallenge, createExercise, newId, putImportedWorkout, putSlots } from '../db/repo.js';
+import {
+  buildChallenge,
+  buildExercise,
+  commitImportAtomically,
+  newId,
+} from '../db/repo.js';
 import { KCAL_ESTIMATOR_VERSION, type PlanSlotRecord, type WorkoutRecord } from '../db/schema.js';
 import type { CanonicalImport, CanonicalSession } from './pipeline.js';
 
@@ -191,8 +196,11 @@ function resolveAdvancement(
 
   for (const slot of slots) {
     if (slot.ordinal < furthestReached) {
-      // A later day was attempted, so the source app must have passed this one.
-      if (withHistory.includes(slot.ordinal)) advanced.add(slot.ordinal);
+      // A later day was attempted, so the source app must have passed this one. That holds
+      // whether or not we have its row: a session whose line was unreadable is still a session
+      // that happened, and requiring one here would leave a hole in the middle of a finished
+      // programme and stall the user on a day they already passed.
+      advanced.add(slot.ordinal);
       continue;
     }
     if (slot.ordinal === furthestReached) {
@@ -212,9 +220,22 @@ function resolveAdvancement(
  * demonstrably completed. Slot targets are written once from the generator and never edited.
  */
 export async function commitImport(input: CommitImportInput): Promise<CommitImportResult> {
-  const exercise = await createExercise(input.canonical.exerciseLabel);
+  // Validate the numbers before anything is built, let alone written. These used to be checked
+  // implicitly by the generator, after the exercise record already existed.
+  for (const [name, value] of [
+    ['baseline', input.baseline.value],
+    ['goal', input.goal],
+    ['weeks', input.weeks],
+    ['days per week', input.daysPerWeek],
+  ] as const) {
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error(`The ${name} must be a positive number. Nothing has been imported.`);
+    }
+  }
 
-  const { challenge, slots } = await createChallenge({
+  const exercise = buildExercise(input.canonical.exerciseLabel);
+
+  const { challenge, slots } = buildChallenge({
     exerciseId: exercise.id,
     baseline: input.baseline,
     params: pushupParams(input.baseline.value, input.goal, input.weeks, input.daysPerWeek),
@@ -223,7 +244,7 @@ export async function commitImport(input: CommitImportInput): Promise<CommitImpo
   const { assignments, report } = reconcile(input.canonical, slots);
 
   const advancedOrdinals = resolveAdvancement(assignments, slots);
-  let workoutsWritten = 0;
+  const workouts: WorkoutRecord[] = [];
 
   // Within a slot, the source app repeated the day until it passed. So every attempt except
   // the last one on an advanced slot was a miss — recoverable from the ordering, without
@@ -244,14 +265,19 @@ export async function commitImport(input: CommitImportInput): Promise<CommitImpo
       chainId: challenge.chainId,
       attemptNo,
       performedAt: session.performedAt,
-      sets: session.actualSets.map((actual, i) => ({
-        index: i + 1,
-        effectiveTarget: slot?.targets[i]?.reps ?? actual,
-        actual,
-      })),
+      // IMP-07: an unreconciled session has no known prescription, so it gets none. Falling
+      // back to `actual` here would manufacture a target out of the reps performed.
+      sets: session.actualSets.map((actual, i) => {
+        const prescribed = slot?.targets[i]?.reps;
+        return {
+          index: i + 1,
+          actual,
+          ...(prescribed === undefined ? {} : { effectiveTarget: prescribed }),
+        };
+      }),
       actualTotal: session.actualTotal,
       adjustmentType: 'none',
-      effectiveTotal: slot?.targetTotal ?? session.actualTotal,
+      ...(slot === undefined ? {} : { effectiveTotal: slot.targetTotal }),
       outcome: satisfied ? 'completed_as_planned' : 'failed',
       importSource: input.canonical.sourceProfileId,
       ...(slot === undefined ? {} : { planSlotId: slot.id }),
@@ -269,20 +295,20 @@ export async function commitImport(input: CommitImportInput): Promise<CommitImpo
             },
           }),
     };
-    await putImportedWorkout(record);
-    workoutsWritten += 1;
+    workouts.push(record);
   }
 
   // Slots the imported history shows as satisfied become completed; the rest stay available.
   const updated = slots.map((slot) =>
     advancedOrdinals.has(slot.ordinal) ? { ...slot, status: 'completed' as const } : slot,
   );
-  await putSlots(updated);
+
+  await commitImportAtomically({ exercise, challenge, slots: updated, workouts });
 
   return {
     challengeId: challenge.id,
     chainId: challenge.chainId,
     report,
-    workoutsWritten,
+    workoutsWritten: workouts.length,
   };
 }

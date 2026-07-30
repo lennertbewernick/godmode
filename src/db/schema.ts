@@ -119,7 +119,8 @@ export interface WorkoutRecord {
   actualTotal: number;
   /** Per-attempt adjustment. Lives here, never on the slot. */
   adjustmentType: AdjustmentType;
-  effectiveTotal: number;
+  /** Prescribed total for this attempt. Absent when no prescription is known — see PerformedSet. */
+  effectiveTotal?: number;
   outcome: WorkoutOutcome;
   evaluation?: EvaluationResult;
   evaluationPolicyId?: string;

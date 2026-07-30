@@ -358,7 +358,7 @@ Deliberately absent:
 ```sh
 npm install
 npm run dev        # http://localhost:5173
-npm test           # 173 tests
+npm test           # 185 tests
 npm run typecheck
 npm run build      # production bundle + service worker into dist/
 ```
@@ -490,7 +490,7 @@ because that session came in at 202 against 205.
 npm test
 ```
 
-173 tests, all pure or against a fake IndexedDB. Notable ones:
+185 tests, all pure or against a fake IndexedDB. Notable ones:
 
 - Both verified reference cards reproduce exactly.
 - The set ordering holds for **every integer max from 1 to 200** — non-strictly, with regression

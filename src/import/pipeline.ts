@@ -158,7 +158,18 @@ function applyFormat(raw: string, format: DateFormatId): ParsedDateParts | null 
   if (month < 1 || month > 12) return null;
   if (day < 1 || day > 31) return null;
   if (split.hour > 23 || split.minute > 59) return null;
-  return { year, month, day, hour: split.hour, minute: split.minute };
+  const parts = { year, month, day, hour: split.hour, minute: split.minute };
+  // A day-of-month range check accepts 31 February. Construct the date and read it back:
+  // if the calendar rolled it over into March, the input was not a real date.
+  if (!isRealCalendarDate(parts)) return null;
+  return parts;
+}
+
+function isRealCalendarDate(p: ParsedDateParts): boolean {
+  const d = new Date(Date.UTC(p.year, p.month - 1, p.day));
+  return (
+    d.getUTCFullYear() === p.year && d.getUTCMonth() === p.month - 1 && d.getUTCDate() === p.day
+  );
 }
 
 function toIso(p: ParsedDateParts): string {
@@ -212,15 +223,43 @@ export function detectDateFormat(
 function parseDurationSeconds(raw: string): number | undefined {
   const m = /^(\d{1,3}):(\d{2})$/.exec(raw.trim());
   if (!m) return undefined;
-  return Number(m[1]) * 60 + Number(m[2]);
+  const seconds = Number(m[2]);
+  // `mm:ss` — 05:99 is not 6:39, it is a malformed cell. Reading it as 399s would invent
+  // a duration the source never recorded.
+  if (seconds > 59) return undefined;
+  return Number(m[1]) * 60 + seconds;
 }
 
-function parseIntOrUndefined(raw: string | undefined): number | undefined {
+/** Absent (blank or `-`), a value, or a cell that is present but not usable. */
+type Cell = number | undefined | 'invalid';
+
+/**
+ * Parse a cell that must hold a whole number.
+ *
+ * Rounding is deliberately not done. `Math.round` turned "7.6" into 8 and "abc"-adjacent junk
+ * into a plausible-looking rep count, which is the pipeline silently changing the user's data
+ * rather than telling them a cell is unreadable.
+ */
+function parseIntCell(raw: string | undefined): Cell {
   if (raw === undefined) return undefined;
   const t = raw.trim();
   if (t === '' || t === '-') return undefined;
   const n = Number(t.replace(',', '.'));
-  return Number.isFinite(n) ? Math.round(n) : undefined;
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return 'invalid';
+  return n;
+}
+
+/** As above, but a decimal is acceptable — kcal is an estimate, not a count. */
+function parseNumberCell(raw: string | undefined): Cell {
+  if (raw === undefined) return undefined;
+  const t = raw.trim();
+  if (t === '' || t === '-') return undefined;
+  const n = Number(t.replace(',', '.'));
+  return Number.isFinite(n) ? n : 'invalid';
+}
+
+function valueOrUndefined(cell: Cell): number | undefined {
+  return cell === 'invalid' ? undefined : cell;
 }
 
 // ── Stages 2 & 3: map and validate ──────────────────────────────────────────────
@@ -277,10 +316,16 @@ export function buildCanonicalImport(text: string, profile: ImportProfile): Impo
     }
 
     const parts = applyFormat(row[profile.columns.date] ?? '', detection.format);
-    const week = parseIntOrUndefined(row[profile.columns.week]);
-    const day = parseIntOrUndefined(row[profile.columns.day]);
+    const week = parseIntCell(row[profile.columns.week]);
+    const day = parseIntCell(row[profile.columns.day]);
 
-    if (!parts || week === undefined || day === undefined) {
+    if (
+      !parts ||
+      typeof week !== 'number' ||
+      typeof day !== 'number' ||
+      week < 1 ||
+      day < 1
+    ) {
       issues.push({
         severity: 'error',
         line,
@@ -290,9 +335,48 @@ export function buildCanonicalImport(text: string, profile: ImportProfile): Impo
       return;
     }
 
-    const actualSets = profile.columns.sets
-      .map((c) => parseIntOrUndefined(row[c]))
-      .filter((n): n is number => n !== undefined && n > 0);
+    // Set columns must keep their positions. The previous version filtered out anything not
+    // greater than zero, so a logged set of 0 vanished and every later set silently moved up
+    // a slot — set 3 became set 2 in the stored history.
+    const rawSets = profile.columns.sets.map((c) => parseIntCell(row[c]));
+
+    if (rawSets.some((c) => c === 'invalid')) {
+      issues.push({
+        severity: 'error',
+        line,
+        message: 'A set column is not a whole number. Row skipped.',
+      });
+      rowsRejected += 1;
+      return;
+    }
+    if (rawSets.some((c) => typeof c === 'number' && c < 0)) {
+      issues.push({
+        severity: 'error',
+        line,
+        message: 'A set column is negative. Row skipped.',
+      });
+      rowsRejected += 1;
+      return;
+    }
+
+    // Unused trailing set columns are blank in the source and simply mean "fewer sets".
+    let end = rawSets.length;
+    while (end > 0 && rawSets[end - 1] === undefined) end -= 1;
+    const kept = rawSets.slice(0, end);
+
+    if (kept.some((c) => c === undefined)) {
+      issues.push({
+        severity: 'error',
+        line,
+        message:
+          'A set column is blank between two filled ones, so the set order cannot be trusted. ' +
+          'Row skipped.',
+      });
+      rowsRejected += 1;
+      return;
+    }
+
+    const actualSets = kept as number[];
 
     if (actualSets.length === 0) {
       issues.push({
@@ -305,7 +389,7 @@ export function buildCanonicalImport(text: string, profile: ImportProfile): Impo
     }
 
     const computedTotal = actualSets.reduce((s, n) => s + n, 0);
-    const statedTotal = parseIntOrUndefined(row[profile.columns.total]);
+    const statedTotal = valueOrUndefined(parseIntCell(row[profile.columns.total]));
     if (statedTotal !== undefined && statedTotal !== computedTotal) {
       issues.push({
         severity: 'warning',
@@ -317,7 +401,7 @@ export function buildCanonicalImport(text: string, profile: ImportProfile): Impo
     }
 
     const durationSeconds = parseDurationSeconds(row[profile.columns.duration] ?? '');
-    const kcalExternal = parseIntOrUndefined(row[profile.columns.kcal]);
+    const kcalExternal = valueOrUndefined(parseNumberCell(row[profile.columns.kcal]));
 
     sessions.push({
       performedAt: toIso(parts),
@@ -341,7 +425,7 @@ export function buildCanonicalImport(text: string, profile: ImportProfile): Impo
 
   const first = dataRows[0]!;
   const exerciseLabel = (first[profile.columns.exercise] ?? '').trim() || 'Exercise';
-  const goal = parseIntOrUndefined(first[profile.columns.goal]);
+  const goal = valueOrUndefined(parseIntCell(first[profile.columns.goal]));
   const challengeLength = (first[profile.columns.challengeLength] ?? '').trim();
 
   return {

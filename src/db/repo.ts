@@ -70,14 +70,19 @@ export async function saveSettings(patch: Partial<SettingsRecord>): Promise<Sett
 
 // ── Exercises ───────────────────────────────────────────────────────────────────
 
-export async function createExercise(label: string): Promise<ExerciseRecord> {
-  const db = await getDB();
-  const record: ExerciseRecord = {
+/** Build an exercise record without writing it. */
+export function buildExercise(label: string): ExerciseRecord {
+  return {
     id: newId('ex'),
     label: label.trim() || 'Exercise',
     unit: 'reps',
     createdAt: nowIso(),
   };
+}
+
+export async function createExercise(label: string): Promise<ExerciseRecord> {
+  const db = await getDB();
+  const record = buildExercise(label);
   await db.put('exercises', record);
   return record;
 }
@@ -120,11 +125,16 @@ export interface CreateChallengeInput {
   chainId?: string;
 }
 
-export async function createChallenge(input: CreateChallengeInput): Promise<{
+/**
+ * Build a challenge and its slots without writing anything.
+ *
+ * Split out so a caller that must write several stores together — import, in particular —
+ * can generate and validate everything first and then commit in one transaction.
+ */
+export function buildChallenge(input: CreateChallengeInput): {
   challenge: ChallengeRecord;
   slots: PlanSlotRecord[];
-}> {
-  const db = await getDB();
+} {
   const id = newId('ch');
   const generatedAt = nowIso();
 
@@ -152,12 +162,49 @@ export async function createChallenge(input: CreateChallengeInput): Promise<{
   const specs = materialize(percentageRampPattern, input.params);
   const slots = specs.map((spec) => specToRecord(spec, id, generatedAt));
 
+  return { challenge, slots };
+}
+
+export async function createChallenge(input: CreateChallengeInput): Promise<{
+  challenge: ChallengeRecord;
+  slots: PlanSlotRecord[];
+}> {
+  const db = await getDB();
+  const { challenge, slots } = buildChallenge(input);
+
   const tx = db.transaction(['challenges', 'planSlots'], 'readwrite');
-  await tx.objectStore('challenges').put(challenge);
-  for (const slot of slots) await tx.objectStore('planSlots').put(slot);
-  await tx.done;
+  await Promise.all([
+    tx.objectStore('challenges').put(challenge),
+    ...slots.map((slot) => tx.objectStore('planSlots').put(slot)),
+    tx.done,
+  ]);
 
   return { challenge, slots };
+}
+
+/**
+ * Write a whole import in one transaction.
+ *
+ * Import used to write the exercise, then the challenge and slots, then each workout, then the
+ * slot statuses — five or more separate transactions. A failure or a closed tab partway through
+ * left an orphan exercise, or a challenge holding some of the history, with nothing to say the
+ * import was incomplete. Either everything lands or nothing does.
+ */
+export async function commitImportAtomically(input: {
+  exercise: ExerciseRecord;
+  challenge: ChallengeRecord;
+  slots: PlanSlotRecord[];
+  workouts: WorkoutRecord[];
+}): Promise<void> {
+  const db = await getDB();
+  const tx = db.transaction(['exercises', 'challenges', 'planSlots', 'workouts'], 'readwrite');
+  await Promise.all([
+    tx.objectStore('exercises').put(input.exercise),
+    tx.objectStore('challenges').put(input.challenge),
+    ...input.slots.map((slot) => tx.objectStore('planSlots').put(slot)),
+    ...input.workouts.map((workout) => tx.objectStore('workouts').put(workout)),
+    tx.done,
+  ]);
 }
 
 function specToRecord(

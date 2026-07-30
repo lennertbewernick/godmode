@@ -261,10 +261,24 @@ export function buildCsv(input: CsvExportInput): string {
         ...padded,
         String(wo.actualTotal),
         wo.kcal === undefined ? '-' : String(wo.kcal.value),
-      ].join(';');
+      ]
+        .map(csvField)
+        .join(';');
     });
 
   return [header, ...rows].join('\n');
+}
+
+/**
+ * Quote a field that would otherwise break the row.
+ *
+ * The exercise label is free text the user typed. "Push-ups; wide" silently became two
+ * columns, shifting every later value one place and corrupting the export — and the parser
+ * we ship would then reject or misread the file on the way back in.
+ */
+function csvField(value: string): string {
+  if (!/[;"\n\r]/.test(value)) return value;
+  return `"${value.replace(/"/g, '""')}"`;
 }
 
 export function downloadFile(filename: string, content: string, mime: string): void {

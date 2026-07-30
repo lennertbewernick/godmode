@@ -151,8 +151,16 @@ export type WorkoutOutcome =
 
 export interface PerformedSet {
   index: number;
-  /** What was prescribed for this attempt, after any adjustment. */
-  effectiveTarget: number;
+  /**
+   * What was prescribed for this attempt, after any adjustment.
+   *
+   * Optional, and absent means genuinely unknown — an imported session that could not be
+   * reconciled to a plan slot has no recoverable prescription. It must never be filled in
+   * from `actual`: that would record "you were told to do exactly what you did", which is a
+   * prescription the user never received and which makes every such session look like a
+   * perfect hit forever after.
+   */
+  effectiveTarget?: number;
   actual: number;
   startedAt?: string;
   endedAt?: string;
