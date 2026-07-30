@@ -47,7 +47,7 @@ export function Today({
 
   if (!slot) {
     return (
-      <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-4 lg:max-w-2xl">
         <Card>
           <h2 className="text-xl font-semibold text-slate-100">Programme complete</h2>
           <p className="mt-2 text-sm leading-relaxed text-slate-300">
@@ -76,120 +76,130 @@ export function Today({
   const effectiveTargets = adjusting && draft.length > 0 ? draft : baseTargets;
 
   return (
-    <div className="flex flex-col gap-4">
+    // Mobile stacks in the original order. From lg the session and its adjust panel take
+    // the wide column and the context — plan numbers, the stuck-on-this-day escape — moves
+    // into a rail, so nothing that matters mid-session sits below the fold on a laptop.
+    <div className="flex flex-col gap-4 lg:grid lg:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)] lg:items-start">
       {lastMessage ? (
-        <Banner tone="good" onDismiss={onDismissMessage}>
-          {lastMessage}
-        </Banner>
+        <div className="lg:col-span-2">
+          <Banner tone="good" onDismiss={onDismissMessage}>
+            {lastMessage}
+          </Banner>
+        </div>
       ) : null}
 
-      <Card>
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <div className="truncate text-sm text-slate-400">{exerciseLabel}</div>
-            <h2 className="text-2xl font-semibold text-slate-100">
-              {slot.week !== undefined && slot.day !== undefined
-                ? `Week ${slot.week} · Day ${slot.day}`
-                : (slot.cycleLabel ?? `Session ${slot.ordinal}`)}
-            </h2>
-            {attemptNo > 1 ? (
-              <div className="mt-0.5 text-sm text-amber-300">Attempt {attemptNo}</div>
-            ) : null}
+      <div className="flex flex-col gap-4">
+        <Card>
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="truncate text-sm text-slate-400">{exerciseLabel}</div>
+              <h2 className="text-2xl font-semibold text-slate-100">
+                {slot.week !== undefined && slot.day !== undefined
+                  ? `Week ${slot.week} · Day ${slot.day}`
+                  : (slot.cycleLabel ?? `Session ${slot.ordinal}`)}
+              </h2>
+              {attemptNo > 1 ? (
+                <div className="mt-0.5 text-sm text-amber-300">Attempt {attemptNo}</div>
+              ) : null}
+            </div>
+            <div className="shrink-0 text-right">
+              <div className="tnum text-2xl font-semibold text-teal-300">{slot.targetTotal}</div>
+              <div className="text-xs text-slate-400">reps to pass</div>
+            </div>
           </div>
-          <div className="shrink-0 text-right">
-            <div className="tnum text-2xl font-semibold text-teal-300">{slot.targetTotal}</div>
-            <div className="text-xs text-slate-400">reps to pass</div>
+
+          <SetRow reps={effectiveTargets} amrapFlags={amrapFlags} className="mt-4" />
+
+          <div className="mt-4 flex items-center gap-4 text-xs text-slate-400">
+            <span className="tnum">rest {formatClock(slot.restSeconds)}</span>
+            <span className="tnum">
+              day {slotsAdvanced + 1} of {slotsTotal}
+            </span>
           </div>
-        </div>
 
-        <SetRow reps={effectiveTargets} amrapFlags={amrapFlags} className="mt-4" />
+          {adjustment !== 'none' ? (
+            <div className="mt-3 text-xs">
+              {adjustment === 'scaled_down' ? (
+                <span className="text-amber-300">
+                  Scaled down to {draftTotal}. This day stays next until you reach {baseTotal}.
+                </span>
+              ) : adjustment === 'scaled_up' ? (
+                <span className="text-teal-300">Scaled up to {draftTotal}.</span>
+              ) : (
+                <span className="text-slate-300">Same {baseTotal} reps, different shape.</span>
+              )}
+            </div>
+          ) : null}
 
-        <div className="mt-4 flex items-center gap-4 text-xs text-slate-400">
-          <span className="tnum">rest {formatClock(slot.restSeconds)}</span>
-          <span className="tnum">
-            day {slotsAdvanced + 1} of {slotsTotal}
-          </span>
-        </div>
-
-        {adjustment !== 'none' ? (
-          <div className="mt-3 text-xs">
-            {adjustment === 'scaled_down' ? (
-              <span className="text-amber-300">
-                Scaled down to {draftTotal}. This day stays next until you reach {baseTotal}.
-              </span>
-            ) : adjustment === 'scaled_up' ? (
-              <span className="text-teal-300">Scaled up to {draftTotal}.</span>
-            ) : (
-              <span className="text-slate-300">Same {baseTotal} reps, different shape.</span>
-            )}
+          <div className="mt-5 flex flex-col gap-2 sm:flex-row">
+            <Button className="flex-1" onClick={() => onStart(effectiveTargets, adjustment)}>
+              Start
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setAdjusting((v) => !v);
+                setDraft(adjusting ? [] : [...baseTargets]);
+              }}
+            >
+              {adjusting ? 'Reset' : 'Adjust'}
+            </Button>
           </div>
+        </Card>
+
+        {adjusting ? (
+          <Card>
+            <h3 className="font-semibold text-slate-100">Adjust the sets</h3>
+            <p className="mt-1 text-xs leading-relaxed text-slate-400">
+              Move reps between sets, or change the total for an easier or harder day.
+            </p>
+            <div className="mt-4 flex flex-col gap-3">
+              {draft.map((value, i) => (
+                <NumberField
+                  key={i}
+                  label={`Set ${i + 1}${amrapFlags[i] ? ' (open-ended)' : ''}`}
+                  value={value}
+                  min={1}
+                  onChange={(next) =>
+                    setDraft((prev) => {
+                      const copy = [...prev];
+                      copy[i] = next === '' ? 1 : Math.max(1, next);
+                      return copy;
+                    })
+                  }
+                  suffix="reps"
+                />
+              ))}
+            </div>
+            <div className="tnum mt-4 text-sm text-slate-300">
+              Total {draftTotal} · prescribed {baseTotal}
+            </div>
+          </Card>
+        ) : null}
+      </div>
+
+      {/* Ordered so that stacking the rail on mobile reproduces the original sequence. */}
+      <div className="flex flex-col gap-4">
+        {attemptNo >= 3 ? (
+          <Card>
+            <h3 className="font-semibold text-slate-100">Stuck on this day?</h3>
+            <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
+              Move on without hitting the number. It's marked as skipped in your history.
+            </p>
+            <Button variant="ghost" className="mt-4 w-full" onClick={onAdvanceManually}>
+              Move to the next day anyway
+            </Button>
+          </Card>
         ) : null}
 
-        <div className="mt-5 flex flex-col gap-2 sm:flex-row">
-          <Button className="flex-1" onClick={() => onStart(effectiveTargets, adjustment)}>
-            Start
-          </Button>
-          <Button
-            variant="ghost"
-            onClick={() => {
-              setAdjusting((v) => !v);
-              setDraft(adjusting ? [] : [...baseTargets]);
-            }}
-          >
-            {adjusting ? 'Reset' : 'Adjust'}
-          </Button>
-        </div>
-      </Card>
-
-      {adjusting ? (
         <Card>
-          <h3 className="font-semibold text-slate-100">Adjust the sets</h3>
-          <p className="mt-1 text-xs leading-relaxed text-slate-400">
-            Move reps between sets, or change the total for an easier or harder day.
-          </p>
-          <div className="mt-4 flex flex-col gap-3">
-            {draft.map((value, i) => (
-              <NumberField
-                key={i}
-                label={`Set ${i + 1}${amrapFlags[i] ? ' (open-ended)' : ''}`}
-                value={value}
-                min={1}
-                onChange={(next) =>
-                  setDraft((prev) => {
-                    const copy = [...prev];
-                    copy[i] = next === '' ? 1 : Math.max(1, next);
-                    return copy;
-                  })
-                }
-                suffix="reps"
-              />
-            ))}
-          </div>
-          <div className="tnum mt-4 text-sm text-slate-300">
-            Total {draftTotal} · prescribed {baseTotal}
+          <div className="grid grid-cols-3 gap-3">
+            <Stat label="Baseline" value={challenge.baseline.value} sub={challenge.baseline.source} />
+            <Stat label="Goal" value={challenge.goalValue ?? '—'} sub="plan input" />
+            <Stat label="Days done" value={`${slotsAdvanced}/${slotsTotal}`} />
           </div>
         </Card>
-      ) : null}
-
-      {attemptNo >= 3 ? (
-        <Card>
-          <h3 className="font-semibold text-slate-100">Stuck on this day?</h3>
-          <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
-            Move on without hitting the number. It's marked as skipped in your history.
-          </p>
-          <Button variant="ghost" className="mt-4 w-full" onClick={onAdvanceManually}>
-            Move to the next day anyway
-          </Button>
-        </Card>
-      ) : null}
-
-      <Card>
-        <div className="grid grid-cols-3 gap-3">
-          <Stat label="Baseline" value={challenge.baseline.value} sub={challenge.baseline.source} />
-          <Stat label="Goal" value={challenge.goalValue ?? '—'} sub="plan input" />
-          <Stat label="Days done" value={`${slotsAdvanced}/${slotsTotal}`} />
-        </div>
-      </Card>
+      </div>
     </div>
   );
 }
