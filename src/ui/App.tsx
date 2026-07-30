@@ -46,6 +46,7 @@ import { Runner } from './Runner.js';
 import { Settings } from './Settings.js';
 import { Today } from './Today.js';
 import { AddWorkout, Welcome } from './Welcome.js';
+import { TABS, type Tab } from './nav.js';
 import { buildShareCard, toStatWorkouts } from './shareCardData.js';
 import { Banner, Button, Card, NumberField, Segmented, Spinner } from './kit.js';
 // The update seam only. Nothing here imports ../pwa/lifecycle.js: that module owns the
@@ -54,14 +55,12 @@ import { Banner, Button, Card, NumberField, Segmented, Spinner } from './kit.js'
 import { shouldOfferUpdate } from '../pwa/policy.js';
 import { applyUpdate, subscribeUpdateReady } from '../pwa/updateStore.js';
 
-type Tab = 'today' | 'history' | 'settings';
 type View =
   | { kind: 'tab'; tab: Tab }
   | { kind: 'runner' }
   | { kind: 'continue' }
   | { kind: 'add-workout' };
 
-const TABS: readonly Tab[] = ['today', 'history', 'settings'];
 const TAB_KEY = 'godmode.tab';
 
 /**
