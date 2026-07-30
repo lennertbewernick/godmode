@@ -16,8 +16,8 @@ export default defineConfig({
       registerType: 'autoUpdate',
       includeAssets: ['favicon.svg'],
       manifest: {
-        name: 'Fitness Companion',
-        short_name: 'Fitness',
+        name: 'GodMode: No More Later',
+        short_name: 'GodMode',
         description: 'Progressive bodyweight challenge planner. Local-first, no accounts.',
         theme_color: '#0f172a',
         background_color: '#0f172a',
