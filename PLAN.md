@@ -1,44 +1,50 @@
 # Fitness Companion — Plan
 
-A local-first, single-tenant, open-source replacement for the "Just 6 Weeks" push-up
-challenge, built so that camera-based rep counting can be added later without a rewrite.
+A local-first, open-source, single-tenant fitness companion PWA. Replaces the "Just 6
+Weeks" freemium push-up challenge, built so camera-based rep counting can be added later
+without a rewrite.
 
 Status: planning. Nothing implemented yet.
-Source material: `example/` (one CSV export, six screenshots of the incumbent app),
-plus the confirmed baseline max test of **18**.
+License: AGPL-3.0.
+Source material: `example/` — one CSV export (29 logged sessions), six screenshots — plus
+the confirmed baseline max test of **18**.
+
+> **Epistemic status.** This document distinguishes three tiers throughout:
+> **[VERIFIED]** — confirmed against the CSV or a screenshot.
+> **[INFERRED]** — a reasonable reading of the data, not proven.
+> **[OUR CHOICE]** — a transparent design decision of ours, *not* recovered from the
+> incumbent. Earlier drafts of this plan blurred these; a Codex round-0 review
+> (`Q1–Q7`, 2026-07-30) forced the separation. Do not re-blur them.
 
 ---
 
-## 1. Reverse-engineered mechanism
+## 1. The progression model
 
-Derived from `example/incumbent-history-sample.csv` (29 logged sessions, 6 weeks,
-3134 reps), the workout cards in the screenshots, and the known baseline of 18.
+### 1.1 One percentage table [VERIFIED at two points]
 
-### 1.1 One percentage table drives everything
-
-`Ziel: 100` is a **single-set** goal — 100 push-ups in one go, not per session. The
-program works by ramping an *estimated current max* from your baseline to that goal, and
-prescribing each session as fixed percentages of wherever that estimate currently sits.
+`Ziel: 100` is a **single-set** goal — 100 push-ups in one go, not per session. The program
+ramps an *estimated current max* from baseline toward that goal and prescribes each session
+as percentages of wherever the estimate sits.
 
 ```
 SET_PERCENTAGES = [0.37, 0.47, 0.37, 0.33, 0.51]     // sums to 2.05
 ```
 
-Set 5 is a floor, displayed as `N+`. The percentages sum to **205%**, which is why the
-terminal session volume lands at ~2× the headline goal. This resolves the "it targeted
-over 200 for me" confusion: the program never asks for 100 in one set. It builds you to a
-session whose best set is `51+`, on the theory that the 100-rep test is then in reach.
+Set 5 is a floor, displayed `N+`. The percentages sum to **205%**, which is why terminal
+volume lands at ~2× the headline goal. This answers "why did it target over 200": the
+program never asks for 100 in one set — it builds toward a session whose best set is `51+`.
 
-The table is confirmed at both endpoints of the observed challenge:
-
-| | Estimated max | 37% | 47% | 37% | 33% | 51%+ | Total |
+| | Est. max | 37% | 47% | 37% | 33% | 51%+ | Total |
 |---|---|---|---|---|---|---|---|
-| **W1D1** (baseline) | 18 | 7 | 8 | 7 | 6 | 9+ | 37 |
-| **W6D3** (goal) | 100 | 37 | 47 | 37 | 33 | 51+ | 205 |
+| **W1D1** | 18 | 7 | 8 | 7 | 6 | 9+ | 37 |
+| **W6D3** | 100 | 37 | 47 | 37 | 33 | 51+ | 205 |
 
-Both rows reproduce the logged/screenshotted cards exactly. Note that at goal = 100 the
-prescribed sets *are* the percentages, which is almost certainly how the incumbent
-implements it.
+Both rows reproduce observed cards exactly. `0.37×18=6.66→7`, `0.47×18=8.46→8`,
+`0.33×18=5.94→6`, `0.51×18=9.18→9`. At goal 100 the prescribed sets *are* the percentages.
+
+**Scope of this verification.** Two endpoints, one of which (W6D3) is the *only* card we
+have from a screenshot. Every other row in the CSV is **actual reps, not prescribed
+targets**. They coincide when the user hit the prescription, but that is an inference.
 
 ### 1.2 Set shape — "medium, big, medium, small, biggest+"
 
@@ -50,249 +56,292 @@ implements it.
 | 4 | *small* | 33 |
 | 5 | **biggest+** (AMRAP) | 51 |
 
-The shape is scale-free: `7·8·7·6·9+` and `37·47·37·33·51+` are the same curve at
-different magnitudes. Set 4 dips deliberately below the medium sets so something is banked
-for the AMRAP set.
+Set 4 dips deliberately below the medium sets so something is banked for the AMRAP set.
 
-**Invariant to assert on every generated session:**
+**Invariant — non-strict.** [OUR CHOICE, corrected]
 
 ```
-set5 > set2 > set1 == set3 > set4
+set5 >= set2 >= set1 == set3 >= set4      // plus: AMRAP asserted via metadata, not ordering
 ```
 
-Naive rounding at small estimated maxima will collapse `set1 == set3` or lift `set4` above
-`set1`. The assertion catches that class of bug immediately. It is also the reason the
-generator must round each set independently rather than distributing a total.
+A strict version is **unsatisfiable at ordinary baselines** — integer rounding collapses
+adjacent roles:
 
-### 1.3 The estimated-max ramp
+```
+M=14 → 5,7,5,5,7    set5>set2 fails
+M=20 → 7,9,7,7,10   set3>set4 fails
+M=21 → 8,10,8,7,11  strict holds
+```
 
-The estimate grows **geometrically from baseline to goal** across the N sessions
-(6 weeks × 3 days = 18):
+M(2) of the reference program is 19.9, generating `7,9,7,7,10` — a strict assertion would
+fail on **slot 2 of the very program this model was derived from**. Strictness holds only
+from M≥21 for this table, and gating pull-ups behind a baseline of 21 would be absurd.
+Do not "repair" rounded output to satisfy an ordering; that changes the prescription.
+
+**Rounding must be specified, not inherited.** The invariant is sensitive at `.5`
+boundaries, so the generator pins one rule explicitly (half-up on the exact decimal, not
+`Math.round` on a float, not banker's rounding) and tests it.
+
+### 1.3 The estimated-max ramp [OUR CHOICE]
 
 ```
 M(n) = baseline × (goal / baseline) ^ ((n − 1) / (N − 1))
-
-r = (100 / 18) ^ (1/17) = 1.1061      // ≈ 10.6% per session
+r = (100 / 18) ^ (1/17) = 1.1061        // ≈ 10.6% per session
 ```
 
-Validation — exact to the rep, across the entire back half:
+**This is our transparent approximation, not a recovered algorithm.** Honest scorecard
+against the reference data — 5 of 18 slots reproduce exactly:
 
-| Session | Est. max | Model | Observed card |
-|---------|----------|-------|---------------|
-| W4D3 | 54.6 | 20 · 26 · 20 · 18 · 28 (112) | 20 · 26 · 20 · 18 · 28 ✓ |
-| W5D1 | 60.5 | 22 · 28 · 22 · 20 · 31 (123) | 22 · 28 · 22 · 20 · 31 ✓ |
-| W5D2 | 66.9 | 25 · 32 · 25 · 22 · 34 (138) | 25 · 32 · 25 · 22 · 34 ✓ |
-| W6D1 | 81.8 | 30 · 38 · 30 · 27 · 42 (167) | 30 · 38 · 30 · 27 · 42 ✓ |
-| W6D3 | 100 | 37 · 47 · 37 · 33 · 51 (205) | 37 · 47 · 37 · 33 · 51+ ✓ |
+| Slot | Model total | Observed | |
+|---|---|---|---|
+| 1 | 37 | 37 | exact ✓ |
+| 2–11 | — | — | 2–13% **low** |
+| 12 | 112 | 112 | exact ✓ |
+| 13 | 123 | 123 | exact ✓ |
+| 14 | 137 (`25·31·25·22·34`) | 138 (`25·32·25·22·34`) | −1 |
+| 15 | 151 | 156 | −5 |
+| 16 | 167 | 167 | exact ✓ |
+| 17 | 184 | 187 | −3 |
+| 18 | 205 | 205 (screenshot) | exact ✓ |
 
-Sessions 1 and 12–18 land exactly. Sessions 2–11 run ~8–10% *below* this curve (observed
-W2D2 total was 49, curve says 55). Most likely the incumbent recalibrates the remaining
-ramp from AMRAP performance rather than holding a fixed curve. Not distinguishable from a
-single export — and deliberately **not** replicated here: this project ships the explicit
-curve plus manual per-session adjustment (§2.2), which is inspectable and gives the user
-the control an opaque adaptation algorithm takes away.
+Alternative models were evaluated and rejected:
 
-### 1.4 Repeat-on-miss
+- **Calendar-position ramp** — *disproven.* The 11 repeat sessions stretched elapsed time,
+  so calendar interpolation gives M≈47.4 at W4D3 (total ~98 vs observed 112) and ~105 at
+  W5D1 (vs 123). Substantially too low mid-program.
+- **AMRAP-driven recalibration** — unsupported. Would require two trajectories to
+  distinguish; we have one. Fittable after the fact, which is not reverse engineering.
+- **Two-segment ramp** — approximates it (18→41 over slots 1–10 is ~9.6%/slot, 41→100 over
+  11–18 is ~11.8%/slot) but adds parameters with no mechanistic evidence.
+- **Precomputed nonlinear table** — the most likely explanation for the incumbent. Consumer
+  fitness apps typically ship a lookup table, in which case the endpoints tell us little
+  about the interior and no closed form exists to find.
 
-A session **passes when the sum of actual reps ≥ the session's target total**. The
-criterion is the total, not the individual sets:
+We ship the explicit geometric curve because it is inspectable and adjustable, not because
+it is what the incumbent does.
 
-- 2026-06-09: `10·13·10·9·13` = 55 → repeated.
-  2026-06-11: `10·13·10·9·14` = 56 → passed.
+### 1.4 Repeat-on-miss [VERIFIED]
+
+A session **passes when sum(actual) ≥ target total** — the total, not individual sets:
+
+- 2026-06-09 `10·13·10·9·13` = 55 → repeated; 2026-06-11 `10·13·10·9·14` = 56 → passed.
   Sets 1–4 byte-identical; only the AMRAP set differed by one rep.
 - W4D2 repeated four times, marching `92 → 98 → 104 → 108`, passing exactly at 108.
 
-A failed session still counts and is still logged. The same `(week, day)` slot simply
-produces another attempt with the same targets.
+A failed session still counts and is still logged. The slot produces another attempt.
+The final logged session was 202 against 205, which by this rule repeats.
 
-Note: the final logged session was 202 against a 205 target (48 on a `51+` set), which by
-this rule should repeat.
-
-### 1.5 Rest between sets
-
-Not directly recoverable from the CSV — the `Zeit` column bundles work and rest. Derived
-from the two known endpoints (30 s at baseline 18, ~150 s at goal 100):
+### 1.5 Rest between sets [OUR CHOICE]
 
 ```
 rest_s = clamp(round_to_5(1.46 × M(n) + 4), 30, 180)
 ```
 
-Cross-validated: solving the recorded session durations for a constant rep pace yields
-~2.2 s/rep and ~77–99 s effective rest through the middle of the program, against this
-formula's 83 s (W4D3) and 91 s (W5D1). Two independent derivations agree.
+This is **algebra through two assumed endpoints** (30 s at M=18, 150 s at M=100), giving
+slope `(150−30)/(100−18) = 1.463`. It is not independent evidence. The duration
+cross-check is underidentified: one aggregate `Zeit` per session cannot separate rep pace
+from rest from UI transitions from skipped timers. A configurable product default, nothing
+more.
 
-Rest is skippable in-workout via −/+ controls, which is why observed durations sit below
-what the ladder implies.
+### 1.6 Calories [OUR CHOICE]
 
-### 1.6 Calories — not reproducible, and that is the finding
+The incumbent's kcal column is **not explained by any simple monotonic function of reps or
+duration** — 37 reps → 13 kcal but 44 reps → 9 kcal. An external sensor feed (HealthKit /
+watch) is one plausible hypothesis, not an established finding. (Separately: the app
+paywalls the column behind `Premium` and shows `–`, yet ships values in the CSV export.)
 
-The incumbent's kcal column is **not a function of reps or duration**: 37 reps → 13 kcal,
-but 44 reps → 9 kcal. That noise signature indicates measured HealthKit / watch energy,
-not arithmetic. (The app paywalls the column behind `Premium` in the UI and shows `–`, yet
-ships the values in the CSV export anyway.)
-
-This project computes a transparent estimate instead. A push-up lifts ~65% of bodyweight
-through ~0.4 m; counting the eccentric at ~22% metabolic efficiency:
+Our own coarse estimate, order-of-magnitude only:
 
 ```
-kcal ≈ reps × bodyweight_kg × 0.003
+mechanical ≈ bodyweight_kg × 0.65 × 9.81 × 0.4 m   ≈ 204 J/rep at 80 kg
+metabolic  ≈ mechanical / 0.22                     ≈ 0.22 kcal/rep at 80 kg
+kcal       ≈ reps × bodyweight_kg × 0.003
 ```
 
-≈ 0.25 kcal/rep at 80 kg, so a 202-rep session ≈ 50 kcal. **Required body data:
-bodyweight only.** Height/age/sex add negligible accuracy for this movement; heart rate
-would help materially if a watch feed is ever added. Always labelled an estimate, never
-gated.
+The 0.65 and 0.4 m terms depend on body geometry and technique, so the coefficient is
+**configurable**, and displacement is not claimed to be height-independent. Bodyweight is
+the only required input. Always labelled an estimate, never gated.
 
-### 1.7 Remaining unknown
-
-Only one: **the early-session divergence** described in §1.3. Everything else in this
-section is confirmed against observed data at both endpoints.
+Imported kcal and computed kcal must never be conflated: store `value`, `source`
+(`external` | `estimated`), and `estimator_version` separately so a formula change does not
+silently rewrite history.
 
 ---
 
 ## 2. MVP definition
 
-The MVP is not "a push-up app". It is **the smallest thing that lets a challenge-group
-member delete the incumbent without losing anything.**
+**The smallest thing that lets a challenge-group member delete the incumbent without losing
+anything.**
 
 ### 2.1 Must-have
 
-1. **CSV import with a mapping layer** (§4.3). Group members have months of history in the
-   incumbent, possibly in different locales. An app that starts empty offers no reason to
-   switch.
-2. **Plan generator as a pure, inspectable function.**
-   `(baseline_max, goal, weeks, days_per_week) → N sessions`, seedable from imported
-   history as well as a fresh baseline test.
-3. **Adjustable segments** (§2.2).
-4. **Workout runner.** Set-by-set, rest timer with audio cue, correctable actual reps.
-   Set 5 is the screen that matters — the other four are countdown.
-5. **Repeat-on-miss.** Target missed ⇒ same slot again, still logged, showing how far
-   short ("3 reps short").
-6. **History.** List view, cumulative line chart, lifetime totals (time / reps / kcal).
-7. **Export.** Canonical JSON + CSV that round-trips the import.
-8. **Settings.** Exercise label, bodyweight, rest curve override.
+1. **CSV import** with a locale-tolerant mapping layer (§4.3)
+2. **Plan generator** — pure, inspectable, `(baseline, goal, weeks, days_per_week) → N slots`
+3. **Adjustable segments** (§2.2)
+4. **Workout runner** — set-by-set, rest timer + audio cue, correctable reps. Set 5 is the
+   screen that matters; the others are countdown
+5. **Repeat-on-miss** with explicit outcome states (§2.2)
+6. **History** — list, cumulative chart, lifetime totals
+7. **Export** — canonical JSON + CSV round-trip, with active backup prompting (§3)
+8. **Settings** — exercise label, bodyweight, rest curve override
 
-### 2.2 Adjustable segments
+### 2.2 Adjustable segments and outcome states
 
-Every prescribed set is editable, before or during a session. Two distinct operations,
-which must not be conflated:
+Two distinct operations:
 
-- **Redistribute** — move reps between sets, keeping the session total. Same stimulus,
-  different shape. Never affects pass/fail.
-- **Rescale** — change the session total itself. An easier or harder day.
+- **Redistribute** — move reps between sets, total unchanged. Never affects pass/fail.
+- **Rescale** — change the session total. An easier or harder day.
 
-Storage keeps both the generated and the effective values (`target_*` +
-nullable `override_*`), so the canonical plan is always visible and revertible, and the
-history can honestly mark a session as deviating from plan.
+Every attempt carries **one outcome**:
 
-**Open decision:** when a session is rescaled *down*, does the pass rule follow the
-adjusted total or the original? Following the adjusted total makes the plan trivially
-passable; following the original makes the adjustment pointless. Current lean: follow the
-adjusted total, but mark the session `deviated` in history and exclude it from any
-"completed as planned" count.
+| Outcome | Counted in history | Advances slot |
+|---|---|---|
+| `completed_as_planned` | yes | yes |
+| `scaled_up` | yes | yes |
+| `deload` (rescaled down) | yes | **no** |
+| `failed` (missed target) | yes | no |
+| `advanced_manually` | yes | yes — explicit, confirmed, recorded |
+
+**Rationale.** The repeat-on-miss ratchet is the engine of the program; if lowering a total
+advanced the plan, the ratchet is gone. But calling a session done while ill a "failure" is
+wrong — the work happened. So a deload is fully counted and simply does not advance.
+
+**`advanced_manually` is the required escape hatch.** Without it a user who deloads
+repeatedly is stuck on one slot forever. It demands explicit confirmation and is recorded,
+never inferred from a deload.
+
+**Three separate metrics, never conflated** — otherwise deloading inflates a streak while
+dodging failure:
+
+- **Activity streak** — any logged workout
+- **Plan compliance** — `completed_as_planned` + `scaled_up` only
+- **Challenge progress** — advanced slots / total slots
+
+On the cumulative chart, the *planned* line advances once per slot; the *actual* line
+includes every attempt and deload. Both labelled.
 
 ### 2.3 Explicitly out of MVP
 
-Multiple concurrent challenges · exercises beyond a free-text label · accounts · sync ·
-social/leaderboard features · vision rep counting · notifications · watch app.
+Multiple concurrent challenges · accounts · sync · leaderboard · vision rep counting ·
+notifications · watch app · i18n (English UI only) · user-defined set counts (phase 2).
 
 ### 2.4 No exercise illustrations
 
-Exercises are a **label/identifier only**. No artwork, animation, or demo video. This
-removes the largest asset-production cost and is the main reason the MVP is finishable.
+Exercises are a **label/identifier only** — no artwork, animation, or demo video. This
+removes the largest asset cost and is the main reason the MVP is finishable.
 
 ---
 
 ## 3. Architecture
 
-**Local-first PWA. No backend, ever.**
+**Local-first PWA. No backend in the MVP.**
+
+(Not "no backend ever" — a future group-comparison feature may need one. The defensible
+scope statement is MVP-bounded.)
 
 | Concern | Choice | Why |
-|---------|--------|-----|
-| Build | Vite + TypeScript | Fast, boring, no config drift |
+|---|---|---|
+| Build | Vite + TypeScript | Boring, no config drift |
 | UI | React + Tailwind | Largest body of MediaPipe examples for phase 5 |
-| Storage | IndexedDB (via `idb`), versioned schema | Reliable on iOS Safari; SQLite-wasm/OPFS still dicey there |
-| Charts | Hand-rolled SVG | One line chart does not justify a dependency |
+| Storage | IndexedDB (`idb`), versioned schema | Reliable on iOS Safari; SQLite-wasm/OPFS still dicey there |
+| Charts | Hand-rolled SVG | One line chart needs no dependency |
 | Tests | Vitest | Generator is pure — heavily unit-tested |
 | Offline | Service worker, installable | Must work mid-workout with no signal |
-| Backend | none | Keeps "single tenant, local app" true at every stage |
 
-Phase 5 decision: **browser-side pose detection** (MediaPipe Tasks Vision), *not* Python.
-Python + MediaPipe cannot run on an iPhone, and the phone propped against a wall is the
-actual use case. The browser path uses the same underlying model family, runs on-device,
-and preserves the offline property. Python stays available later for desktop offline video
-analysis, off the critical path.
+**Storage durability is a real risk.** iOS evicts IndexedDB for unused sites, and the device
+is the only copy. JSON export existing is not sufficient — onboarding must explain it, and
+the app must actively prompt for a backup on a cadence. Treat data loss as a product
+concern, not a footnote.
 
-The plan generator, pass rule, and rest curve live in a pure `core/` module with no DOM and
-no storage imports. That module is the part worth getting right.
+Phase 5 uses **browser-side pose detection** (MediaPipe Tasks Vision), not Python: Python
+can't run on an iPhone, and the phone propped against a wall is the actual use case.
+
+The generator, pass rule, and rest curve live in a pure `core/` module with no DOM and no
+storage imports.
 
 ### 3.1 Distributing to the challenge group
 
-One static deployment at a URL. Each member opens it, installs to home screen, imports
-their own CSV. Storage is per-device, so "single tenant" and "shareable with the group"
-are not in tension — there are N isolated local datasets and zero accounts.
+One static deployment. Each member opens it, installs to home screen, imports their own
+CSV. Storage is per-device, so "single tenant" and "shareable" are not in tension — N
+isolated datasets, zero accounts. Requires: works unaided on a fresh iPhone from a link;
+per-person baseline and goal; nothing hardcoded to push-ups or to 100.
 
-Requirements this imposes:
-
-- Must work for a non-technical user on a fresh iPhone with no setup beyond opening a link
-- Import must tolerate locale variation in their exports (§4.3)
-- Baseline and goal must be settable per person; nothing hardcoded to push-ups or to 100
-- Full JSON export/import, so a phone change does not lose history
+Group comparison, if built, is a **manual share card** (export an image or JSON summary to
+paste into the group chat). Post-MVP.
 
 ---
 
 ## 4. Data model
 
 ```
-exercise      id, label, unit='reps', created_at
+exercise        id, label, unit='reps', created_at
 
-challenge     id, exercise_id, goal, weeks, days_per_week,
-              baseline_max, growth_rate, started_at, completed_at, status
+exercise_template  id, exercise_id, set_count,
+                   coefficients[]        -- ordered, e.g. [.37,.47,.37,.33,.51]
+                   roles[]               -- medium|big|small|amrap
+                   -- data, not code. Phase 0 ships exactly one: 5-set push-up.
 
-plan_slot     id, challenge_id, ordinal, week, day, estimated_max,
-              target_set1..target_set5, target_total, rest_s,
-              override_set1..override_set5, override_total, deviated
+challenge       id, exercise_id, template_id, goal, weeks, days_per_week,
+                baseline_max, growth_rate, started_at, completed_at, status
 
-workout       id, challenge_id, plan_slot_id, attempt_no,
-              performed_at, duration_s, kcal_estimate, note
+plan_slot       id, challenge_id, ordinal, week, day, estimated_max, rest_s
+                -- IMMUTABLE generated targets only
 
-workout_set   id, workout_id, index, target, actual,
-              started_at, ended_at, rest_after_s
+plan_slot_target  id, plan_slot_id, index, reps, role, is_amrap
+                  -- child rows, NOT fixed columns
 
-settings      bodyweight_kg, rest_curve_override, locale, ...
+workout         id, challenge_id, plan_slot_id (nullable), attempt_no,
+                performed_at, duration_s, note,
+                outcome, adjustment_type, scale_factor, effective_total
+                -- effective targets + deviation live HERE, per attempt
+
+workout_set     id, workout_id, index, effective_target, actual,
+                started_at, ended_at, rest_after_s
+
+kcal_record     workout_id, value, source, estimator_version
+
+settings        bodyweight_kg, kcal_coefficient, rest_curve_override, ...
 ```
 
-### 4.1 The one modelling decision that matters
+### 4.1 The decisions that matter
 
-`plan_slot → workout` is **1:N**, not 1:1. Repeats mean a single `(week, day)` slot
-accumulates multiple attempts. Conflating plan with log is the mistake that forces a
-schema migration later. Targets live on the slot; actuals live on the workout.
+**`plan_slot → workout` is 1:N.** Repeats mean one `(week, day)` slot accumulates attempts.
+
+**Overrides live on `workout`, not `plan_slot`.** Each attempt can adjust differently —
+attempt 1 redistributes, attempt 2 deloads, attempt 3 scales up. A single override field on
+the slot overwrites history and makes past pass/fail decisions unreconstructable. `plan_slot`
+targets are immutable once generated.
+
+**Targets are child rows, not five columns.** This is what makes variable set counts a
+later feature rather than a migration.
+
+**`plan_slot_id` is nullable.** Imported workouts that don't reconcile to a generated slot
+are stored unlinked rather than force-fitted.
+
+**`(week, day)` is not globally unique** — reconciliation keys on challenge identity too.
 
 ### 4.2 Improvement over the incumbent
 
 `workout_set` records per-set timestamps. The incumbent stores one aggregate duration,
-which is why rest had to be reverse-engineered at all (§1.5). Capturing it is free at
-write time and makes real rest analysis possible.
+which is exactly why rest had to be guessed (§1.5). Free at write time.
 
 ### 4.3 Import: a four-stage pipeline
 
-Parsing and committing are separated by an explicit serialized intermediate, so import is
-testable, reviewable, and shareable.
-
 ```
-raw file  →  [1] parse  →  rows
-          →  [2] map (profile)  →  canonical JSON
-          →  [3] validate  →  report
-          →  [4] commit  →  DB
+raw file → [1] parse → rows → [2] map (profile) → canonical JSON
+         → [3] validate → report → [4] commit → DB
 ```
 
-**Stage 2 — mapping profiles.** Declarative, positional, one per source dialect:
+**Positional mapping profiles.** Because mapping is positional, translated headers do *not*
+require separate profiles — only differing value formats do. So one tolerant
+`incumbent-csv-v1` profile covers the 14-column semicolon layout across languages, with date
+format detected rather than assumed:
 
 ```json
 {
-  "id": "incumbent-csv-de",
+  "id": "incumbent-csv-v1",
   "delimiter": ";",
-  "dateFormat": "d.M.yyyy HH:mm",
+  "dateFormats": ["d.M.yyyy HH:mm", "M/d/yyyy HH:mm"],
   "durationFormat": "mm:ss",
   "columns": {
     "date": 0, "exercise": 1, "goal": 2, "challengeLength": 3,
@@ -302,27 +351,22 @@ raw file  →  [1] parse  →  rows
 }
 ```
 
-Profiles are **data, not code**, so group members on other locales can contribute one
-without touching the parser. `incumbent-csv-en` and friends live beside `incumbent-csv-de`.
+**Why positional.** The export has **two columns both named `Zeit`** — index 3 is the
+challenge length (`"6 Wochen"`), index 6 is the session duration (`mm:ss`). Header-keyed
+parsing risks collapsing them depending on the library's duplicate-header behaviour; some
+return row arrays or support header transforms, so this is a concrete hazard rather than a
+universal failure. Positional mapping removes the question.
 
-**Why positional indices, not header names:** the incumbent's export has **two columns both
-named `Zeit`** — column 4 is the challenge length (`"6 Wochen"`), column 7 is the session
-duration (`mm:ss`). Any name-keyed parser (`csv.DictReader`, most JS libraries with
-`header: true`) silently drops one and corrupts the import without erroring. Positional
-mapping makes the bug structurally impossible.
+**Canonical JSON** is the real interchange format: what exports produce, what fixtures are
+written in, and what a group member sends when reporting an import bug.
 
-**Stage 2 output — canonical JSON.** The serialized intermediate is the project's real
-interchange format. It is what gets exported, what test fixtures are written in, what a
-group member sends when reporting an import bug, and what survives a schema change.
+**Reconciliation.** Attach imported workouts to generated slots by `(challenge, week, day)`
+and report disagreements. **Never manufacture prescribed targets from actual reps** — the
+CSV contains actuals only, and the model's own slots 2–11 diverge from the reference data
+(§1.3), so forcing agreement would fabricate history. Unreconcilable rows stay unlinked.
 
-**Stage 3 — reconciliation.** Generate the canonical plan from `goal` + `baseline`, attach
-imported workouts to slots by `(week, day)`, and report where generated targets disagree
-with observed set maxima. Observed values are ground truth; disagreement is a warning, not
-a failure. Expect disagreement on sessions 2–11 per §1.3.
-
-Other dialect details: dates are unpadded (`29.5.2026 08:34`); rows ascend by date;
-repeated `(week, day)` pairs are repeat attempts; `kcal` is imported but flagged
-`source=external` and excluded from our own estimates.
+Other dialect facts: dates unpadded (`29.5.2026 08:34`); rows ascend by date; repeated
+`(week, day)` pairs are attempts; `kcal` imported with `source=external`.
 
 ---
 
@@ -331,36 +375,43 @@ repeated `(week, day)` pairs are repeat attempts; `kcal` is imported but flagged
 MVP is phases 0–4.
 
 | Phase | Scope | Done when |
-|-------|-------|-----------|
-| **0** | Repo, TS, `core/` generator + pass rule + rest curve, unit tests | Reproduces every card in §1.1 and §1.3 exactly; invariant §1.2 asserted |
-| **1** | Import pipeline, mapping profiles, canonical JSON, IndexedDB schema | The existing 29-session CSV imports and re-exports round-trip clean |
-| **2** | Workout runner, rest timer, audio cue, rep correction, repeat logic, segment adjustment | A full session can be logged offline on a phone |
-| **3** | History list, cumulative chart, lifetime totals, kcal estimate | Matches the incumbent's stats screen, minus the paywall |
-| **4** | PWA polish — installable, offline, iOS home screen; deploy for the group | A group member can go from link to imported history unaided |
-| **5** | *Post-MVP:* MediaPipe pose rep counting | — |
+|---|---|---|
+| **0** | Repo, TS, `core/` generator + pass rule + rest curve + explicit rounding; template-as-data with one 5-set push-up template | Reproduces §1.1 endpoints exactly; §1.2 non-strict invariant asserted across M=1..200; rounding rule tested at `.5` |
+| **1** | Import pipeline, `incumbent-csv-v1` profile, canonical JSON, IndexedDB schema | The real 29-session CSV imports and round-trips; unreconciled rows land unlinked |
+| **2** | Runner, rest timer, audio, rep correction, outcome states, segment adjustment | A full session logs offline on a phone; all five outcomes reachable |
+| **3** | History list, cumulative chart (planned vs actual), three metrics, kcal | Matches the incumbent's stats screen, minus the paywall |
+| **4** | PWA polish, backup prompting, deploy for the group | A group member goes link → imported history unaided |
+| **5** | *Post-MVP:* MediaPipe rep counting; manual share card; user-defined set counts | — |
 
-### Phase 5 sketch (not MVP)
+### Phase 5 sketch
 
 `PoseLandmarker` in a Web Worker; rep counting as an elbow-angle state machine with
 hysteresis to reject partials; form checks via shoulder–hip–ankle collinearity (hip sag)
-and elbow depth. Behind a `RepSource` interface with `manual` and `vision`
-implementations, so the runner does not care which is active. Defining that interface in
-phase 2 is the only phase-5 concession the MVP makes.
+and elbow depth. Behind a `RepSource` interface (`manual` | `vision`) so the runner doesn't
+care which is active. Defining that interface in phase 2 is the only phase-5 concession the
+MVP makes.
 
 ---
 
-## 6. Open questions
+## 6. Resolved decisions
 
-1. **Which exercises does the group do?** The 37/47/37/33/51 table is validated only for
-   push-ups at baseline 18 → goal 100. A pull-up challenge at baseline 5 would prescribe
-   `2·2·2·2·3+`, where integer rounding dominates and the §1.2 invariant may be
-   unsatisfiable. Low-rep movements likely need their own table or a floor rule.
-2. **"Segments adjustable" — values only, or also the number of sets?** Editing the five
-   values is straightforward. Allowing 4 or 6 sets means the percentage table stops being
-   a fixed 5-tuple and becomes a shape function.
-3. **Pass rule under downward rescale** — see §2.2.
-4. **Locale spread of the group's exports** — determines which mapping profiles ship first.
-5. **Progress comparison.** A "challenge group" implies wanting to compare. Fully local
-   means no leaderboard without a backend. A manual export/share card is the no-backend
-   compromise — is that enough?
-6. **License.** MIT vs AGPL.
+| Decision | Choice |
+|---|---|
+| Exercises | Template/coefficients as per-exercise data; only 5-set push-ups ships in phase 0 |
+| Set count | Generic storage now (child rows); user-defined counts post-MVP |
+| Downward rescale | Counted, does not advance; `advanced_manually` is the escape hatch |
+| Group comparison | Manual share card, post-MVP. No backend in MVP |
+| UI language | English only, no i18n |
+| Import locale | One tolerant positional profile; date format detected |
+| License | AGPL-3.0 |
+
+## 7. Remaining unknowns
+
+1. **The incumbent's true interior progression.** Slots 2–11 are unexplained (§1.3). Most
+   likely a precomputed table with no closed form. We do not need to solve this — we ship
+   our own transparent curve — but no future claim should assert we recovered it.
+2. **Low-rep exercises.** A pull-up-style challenge (baseline ~5) needs its own template
+   and progression, not a threshold switch into another unvalidated table. Blocked on a
+   real use case and fixtures.
+3. **English export format.** No English CSV sample exists. The `dateFormats` list is a
+   guess until someone supplies a real file.
