@@ -68,6 +68,24 @@ type View =
 const TAB_KEY = 'godmode.tab';
 
 /**
+ * Whether the workout row offers "add a workout".
+ *
+ * Off deliberately, 2026-07-30. Everything behind this flag works — the flow builds a real
+ * challenge — but it can only ever build ONE shape of plan: `percentage-ramp`, parameterised by
+ * goal, weeks and days per week. `repo.ts` names that pattern directly rather than resolving the
+ * `patternId` it already stores, and the form's fields are that pattern's parameters, not
+ * universal ones. A general-looking "+" therefore promises a generality the app does not have.
+ *
+ * Turning this back to `true` is the whole change. What should come first is in
+ * `.planning/BACKLOG.md` → "Richer workouts and plans": the pattern registry, then a second
+ * pattern worth choosing between.
+ *
+ * While this is false there is NO way to add a second workout in the UI. That is intended and
+ * was asked for — do not "fix" it without asking.
+ */
+const ADD_WORKOUT_ENABLED = false;
+
+/**
  * The open tab survives a reload. localStorage rather than the settings record because it is a
  * UI position, not user data — it should not travel in a backup or overwrite the tab on another
  * device when one is restored.
@@ -724,9 +742,12 @@ function WorkoutBar({
   onSelect: (challengeId: string) => void;
   onAddWorkout: () => void;
 }) {
-  // items-stretch, not items-center: the add button below has no line box of its own, so it
-  // would sit at its min-h-9 floor while the chips are pushed past it by their 24px line box.
-  // Stretching lets it inherit whatever height the chips settle at instead of restating it.
+  // items-stretch, not items-center, and it is there for the add button specifically: that
+  // button has no line box of its own, so it would sit at its min-h-9 floor while the chips are
+  // pushed past it by their 24px line box. Stretching lets it inherit whatever height the chips
+  // settle at instead of restating it. With ADD_WORKOUT_ENABLED false the row is chips only and
+  // this makes no visible difference — it is kept so re-enabling the button stays a one-word
+  // change rather than a one-word change plus a layout regression.
   return (
     <div className="flex flex-wrap items-stretch gap-2">
       <div className="flex flex-wrap gap-2" role="tablist" aria-label="Workout">
@@ -758,15 +779,20 @@ function WorkoutBar({
         glyph inside the height the row hands it. It stays outside the tablist — it selects
         nothing. If the chips wrap, this drops to its own flex line rather than stretching to
         the wrapped block, which is why stretching is safe here.
+
+        Hidden while ADD_WORKOUT_ENABLED is false — see the flag for why, and note that the
+        markup is kept rather than deleted so restoring it costs nothing.
       */}
-      <button
-        type="button"
-        aria-label="Add a workout"
-        onClick={onAddWorkout}
-        className="inline-flex min-h-9 items-center justify-center rounded-xl border border-[#33405c] px-3 py-1.5 text-sm text-slate-300 transition-colors hover:bg-[#1c2740]"
-      >
-        <PlusGlyph />
-      </button>
+      {ADD_WORKOUT_ENABLED ? (
+        <button
+          type="button"
+          aria-label="Add a workout"
+          onClick={onAddWorkout}
+          className="inline-flex min-h-9 items-center justify-center rounded-xl border border-[#33405c] px-3 py-1.5 text-sm text-slate-300 transition-colors hover:bg-[#1c2740]"
+        >
+          <PlusGlyph />
+        </button>
+      ) : null}
     </div>
   );
 }
