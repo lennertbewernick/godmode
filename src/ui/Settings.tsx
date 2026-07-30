@@ -17,9 +17,6 @@ export function Settings({
   workoutCount,
   active,
   labels,
-  selectedId,
-  onSelectChallenge,
-  onAddWorkout,
   onEndWorkout,
   onSave,
   onOpenExport,
@@ -31,9 +28,6 @@ export function Settings({
   workoutCount: number;
   active: ChallengeRecord[];
   labels: Map<string, string>;
-  selectedId: string;
-  onSelectChallenge: (challengeId: string) => void;
-  onAddWorkout: () => void;
   onEndWorkout: (challengeId: string) => void;
   onSave: (patch: Partial<SettingsRecord>) => void;
   /** Opens the one export sheet. Restore stays here, because it is import and it destroys. */
@@ -53,12 +47,12 @@ export function Settings({
   return (
     <div className="flex flex-col gap-4 lg:grid lg:grid-cols-2 lg:items-start">
       <Card>
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <h3 className="font-semibold text-slate-100">Your workouts</h3>
-          <Button variant="ghost" onClick={onAddWorkout}>
-            Add a workout
-          </Button>
-        </div>
+        {/*
+          An inventory, not a selector. The workout row above Today and History owns selection
+          outright, and it hosts the "add a workout" control that used to sit in this header —
+          one fact, one idiom, one place.
+        */}
+        <h3 className="font-semibold text-slate-100">Your workouts</h3>
         <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
           Anything you can count gets its own plan and its own history. Sit-ups, squats,
           pull-ups, dips.
@@ -67,27 +61,16 @@ export function Settings({
         <ul className="mt-4 flex flex-col divide-y divide-[#26324b]">
           {active.map((challenge) => {
             const label = labels.get(challenge.exerciseId) ?? 'Exercise';
-            const isSelected = challenge.id === selectedId;
             return (
               <li key={challenge.id} className="flex items-center justify-between gap-3 py-3">
                 <div className="min-w-0">
-                  <div className="truncate text-sm font-medium text-slate-100">
-                    {label}
-                    {isSelected ? (
-                      <span className="ml-2 text-xs font-normal text-teal-300">showing</span>
-                    ) : null}
-                  </div>
+                  <div className="truncate text-sm font-medium text-slate-100">{label}</div>
                   <div className="tnum mt-0.5 text-xs text-slate-400">
                     from {challenge.baseline.value} toward {challenge.goalValue ?? '—'} · started{' '}
                     {challenge.startedAt.slice(0, 10)}
                   </div>
                 </div>
                 <div className="flex shrink-0 gap-2">
-                  {isSelected ? null : (
-                    <Button variant="ghost" onClick={() => onSelectChallenge(challenge.id)}>
-                      Show
-                    </Button>
-                  )}
                   <Button variant="subtle" onClick={() => setConfirmEnd(challenge.id)}>
                     End
                   </Button>
@@ -228,7 +211,13 @@ export function Settings({
             <dd className="text-slate-200">{exerciseLabel}</dd>
           </div>
           <div className="flex justify-between gap-3">
-            <dt className="text-slate-400">Sessions stored</dt>
+            {/*
+              Scoped, and now said rather than implied. `workoutCount` is the selected
+              challenge's session count, while the app also holds a database-wide total (the
+              backup nag uses it). With no selection control left in Settings, leaning on the
+              adjacent "Exercise" row to carry the scope is weaker than stating it.
+            */}
+            <dt className="text-slate-400">Sessions for this exercise</dt>
             <dd className="tnum text-slate-200">{workoutCount}</dd>
           </div>
           <div className="flex justify-between gap-3">

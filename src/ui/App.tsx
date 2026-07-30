@@ -535,9 +535,6 @@ export function App() {
             workoutCount={state.workouts.length}
             active={state.active}
             labels={state.labels}
-            selectedId={state.challenge.id}
-            onSelectChallenge={(id) => void selectChallenge(id)}
-            onAddWorkout={() => setView({ kind: 'add-workout' })}
             onEndWorkout={(id) => void endWorkout(id)}
             onSave={(patch) => {
               void saveSettings(patch).then(() => {
