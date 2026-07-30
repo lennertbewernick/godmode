@@ -150,9 +150,16 @@ achievement:
 
 | | What it means |
 |---|---|
-| **Streak** | Days in a row you showed up at all |
+| **Streak** | Sessions in a row where you kept the rhythm |
 | **Compliance** | How often you actually hit the prescribed number |
 | **Progress** | How far through the plan you are |
+
+**Streak counts sessions, not calendar days**, and that distinction matters more than it sounds.
+A three-day-a-week plan has rest days built into it. Counting consecutive *days* would score
+someone who never missed a single session at "1 day, best 1 day" forever — it would punish
+following the plan. So a session counts toward your streak as long as it lands within the spacing
+your plan expects, plus a day of slack. Disappear for a week and it breaks, which is the thing
+actually worth knowing.
 
 You can deload every session and keep a perfect streak. That is fine — showing up matters — but
 it should not look like you are hitting your numbers, so it doesn't.

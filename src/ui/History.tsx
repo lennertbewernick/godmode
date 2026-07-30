@@ -14,6 +14,7 @@ import {
   cumulativeSeries,
   formatDuration,
   lifetimeTotals,
+  rhythmGapDays,
   sessionSeries,
   type StatSlot,
   type StatWorkout,
@@ -44,6 +45,7 @@ export function History({
   slots,
   exerciseLabel,
   scopedToOneWorkout,
+  daysPerWeek,
   onExportCsv,
   onExportJson,
 }: {
@@ -52,6 +54,8 @@ export function History({
   exerciseLabel: string;
   /** True when more than one workout exists, so the scope needs stating. */
   scopedToOneWorkout: boolean;
+  /** Sets the streak's rest-day tolerance. See `rhythmGapDays`. */
+  daysPerWeek: number;
   onExportCsv: () => void;
   onExportJson: () => void;
 }) {
@@ -80,7 +84,7 @@ export function History({
   );
 
   const totals = lifetimeTotals(statWorkouts);
-  const metrics = computeMetrics(statWorkouts, statSlots);
+  const metrics = computeMetrics(statWorkouts, statSlots, rhythmGapDays(daysPerWeek));
   const perSession = sessionSeries(statWorkouts, statSlots);
   const cumulative = cumulativeSeries(statWorkouts, statSlots);
   const slotById = useMemo(() => new Map(slots.map((s) => [s.id, s])), [slots]);
@@ -142,8 +146,8 @@ export function History({
           <div className="mt-4 grid grid-cols-3 gap-3">
             <Stat
               label="Streak"
-              value={`${metrics.activityStreak}d`}
-              sub={`best ${metrics.longestActivityStreak}d`}
+              value={metrics.activityStreak}
+              sub={`sessions · best ${metrics.longestActivityStreak}`}
             />
             <Stat
               label="Compliance"

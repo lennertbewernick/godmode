@@ -72,7 +72,10 @@ const ADVANCING_OUTCOMES: WorkoutOutcome[] = [
 const COMPLIANT_OUTCOMES: WorkoutOutcome[] = ['completed_as_planned', 'scaled_up'];
 
 export interface Metrics {
-  /** Consecutive calendar days with at least one workout, counting back from the latest. */
+  /**
+   * Consecutive sessions kept in rhythm, counting back from the latest. Not calendar days —
+   * see `rhythmGapDays` for why that reading is actively misleading here.
+   */
   activityStreak: number;
   /** Longest such run anywhere in the history. */
   longestActivityStreak: number;
@@ -91,10 +94,35 @@ function dayKey(iso: string): string {
   return iso.slice(0, 10);
 }
 
-export function activityStreaks(workouts: StatWorkout[]): {
-  current: number;
-  longest: number;
-} {
+/** Rest-day tolerance for a three-day-a-week programme, the common case. */
+export const DEFAULT_RHYTHM_GAP_DAYS = 4;
+
+/**
+ * The largest gap between sessions that still counts as keeping the rhythm.
+ *
+ * Counting *consecutive calendar days* is the obvious reading of "streak" and it is wrong for
+ * this app. A three-day-a-week programme has rest days built into it, so a user following the
+ * plan perfectly trains with two-day gaps and would score a streak of 1 forever — the metric
+ * would punish compliance and reward nothing.
+ *
+ * This is measured, not assumed: across the 29-session reference history the gaps are 2, 3 or 4
+ * days and there is not a single instance of two consecutive days. A calendar-day streak on that
+ * data reads "1, best 1", which is worse than showing nothing.
+ *
+ * So a streak here counts consecutive *sessions* whose spacing is consistent with the plan:
+ * `ceil(7 / daysPerWeek)` days, plus one day of slack for real life. Three a week tolerates four
+ * days; daily training tolerates two. Miss enough that the gap exceeds it and the streak breaks,
+ * which is the thing worth knowing.
+ */
+export function rhythmGapDays(daysPerWeek: number): number {
+  if (!Number.isFinite(daysPerWeek) || daysPerWeek <= 0) return DEFAULT_RHYTHM_GAP_DAYS;
+  return Math.ceil(7 / daysPerWeek) + 1;
+}
+
+export function activityStreaks(
+  workouts: StatWorkout[],
+  maxGapDays: number = DEFAULT_RHYTHM_GAP_DAYS,
+): { current: number; longest: number } {
   if (workouts.length === 0) return { current: 0, longest: 0 };
 
   const days = [...new Set(workouts.map((w) => dayKey(w.performedAt)))].sort();
@@ -105,15 +133,19 @@ export function activityStreaks(workouts: StatWorkout[]): {
     const prev = new Date(`${days[i - 1]!}T00:00:00Z`).getTime();
     const cur = new Date(`${days[i]!}T00:00:00Z`).getTime();
     const gapDays = Math.round((cur - prev) / 86_400_000);
-    run = gapDays === 1 ? run + 1 : 1;
+    run = gapDays <= maxGapDays ? run + 1 : 1;
     longest = Math.max(longest, run);
   }
 
   return { current: run, longest };
 }
 
-export function computeMetrics(workouts: StatWorkout[], slots: StatSlot[]): Metrics {
-  const streaks = activityStreaks(workouts);
+export function computeMetrics(
+  workouts: StatWorkout[],
+  slots: StatSlot[],
+  maxGapDays: number = DEFAULT_RHYTHM_GAP_DAYS,
+): Metrics {
+  const streaks = activityStreaks(workouts, maxGapDays);
   const compliant = workouts.filter((w) => COMPLIANT_OUTCOMES.includes(w.outcome)).length;
   const slotsAdvanced = slots.filter((s) => s.status === 'completed').length;
   const slotsTotal = slots.length > 0 ? slots.length : undefined;

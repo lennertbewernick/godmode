@@ -2,10 +2,12 @@ import { describe, expect, it } from 'vitest';
 import {
   activityStreaks,
   computeMetrics,
+  DEFAULT_RHYTHM_GAP_DAYS,
   cumulativeSeries,
   formatClock,
   formatDuration,
   lifetimeTotals,
+  rhythmGapDays,
   sessionSeries,
   type StatSlot,
   type StatWorkout,
@@ -108,6 +110,82 @@ describe('STAT-05 — three metrics that must not be conflated', () => {
 
   it('returns zero compliance for an empty history rather than dividing by zero', () => {
     expect(computeMetrics([], []).planCompliance).toBe(0);
+  });
+});
+
+describe('rhythm tolerance', () => {
+  it('allows a four-day gap on a three-day-a-week plan', () => {
+    // ceil(7/3) = 3 days between sessions, plus one day of slack.
+    expect(rhythmGapDays(3)).toBe(4);
+  });
+
+  it('tightens as the plan gets more frequent and loosens as it gets rarer', () => {
+    expect(rhythmGapDays(7)).toBe(2);
+    expect(rhythmGapDays(4)).toBe(3);
+    expect(rhythmGapDays(2)).toBe(5);
+    expect(rhythmGapDays(1)).toBe(8);
+  });
+
+  it('falls back rather than dividing by zero or worse', () => {
+    expect(rhythmGapDays(0)).toBe(DEFAULT_RHYTHM_GAP_DAYS);
+    expect(rhythmGapDays(-3)).toBe(DEFAULT_RHYTHM_GAP_DAYS);
+    expect(rhythmGapDays(Number.NaN)).toBe(DEFAULT_RHYTHM_GAP_DAYS);
+  });
+});
+
+describe('activity streaks — sessions in rhythm, not calendar days', () => {
+  /**
+   * The regression this metric exists to fix. Across the 29-session reference history every gap
+   * is 2, 3 or 4 days and there is not one instance of two consecutive days — so a
+   * calendar-day streak reads "1, best 1" for a user who never missed a session.
+   */
+  it('does not collapse to 1 on a three-a-week schedule that was followed perfectly', () => {
+    const monWedFri = [
+      '2026-01-05', '2026-01-07', '2026-01-09',
+      '2026-01-12', '2026-01-14', '2026-01-16',
+      '2026-01-19', '2026-01-21', '2026-01-23',
+    ].map((d) => w(d, 100));
+
+    const streaks = activityStreaks(monWedFri, rhythmGapDays(3));
+    expect(streaks.current).toBe(9);
+    expect(streaks.longest).toBe(9);
+  });
+
+  it('survives the exact gap pattern of the real 29-session history', () => {
+    // Gaps observed in the reference export: 2, 3 and one 4. None should break the run.
+    const gaps = [2, 2, 3, 2, 2, 2, 3, 2, 4, 2, 2, 2];
+    let day = new Date(Date.UTC(2026, 4, 29));
+    const workouts = [w(day.toISOString().slice(0, 10), 100)];
+    for (const gap of gaps) {
+      day = new Date(day.getTime() + gap * 86_400_000);
+      workouts.push(w(day.toISOString().slice(0, 10), 100));
+    }
+
+    expect(activityStreaks(workouts, rhythmGapDays(3)).current).toBe(gaps.length + 1);
+  });
+
+  it('breaks when a whole week goes missing', () => {
+    const streaks = activityStreaks(
+      [w('2026-01-05', 100), w('2026-01-07', 100), w('2026-01-19', 100)],
+      rhythmGapDays(3),
+    );
+    expect(streaks.current).toBe(1);
+    expect(streaks.longest).toBe(2);
+  });
+
+  it('breaks a five-day gap on a three-a-week plan — that is a skipped session', () => {
+    expect(
+      activityStreaks([w('2026-01-05', 100), w('2026-01-10', 100)], rhythmGapDays(3)).current,
+    ).toBe(1);
+  });
+
+  it('holds a daily plan together across one rest day but not two', () => {
+    expect(
+      activityStreaks([w('2026-01-05', 10), w('2026-01-07', 10)], rhythmGapDays(7)).current,
+    ).toBe(2);
+    expect(
+      activityStreaks([w('2026-01-05', 10), w('2026-01-08', 10)], rhythmGapDays(7)).current,
+    ).toBe(1);
   });
 });
 

@@ -71,6 +71,17 @@ function storedTab(): Tab {
   }
 }
 
+/**
+ * How often the plan expects you to train, from the challenge's own pattern params.
+ *
+ * `patternParams` is deliberately an opaque record — a future pattern will not share the
+ * percentage ramp's fields — so this reads defensively rather than casting.
+ */
+function daysPerWeek(challenge: ChallengeRecord): number {
+  const raw = challenge.patternParams['daysPerWeek'];
+  return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : 3;
+}
+
 function rememberTab(tab: Tab): void {
   try {
     window.localStorage.setItem(TAB_KEY, tab);
@@ -416,6 +427,7 @@ export function App() {
             slots={state.slots}
             exerciseLabel={state.exerciseLabel}
             scopedToOneWorkout={state.active.length > 1}
+            daysPerWeek={daysPerWeek(state.challenge)}
             onExportCsv={exportCsv}
             onExportJson={() => void exportJson()}
           />
