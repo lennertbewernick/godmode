@@ -195,24 +195,36 @@ variation. Switch to per session.
 works out roughly how much energy the work took. It is shown because there is no reason to hide
 it, but treat it as a ballpark.
 
+## Where your data lives
+
+Your training lives in one SQLite file on **your own server** — a file you can see, copy and back
+up. No account, nobody's database but yours, and the same history on your laptop and your phone.
+
+You sign in once with a token the server prints (`npm run token`). It is exchanged for a session
+cookie your browser holds and JavaScript cannot read.
+
+**The one thing that still lives in the browser** is a workout you are in the middle of, and a
+workout you finished with no connection. The second one matters: it sits in this browser until
+the server takes it, and iOS can clear storage for web apps you have not opened in a while. The
+app tells you when anything is waiting — **do not reinstall or clear site data while it is**.
+Everything else is on the server; clearing the browser costs you nothing.
+
 ## Backups — please read this one
 
-Your data is stored on your phone and nowhere else. That is the point: no account, no server,
-nobody's database but yours.
+Every so often, go to **Settings → Export…**. It saves one file. Put it somewhere that is not
+your server — cloud drive, email to yourself, anywhere. GodMode will nag you about this. Let it.
 
-It also means **if you lose the phone, or iOS clears the storage, the data is gone.** iOS does
-sometimes wipe storage for web apps you have not opened in a while.
+Restoring one is done on the server rather than in the app, because it replaces everything:
 
-So: every so often, go to **Settings → Export backup**. It saves one file. Put it somewhere that
-is not your phone — cloud drive, email to yourself, anywhere. If you ever need it, **Settings →
-Restore from a backup** puts everything back.
+```sh
+npm run import-backup -- backup.json --target godmode.sqlite --dry-run   # rehearse
+npm run import-backup -- backup.json --target godmode.sqlite             # do it
+```
 
-GodMode will nag you about this. Let it.
-
-Restoring **replaces** everything currently on the device, so it checks the file first. A backup
-that is damaged, truncated, or missing a section is refused outright with nothing changed, and a
-backup containing no sessions is refused when the device does have history — that combination is
-almost always the wrong file rather than a deliberate wipe.
+It validates every field of every record, builds a **new** database in a temporary file, verifies
+it with SQLite's own integrity and foreign-key checks plus a record-by-record comparison, and
+only then puts it in place — keeping a copy of whatever was there before. A backup that is
+damaged, truncated, or missing a section is refused outright with nothing changed.
 
 You can also export a **CSV** at any time, in the same format the old app used. Nothing here is
 locked in. Two things to know about it: the **JSON backup is the one that restores** — the CSV is
@@ -376,26 +388,46 @@ Deliberately absent:
 
 ## Running it
 
+There are two processes now: the API server that owns the data, and Vite.
+
 ```sh
 npm install
-npm run dev        # http://localhost:5173
-npm test           # 196 tests
+
+# Terminal 1 — the server. Generates a secret on first run, serves /api and dist/.
+npm run serve                  # http://localhost:8787
+npm run token                  # print that secret, to paste into the app's sign-in screen
+
+# Terminal 2 — the dev client, with /api proxied to the server above.
+npm run dev                    # http://localhost:5173
+
+npm test
 npm run typecheck
-npm run build      # production bundle + service worker into dist/
+npm run build                  # production bundle + service worker into dist/
 ```
+
+**Open `http://localhost:5173` for development and `http://localhost:8787` for the built app.**
+Both work; nothing else does without TLS. The session cookie is `Secure`, and browsers refuse a
+`Secure` cookie over plain HTTP everywhere except loopback — so sign-in fails on a LAN address by
+design rather than quietly sending the secret in clear text. `server/DEPLOY.md` has the rest.
+
+Vite proxies `/api` to `127.0.0.1:8787` (`GODMODE_SERVER_PORT` to change it) so the browser sees
+**one origin** in development, exactly as it does in production. That is what keeps
+`SameSite=Strict` a complete CSRF defence; splitting the two across origins would require a CSRF
+token in the same change.
 
 ## Deploying it
 
-`npm run build` produces a `dist/` folder of static files. Serve it from anywhere — nginx, Caddy,
-a static host, a subfolder. There is no backend, no environment variables, and no build-time
-configuration. `base: './'` in `vite.config.ts` means it works from a subpath too.
-
-Then send people the URL and point them at the install instructions above.
+`npm run start` builds the client and serves it and the API from one listener. It needs a data
+directory and a token, both outside the repository, and **TLS the moment it is not on
+localhost**. The four things a deployment has to get right — TLS, one origin, the Node version,
+and where the database file lives — are in `server/DEPLOY.md`.
 
 ## Stack
 
-Vite · TypeScript (strict, `exactOptionalPropertyTypes`) · React · Tailwind · IndexedDB via
-`idb` · Vitest. No backend, no charting library, no component library.
+Vite · TypeScript (strict, `exactOptionalPropertyTypes`) · React · Tailwind · Vitest · a Node
+`node:sqlite` server with no framework. IndexedDB via `idb` survives as a write-ahead buffer
+only: the in-progress workout and the outbox of unsent ones. No charting library, no component
+library, no ORM.
 
 ## Layout
 
@@ -407,9 +439,11 @@ src/core/         pure domain logic — no DOM, no storage, no React
   stats.ts          totals, streaks, metrics, cumulative series
   patterns/         percentage-ramp: the Just 6 Weeks progression
   policies/         rest and evaluation policies
-src/db/           IndexedDB schema and repository
+src/api/          the typed API client, snapshot selectors, the outbox drainer
+src/db/           record builders, plus the IndexedDB draft + outbox buffer
 src/import/       the four-stage CSV pipeline + mapping profiles
-src/data/         backup, restore, CSV export
+src/data/         backup and CSV export
+server/           the API and the SQLite file it owns — see server/PERSISTENCE.md
 src/ui/           screens and a small hand-rolled component kit
   cues.ts           Web Audio rest-timer cues + the pure cue schedule
   NewWorkout.tsx    creation forms, shared by first run and add-another

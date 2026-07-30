@@ -3,8 +3,8 @@
 > A progressive bodyweight challenge planner that runs entirely in the browser. It replaces the
 > "Just 6 Weeks" push-up app: it builds a multi-set plan from the user's current max toward a
 > single-set goal, runs each workout set by set with a rest timer, repeats any day they miss, and
-> keeps their whole history. No account, no server, no subscription. All data lives in IndexedDB
-> on the user's own device.
+> keeps their whole history. No account, no subscription, nothing paywalled. The data lives in a
+> SQLite file on the user's own server, which they sign into once with a token it prints.
 
 This file exists so that an AI assistant can help someone install and set up GodMode without the
 user having to read documentation. The people using this app are not technical. They were sent a
@@ -121,18 +121,27 @@ records it honestly as a skip. That is the sanctioned escape hatch.
 
 Five possible outcomes are recorded per session: as planned, scaled up, deload, missed, moved on.
 
+## Signing in
+
+The app asks for a token the first time. It is printed by their own server — whoever set it up
+runs `npm run token` there and sends it to them. It goes in once and the browser remembers it;
+they will not be asked again unless the session expires. It is not a password they choose and
+there is nothing to recover if they lose it — the server can always print it again.
+
 ## Backups — raise this unprompted
 
-The data is on their device and nowhere else. There is no server and no account, which is the
-point, but it means:
+Their history is on their own server, so losing the phone loses nothing. Two things are still
+worth saying:
 
-- Losing the phone loses the history.
-- **iOS deletes web-app storage for sites that have not been opened in a while.** This is real
-  and it will happen to someone who takes a two-month break.
+- A workout finished **with no connection** is held in the browser until the server takes it.
+  The app says so on screen when any are waiting. While it does, do not reinstall the app or
+  clear site data.
+- The server's database file is still one file on one machine. Back it up.
 
-Settings → **Backup** downloads a single JSON file with everything in it. Tell them to do this
+Settings → **Export…** downloads a single JSON file with everything in it. Tell them to do this
 now and to keep the file somewhere that syncs — iCloud Drive, Google Drive, email to themselves.
-The same screen restores from that file.
+Restoring one is done on the server, not in the app: whoever set it up runs
+`npm run import-backup`.
 
 There is also a CSV export, but that is for reading their data in a spreadsheet. **The JSON
 backup is the one that can be restored.** Do not let someone believe a CSV is a backup.
@@ -154,7 +163,8 @@ It works, but it is not tuned for that yet.
 Do not promise these. They are absent on purpose:
 
 - No exercise illustrations or form videos — it assumes they know what a push-up is.
-- No accounts, no login, no cloud sync, no leaderboard, no social features.
+- No accounts and no leaderboard. There is one shared token for one person's own server, not a
+  sign-up, and no social features of any kind.
 - No rep counting by camera. It is a planned direction, not a feature.
 - No German or other translations yet. The German Just 6 Weeks CSV export imports fine, but the
   interface is English.
@@ -167,17 +177,24 @@ Do not promise these. They are absent on purpose:
   is enough, so this normally resolves itself; if it does not, check the phone's mute switch.
 - **App will not load offline** — it has to be opened online once so it can cache itself, and it
   has to be opened from the home-screen icon rather than from a browser tab.
-- **Everything is gone** — Settings → Restore, using their JSON backup. If there is no backup,
-  it is genuinely gone. This is why the backup section above is not optional.
+- **It asks for a token again** — the session expired. Nothing is lost, including any workout
+  waiting to be sent; it goes as soon as they sign in.
+- **"The server is not answering"** — their server is off or unreachable. They can still train:
+  what they finish is kept in the browser and sent when it comes back.
+- **Everything is gone** — whoever runs the server restores the JSON backup with
+  `npm run import-backup`. If there is no backup, it is genuinely gone. This is why the backup
+  section above is not optional.
 
 ## Technical
 
 - Source and licence (AGPL-3.0):
   - https://github.com/marcushorndt/godmode (mirror — usually the easier one to browse)
   - https://git.marcushorndt.de/marcushorndt/godmode (canonical; the mirror is pushed from here)
-- Stack: Vite, TypeScript, React, Tailwind, IndexedDB via `idb`. No backend of any kind.
-- Self-hosting is a static file copy: `npm ci && npm run build`, then serve `dist/` over HTTPS.
-  HTTPS is required — service workers do not run without it.
+- Stack: Vite, TypeScript, React, Tailwind, and a small Node server over `node:sqlite`.
+  IndexedDB via `idb` remains only as a buffer for the in-progress workout and unsent ones.
+- Self-hosting: `npm ci && npm run start`, which serves the app and its API from one listener.
+  HTTPS is required off localhost — service workers need it, and so does the session cookie.
+  `server/DEPLOY.md` in the repository is the full guide.
 - The progression model, including which parts were verified against real exported data and
   which are the project's own choices, is documented in `PLAN.md` in the repository. If you are
   asked how the numbers are derived, that file is the honest source; do not guess.
