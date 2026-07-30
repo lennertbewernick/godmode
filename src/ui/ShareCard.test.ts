@@ -29,6 +29,7 @@ interface Stroked {
 function recorder() {
   const painted: Painted[] = [];
   const stroked: Stroked[] = [];
+  const arcs: { x: number; y: number; r: number }[] = [];
   let path: string[] = [];
 
   const ctx = {
@@ -47,7 +48,7 @@ function recorder() {
       this.dash = next;
     },
     measureText(text: string) {
-      // Close enough for the legend's wrapping arithmetic.
+      // Close enough for the label-fitting arithmetic.
       const size = Number(/(\d+(?:\.\d+)?)px/.exec(this.font)?.[1] ?? 16);
       return { width: text.length * size * 0.55 };
     },
@@ -64,7 +65,8 @@ function recorder() {
     lineTo(x: number, y: number) {
       path.push(`L${Math.round(x)},${Math.round(y)}`);
     },
-    arc() {
+    arc(cx: number, cy: number, r: number) {
+      arcs.push({ x: cx, y: cy, r });
       path.push('A');
     },
     stroke() {
@@ -78,6 +80,7 @@ function recorder() {
     canvas,
     painted,
     stroked,
+    arcs,
     draw(input: ShareCardInput) {
       drawShareCard(canvas as unknown as HTMLCanvasElement, buildShareCard(input));
     },
@@ -140,24 +143,61 @@ describe('drawShareCard', () => {
     }
   });
 
-  it('breaks the target line at a session that had no target', () => {
+  it('draws one continuous line of reps done, and nothing else', () => {
     const rec = recorder();
     rec.draw(base);
 
-    const target = rec.stroked.find((s) => s.style === '#64748b' && s.dashed && s.path.length > 1);
-    expect(target).toBeDefined();
-    // Two separate starts and nothing joining them: the line is never drawn across the gap,
-    // which is what would imply a prescription the middle session never had.
-    expect(target!.path.filter((op) => op.startsWith('M'))).toHaveLength(2);
-    expect(target!.path.filter((op) => op.startsWith('L'))).toHaveLength(0);
-
-    // The actual line has every session and is continuous.
-    const actual = rec.stroked.find((s) => s.style === '#5eead4' && !s.dashed);
+    const actual = rec.stroked.find((s) => s.style === '#5eead4');
+    expect(actual).toBeDefined();
     expect(actual!.path.filter((op) => op.startsWith('M'))).toHaveLength(1);
     expect(actual!.path.filter((op) => op.startsWith('L'))).toHaveLength(2);
   });
 
-  it('shows an em dash for the missing target, never the reps that were done', () => {
+  it('draws no prescription on the chart at all', () => {
+    const rec = recorder();
+    rec.draw(base);
+
+    // The dashed grey target line is gone, so there is no second series to read against and
+    // nothing dashed anywhere on the card.
+    expect(rec.stroked.some((s) => s.style === '#64748b')).toBe(false);
+    expect(rec.stroked.some((s) => s.dashed)).toBe(false);
+  });
+
+  it('marks no individual point on the chart', () => {
+    const rec = recorder();
+    // deload and failed are exactly the outcomes that used to get a coloured dot.
+    rec.draw({
+      ...base,
+      workouts: [
+        { ...workout(1, 118, 's1'), outcome: 'deload' },
+        { ...workout(3, 173), outcome: 'failed' },
+        { ...workout(5, 141, 's3'), outcome: 'advanced_manually' },
+      ],
+    });
+    expect(rec.arcs).toHaveLength(0);
+  });
+
+  it('carries no legend, because there is nothing left to decode', () => {
+    const rec = recorder();
+    rec.draw(base);
+    const texts = rec.painted.map((p) => p.text);
+    // The old legend was drawn from a static list, so it announced a yellow "deload" and a blue
+    // "moved on" whether or not the history contained either. Nothing announces them now.
+    expect(texts).not.toContain('reps you did');
+    expect(texts).not.toContain('reps the day asked for');
+    expect(texts).not.toContain('deload');
+    expect(texts).not.toContain('moved on');
+  });
+
+  it('carries no footer', () => {
+    const rec = recorder();
+    rec.draw(base);
+    for (const p of rec.painted) {
+      expect(p.text).not.toMatch(/device|GodMode —/);
+    }
+  });
+
+  it('keeps the prescription in the table, with an em dash where there was none', () => {
     const rec = recorder();
     rec.draw(base);
     const texts = rec.painted.map((p) => p.text);
@@ -187,6 +227,17 @@ describe('drawShareCard', () => {
     expect(texts).toContain('TIME');
     expect(texts).toContain('45:00');
     expect(texts).toContain('STREAK');
+  });
+
+  it('sets the headline figures below the exercise name, and above the readable floor', () => {
+    const rec = recorder();
+    rec.draw(base);
+    const label = rec.painted.find((p) => p.text === 'Liegestütze')!;
+    const value = rec.painted.find((p) => p.text === String(118 + 173 + 141))!;
+    // The numbers are a footing, not the subject: smaller than the exercise they belong to.
+    expect(value.size).toBeLessThan(label.size);
+    expect(value.size).toBeGreaterThanOrEqual(28);
+    expect(value.y).toBeGreaterThan(label.y);
   });
 
   it('offers no kcal figure when there is none', () => {

@@ -12,6 +12,12 @@
  *
  * `ShareCardPreview` is a panel, not a dialog: it renders inside the export sheet's Modal, so
  * the app still has exactly one dialog pattern.
+ *
+ * Revised 2026-07-30 after looking at the first one: the chart is a single line of reps done,
+ * with no dashed prescription and no outcome dots, and there is no legend and no footer. Five
+ * things to decode is right for the History tab, where you are asking a question; it is wrong
+ * for an image someone glances at in a chat. The prescription and the outcome words did not
+ * disappear — they moved to where they can be read, in the table underneath.
  */
 
 import { useEffect, useState } from 'react';
@@ -34,7 +40,6 @@ const MUTED = '#7c8aa5';
 const GRID = '#26324b';
 const XTICK = '#1c2740';
 const ACTUAL = '#5eead4';
-const TARGET = '#64748b';
 
 /**
  * Generic families only. A webfont would have to be fetched, and this app is expected to work
@@ -81,12 +86,9 @@ export function drawShareCard(canvas: HTMLCanvasElement, data: ShareCardData): v
   ctx.textBaseline = 'alphabetic';
   ctx.textAlign = 'left';
 
-  let y = drawHeading(ctx, data);
-  y = drawChart(ctx, data.points, y);
-  y = drawLegend(ctx, y);
+  const y = drawChart(ctx, data.points, drawHeading(ctx, data));
   drawTable(ctx, data, y);
   drawHeadline(ctx, data);
-  drawFooter(ctx);
 }
 
 /** Wordmark, exercise, and a context line built only from the fields that exist. */
@@ -125,10 +127,23 @@ function drawHeading(ctx: CanvasRenderingContext2D, data: ShareCardData): number
   return y + 42;
 }
 
-const PLOT_HEIGHT = 320;
+/**
+ * Taller than the app's own chart, and taller than this card's first version. Dropping the
+ * target line, the outcome dots, the legend and the footer freed most of a third of the card,
+ * and the chart is the thing people actually look at, so it took the space rather than leaving
+ * a band of nothing.
+ */
+const PLOT_HEIGHT = 460;
 const AXIS_GUTTER = 84;
 
-/** The app's per-session chart, at the card's resolution. Returns the y below the x labels. */
+/**
+ * Reps per session, and nothing else. Returns the y at which the table starts.
+ *
+ * Deliberately simpler than `SessionChart`: one teal line, no dashed prescription and no
+ * per-point markers. The app's chart is a diagnostic and can afford five things to decode; this
+ * is a picture in a group chat, seen at thumbnail size and read in about a second. `Chart.tsx`
+ * is unchanged — only the card got simpler.
+ */
 function drawChart(ctx: CanvasRenderingContext2D, points: SessionPoint[], top: number): number {
   const bottom = top + PLOT_HEIGHT;
   const left = PAD + AXIS_GUTTER;
@@ -137,12 +152,11 @@ function drawChart(ctx: CanvasRenderingContext2D, points: SessionPoint[], top: n
     ctx.font = font(32);
     ctx.fillStyle = MUTED;
     ctx.fillText('No sessions yet — your first workout starts the chart.', PAD, top + 60);
-    return top + 110;
+    return top + 120;
   }
 
-  const scale = niceScale(
-    Math.max(...points.map((p) => Math.max(p.actualTotal, p.targetTotal ?? 0)), 1),
-  );
+  // Scaled to the reps actually done, because that is now the only line on the chart.
+  const scale = niceScale(Math.max(...points.map((p) => p.actualTotal), 1));
   const stepX = points.length === 1 ? 0 : (INNER_RIGHT - left) / (points.length - 1);
   const x = (i: number) =>
     points.length === 1 ? left + (INNER_RIGHT - left) / 2 : left + i * stepX;
@@ -182,94 +196,21 @@ function drawChart(ctx: CanvasRenderingContext2D, points: SessionPoint[], top: n
   }
   ctx.textAlign = 'left';
 
-  const line = (pick: (p: SessionPoint) => number | undefined) => {
-    // Break the path wherever the value is missing, exactly as the SVG does. Drawing through
-    // the gap would imply a prescription an unlinked session never had (IMP-07).
-    ctx.beginPath();
-    let started = false;
-    points.forEach((p, i) => {
-      const v = pick(p);
-      if (v === undefined) {
-        started = false;
-        return;
-      }
-      if (started) ctx.lineTo(x(i), y(v));
-      else ctx.moveTo(x(i), y(v));
-      started = true;
-    });
-    ctx.stroke();
-  };
-
+  // One unbroken line: every session has an actual, so there is no gap to break at. The
+  // prescription is not drawn at all any more, which is also why nothing here can imply one.
   ctx.lineJoin = 'round';
   ctx.lineCap = 'butt';
-
-  ctx.strokeStyle = TARGET;
-  ctx.lineWidth = 6;
-  ctx.setLineDash([15, 12]);
-  line((p) => p.targetTotal);
-
   ctx.setLineDash([]);
   ctx.strokeStyle = ACTUAL;
   ctx.lineWidth = 7.5;
-  line((p) => p.actualTotal);
-
-  // Plain markers merge into a smear once they are closer than a few pixels.
-  const showPlainDots = stepX >= 26;
+  ctx.beginPath();
   points.forEach((p, i) => {
-    const colour = OUTCOME_DOT[p.outcome];
-    if (!colour && !showPlainDots) return;
-    ctx.beginPath();
-    ctx.fillStyle = colour ?? ACTUAL;
-    ctx.arc(x(i), y(p.actualTotal), colour ? 11 : 6, 0, Math.PI * 2);
-    ctx.fill();
+    if (i === 0) ctx.moveTo(x(i), y(p.actualTotal));
+    else ctx.lineTo(x(i), y(p.actualTotal));
   });
+  ctx.stroke();
 
-  return bottom + 84;
-}
-
-const LEGEND: readonly { kind: 'line' | 'dash' | 'dot'; colour: string; text: string }[] = [
-  { kind: 'line', colour: ACTUAL, text: 'reps you did' },
-  { kind: 'dash', colour: TARGET, text: 'reps the day asked for' },
-  { kind: 'dot', colour: '#fbbf24', text: 'deload' },
-  { kind: 'dot', colour: '#f87171', text: 'missed' },
-  { kind: 'dot', colour: '#38bdf8', text: 'moved on' },
-];
-
-/** The chart's legend, wrapping onto a second row when the words need one. */
-function drawLegend(ctx: CanvasRenderingContext2D, top: number): number {
-  ctx.font = font(28);
-  let x = PAD;
-  let y = top;
-
-  for (const item of LEGEND) {
-    const width = 44 + 14 + ctx.measureText(item.text).width;
-    if (x > PAD && x + width > INNER_RIGHT) {
-      x = PAD;
-      y += 46;
-    }
-
-    if (item.kind === 'dot') {
-      ctx.beginPath();
-      ctx.fillStyle = item.colour;
-      ctx.arc(x + 16, y - 9, 11, 0, Math.PI * 2);
-      ctx.fill();
-    } else {
-      ctx.beginPath();
-      ctx.strokeStyle = item.colour;
-      ctx.lineWidth = 6;
-      ctx.setLineDash(item.kind === 'dash' ? [12, 9] : []);
-      ctx.moveTo(x, y - 9);
-      ctx.lineTo(x + 40, y - 9);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-
-    ctx.fillStyle = MUTED;
-    ctx.fillText(item.text, x + 58, y);
-    x += width + 34;
-  }
-
-  return y + 54;
+  return bottom + 104;
 }
 
 const COL_TARGET = 620;
@@ -334,7 +275,13 @@ function drawTable(ctx: CanvasRenderingContext2D, data: ShareCardData, top: numb
   ctx.textAlign = 'left';
 }
 
-/** Headline figures, anchored to the bottom so a short table does not drag them up. */
+/**
+ * Headline figures, anchored to the bottom so a short table does not drag them up.
+ *
+ * Deliberately understated. At 68px these read as the subject of the card and competed with the
+ * exercise name and the chart, which are the subject. They are a footing now: still legible at
+ * thumbnail size, no longer shouting.
+ */
 function drawHeadline(ctx: CanvasRenderingContext2D, data: ShareCardData): void {
   const columns: { label: string; value: string; sub: string }[] = [
     {
@@ -362,24 +309,17 @@ function drawHeadline(ctx: CanvasRenderingContext2D, data: ShareCardData): void 
     const x = PAD + i * width;
     ctx.font = font(28, 600);
     ctx.fillStyle = MUTED;
-    ctx.fillText(column.label, x, 1152);
+    ctx.fillText(column.label, x, 1196);
 
-    ctx.font = font(68, 700);
+    // 46px, against a 28px floor — the smallest this can be and still carry the row.
+    ctx.font = font(46, 700);
     ctx.fillStyle = INK;
-    ctx.fillText(column.value, x, 1228);
+    ctx.fillText(column.value, x, 1252);
 
     ctx.font = font(28);
     ctx.fillStyle = MUTED;
-    ctx.fillText(column.sub, x, 1274);
+    ctx.fillText(column.sub, x, 1296);
   });
-}
-
-function drawFooter(ctx: CanvasRenderingContext2D): void {
-  ctx.font = font(28);
-  ctx.fillStyle = MUTED;
-  ctx.textAlign = 'left';
-  // No URL is claimed, because nothing is deployed.
-  ctx.fillText('GodMode — every rep of this stays on its owner’s device.', PAD, 1322);
 }
 
 interface Rendered {
