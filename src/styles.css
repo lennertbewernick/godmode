@@ -24,6 +24,14 @@ body {
 /* Big numeric displays read better with tabular figures. */
 .tnum { font-variant-numeric: tabular-nums; }
 
+/* One beat per second over the last five of a rest. Re-keying the element in React
+   restarts the animation, which is what makes it read as a tick rather than a fade. */
+@keyframes cue-pulse {
+  from { transform: scale(1.12); opacity: 0.85; }
+  to   { transform: scale(1);    opacity: 1; }
+}
+.cue-pulse { animation: cue-pulse 300ms ease-out; }
+
 button { font: inherit; }
 
 @media (prefers-reduced-motion: reduce) {

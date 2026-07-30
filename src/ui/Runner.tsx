@@ -13,34 +13,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatClock } from '../core/stats.js';
 import type { AdjustmentType, PerformedSet, WorkoutPerformance } from '../core/types.js';
 import type { PlanSlotRecord } from '../db/schema.js';
+import { cueForSecondsLeft, playCue } from './cues.js';
 import { Banner, Button, Card, SetRow } from './kit.js';
 
 type Phase = 'set' | 'rest' | 'review';
 
-/** A short two-tone chime. Web Audio avoids shipping an asset and works offline. */
-function playCue(): void {
-  try {
-    const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!Ctor) return;
-    const ctx = new Ctor();
-    const now = ctx.currentTime;
-    [880, 1320].forEach((freq, i) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.frequency.value = freq;
-      osc.type = 'sine';
-      gain.gain.setValueAtTime(0.0001, now + i * 0.18);
-      gain.gain.exponentialRampToValueAtTime(0.25, now + i * 0.18 + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.18 + 0.16);
-      osc.connect(gain).connect(ctx.destination);
-      osc.start(now + i * 0.18);
-      osc.stop(now + i * 0.18 + 0.18);
-    });
-    setTimeout(() => void ctx.close(), 800);
-  } catch {
-    // Audio is a nicety; never let it break the workout.
-  }
-}
+/** Seconds remaining at which the clock starts warning, then counting. */
+const WARN_AT = 10;
+const COUNT_FROM = 5;
 
 export interface RunnerProps {
   slot: PlanSlotRecord;
@@ -79,23 +59,33 @@ export function Runner({
   const isAmrap = amrapFlags[index] === true;
   const target = effectiveTargets[index] ?? 0;
 
-  // Rest countdown.
+  // Rest countdown. A self-rescheduling timeout keyed on the remaining seconds, rather than
+  // one long-lived interval, so ±15s takes effect on the very next tick and the value that
+  // drives the cues is always the value on screen.
   useEffect(() => {
     if (phase !== 'rest') return;
-    const timer = window.setInterval(() => {
-      setRestLeft((left) => {
-        if (left <= 1) {
-          window.clearInterval(timer);
-          playCue();
-          setPhase('set');
-          setStartedAt.current = Date.now();
-          return 0;
-        }
-        return left - 1;
-      });
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [phase]);
+    if (restLeft <= 0) {
+      setPhase('set');
+      setStartedAt.current = Date.now();
+      return;
+    }
+    const timer = window.setTimeout(() => setRestLeft((left) => left - 1), 1000);
+    return () => window.clearTimeout(timer);
+  }, [phase, restLeft]);
+
+  // Cues follow the displayed second. Sounding them here rather than inside the countdown's
+  // state updater keeps the updater pure, so React re-invoking it never double-beeps.
+  const lastCuedAt = useRef<number | null>(null);
+  useEffect(() => {
+    if (phase !== 'rest') {
+      lastCuedAt.current = null;
+      return;
+    }
+    if (lastCuedAt.current === restLeft) return;
+    lastCuedAt.current = restLeft;
+    const cue = cueForSecondsLeft(restLeft);
+    if (cue) playCue(cue);
+  }, [phase, restLeft]);
 
   const setActual = useCallback((value: number) => {
     setActuals((prev) => {
@@ -238,18 +228,40 @@ function RestPanel({
   onSkip: () => void;
 }) {
   const progress = total <= 0 ? 1 : 1 - left / total;
+  const counting = left <= COUNT_FROM;
+  const warning = left <= WARN_AT;
+
   return (
     <Card className="flex flex-1 flex-col items-center justify-center gap-6 text-center">
       <div>
-        <div className="text-xs uppercase tracking-widest text-slate-400">Rest</div>
-        <div className="tnum mt-1 text-7xl font-light tabular-nums text-slate-100">
+        <div
+          className={[
+            'text-xs uppercase tracking-widest transition-colors',
+            counting ? 'text-teal-300' : warning ? 'text-amber-300' : 'text-slate-400',
+          ].join(' ')}
+        >
+          {counting ? 'Get ready' : 'Rest'}
+        </div>
+        {/* Re-keyed every second while counting so the pulse animation restarts on each tick. */}
+        <div
+          key={counting ? left : 'steady'}
+          className={[
+            'tnum mt-1 text-7xl font-light tabular-nums transition-colors',
+            counting ? 'cue-pulse text-teal-200' : warning ? 'text-amber-300' : 'text-slate-100',
+          ].join(' ')}
+          aria-live="off"
+        >
           {formatClock(left)}
         </div>
       </div>
 
       <div className="h-1.5 w-full max-w-xs overflow-hidden rounded-full bg-[#1c2740]">
         <div
-          className="h-full rounded-full bg-teal-300 transition-[width] duration-1000 ease-linear"
+          className={[
+            'h-full rounded-full transition-[width,background-color] duration-1000 ease-linear',
+            warning ? 'bg-amber-300' : 'bg-teal-300',
+            counting ? '!bg-teal-200' : '',
+          ].join(' ')}
           style={{ width: `${Math.min(100, progress * 100)}%` }}
         />
       </div>
