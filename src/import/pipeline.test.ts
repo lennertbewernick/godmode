@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
@@ -8,13 +8,26 @@ import {
 } from './pipeline.js';
 import { INCUMBENT_CSV_V1 } from './profiles.js';
 
-/** The real export, not a fixture. If the pipeline works on this, it works. */
-const REAL_CSV = readFileSync(
-  resolve(process.cwd(), 'example/incumbent-history-sample.csv'),
+/**
+ * The committed synthetic fixture: same 14-column dialect, duplicate `Zeit` columns,
+ * unpadded German dates, and a repeated slot. Always present, so the suite is green on a
+ * fresh clone.
+ */
+const FIXTURE_CSV = readFileSync(
+  resolve(process.cwd(), 'src/import/__fixtures__/incumbent-csv-v1-sample.csv'),
   'utf8',
 );
 
-describe('IMP-01 — the real 29-session export imports', () => {
+/**
+ * The real 29-session export. Personal data, so it is gitignored — these assertions only
+ * run on a machine that has it. `describe.skipIf` keeps CI and other clones honest rather
+ * than silently passing.
+ */
+const REAL_PATH = resolve(process.cwd(), 'example/incumbent-history-sample.csv');
+const HAS_REAL = existsSync(REAL_PATH);
+const REAL_CSV = HAS_REAL ? readFileSync(REAL_PATH, 'utf8') : '';
+
+describe.skipIf(!HAS_REAL)('IMP-01 — the real 29-session export imports', () => {
   const report = buildCanonicalImport(REAL_CSV, INCUMBENT_CSV_V1);
 
   it('accepts every row with no errors', () => {
@@ -86,7 +99,7 @@ describe('IMP-01 — the real 29-session export imports', () => {
   });
 });
 
-describe('IMP-02 — the duplicate `Zeit` column trap', () => {
+describe.skipIf(!HAS_REAL)('IMP-02 — the duplicate `Zeit` column trap (real file)', () => {
   it('reads challenge length from index 3 and duration from index 6', () => {
     // Both columns are literally named `Zeit`. Positional mapping keeps them apart.
     const header = REAL_CSV.split('\n')[0]!;
@@ -114,20 +127,31 @@ describe('IMP-02 — the duplicate `Zeit` column trap', () => {
 });
 
 describe('IMP-03 — date format detection', () => {
-  it('detects the unpadded German format in the real file', () => {
-    const report = buildCanonicalImport(REAL_CSV, INCUMBENT_CSV_V1);
+  it('detects the unpadded German format', () => {
+    const report = buildCanonicalImport(FIXTURE_CSV, INCUMBENT_CSV_V1);
     expect(report.canonical.detectedDateFormat).toBe('d.M.yyyy HH:mm');
   });
 
-  it('prefers a format that yields chronological order', () => {
-    // 1/2/2026 then 3/2/2026: as M/d these are Jan 2 and Mar 2 (ordered);
-    // as d/M they are Feb 1 and Feb 3 (also ordered) -> genuinely ambiguous.
+  it('flags genuine ambiguity when two readings disagree but both stay ordered', () => {
+    // 1/2/2026 then 3/2/2026: as M/d these are Jan 2 and Mar 2; as d/M they are Feb 1 and
+    // Feb 3. Both orderings are chronological but the dates differ -> genuinely ambiguous.
     const result = detectDateFormat(
       ['1/2/2026 08:00', '3/2/2026 08:00'],
       ['M/d/yyyy HH:mm', 'd/M/yyyy HH:mm'],
     );
     expect(result).not.toBeNull();
-    expect(result!.ambiguous.length).toBeGreaterThan(0);
+    expect(result!.ambiguous).toEqual(['d/M/yyyy HH:mm']);
+  });
+
+  it('does NOT flag formats that agree on the result', () => {
+    // `d.M.yyyy` and `d/M/yyyy` are both day-first, so they parse identically. Warning
+    // about them would be pure noise — this fired on the real export before it was fixed.
+    const result = detectDateFormat(
+      ['29.5.2026 08:34', '31.5.2026 09:25'],
+      ['d.M.yyyy HH:mm', 'M/d/yyyy HH:mm', 'd/M/yyyy HH:mm'],
+    );
+    expect(result!.format).toBe('d.M.yyyy HH:mm');
+    expect(result!.ambiguous).toEqual([]);
   });
 
   it('disambiguates when only one reading is chronological', () => {
@@ -140,7 +164,7 @@ describe('IMP-03 — date format detection', () => {
     expect(result!.ambiguous).toEqual([]);
   });
 
-  it('warns when the choice is ambiguous rather than guessing silently', () => {
+  it('warns when the choice is genuinely ambiguous rather than guessing silently', () => {
     const csv = [
       'Datum;Workout;Ziel;Zeit;Woche;Tag;Zeit;Set 1;Set 2;Set 3;Set 4;Set 5;Summe;Kcal',
       '1/2/2026 08:00;Push;100;6 Weeks;1;1;05:00;7;8;7;6;9;37;13',
@@ -148,6 +172,11 @@ describe('IMP-03 — date format detection', () => {
     ].join('\n');
     const report = buildCanonicalImport(csv, INCUMBENT_CSV_V1);
     expect(report.issues.some((i) => i.message.includes('ambiguous'))).toBe(true);
+  });
+
+  it('stays silent on the German export, whose readings agree', () => {
+    const report = buildCanonicalImport(FIXTURE_CSV, INCUMBENT_CSV_V1);
+    expect(report.issues.filter((i) => i.message.includes('ambiguous'))).toEqual([]);
   });
 
   it('returns null when no candidate parses', () => {
@@ -243,7 +272,7 @@ describe('validation and error reporting', () => {
 
 describe('IMP-07 — actuals are never promoted to prescriptions', () => {
   it('produces no target or prescription field anywhere in the canonical form', () => {
-    const report = buildCanonicalImport(REAL_CSV, INCUMBENT_CSV_V1);
+    const report = buildCanonicalImport(FIXTURE_CSV, INCUMBENT_CSV_V1);
     const json = JSON.stringify(report.canonical);
     expect(json).not.toMatch(/"target/i);
     expect(json).not.toMatch(/"prescri/i);
@@ -263,5 +292,40 @@ describe('IMP-07 — actuals are never promoted to prescriptions', () => {
         ),
       );
     }
+  });
+});
+
+
+describe('the committed fixture — structural guarantees without personal data', () => {
+  const report = buildCanonicalImport(FIXTURE_CSV, INCUMBENT_CSV_V1);
+
+  it('reads every row cleanly', () => {
+    expect(report.stats.rowsRead).toBe(8);
+    expect(report.stats.sessionsAccepted).toBe(8);
+    expect(report.issues.filter((i) => i.severity === 'error')).toEqual([]);
+  });
+
+  it('separates the two identically-named `Zeit` columns', () => {
+    const names = FIXTURE_CSV.split('\n')[0]!.split(';').map((s) => s.trim());
+    expect(names.filter((n) => n === 'Zeit')).toHaveLength(2);
+    expect(report.canonical.challengeLength).toBe('6 Wochen'); // index 3
+    expect(report.canonical.sessions[0]!.durationSeconds).toBe(360); // index 6
+  });
+
+  it('keeps a repeated slot as two attempts', () => {
+    const w2d3 = report.canonical.sessions.filter((s) => s.week === 2 && s.day === 3);
+    expect(w2d3.map((s) => s.actualTotal)).toEqual([55, 56]);
+    expect(report.stats.distinctSlots).toBe(7);
+    expect(report.stats.repeatedSlots).toBe(1);
+  });
+
+  it('reproduces the verified baseline card from the first row', () => {
+    expect(report.canonical.sessions[0]!.actualSets).toEqual([7, 8, 7, 6, 9]);
+    expect(report.canonical.sessions[0]!.actualTotal).toBe(37);
+  });
+
+  it('treats a "-" kcal cell as absent', () => {
+    expect(report.canonical.sessions[1]!.kcalExternal).toBeUndefined();
+    expect(report.canonical.sessions[0]!.kcalExternal).toBe(12);
   });
 });

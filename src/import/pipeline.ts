@@ -178,14 +178,16 @@ export function detectDateFormat(
   rawDates: string[],
   candidates: DateFormatId[],
 ): { format: DateFormatId; ambiguous: DateFormatId[] } | null {
-  const viable: DateFormatId[] = [];
+  const viable: { format: DateFormatId; signature: string }[] = [];
 
   for (const format of candidates) {
     const parsed = rawDates.map((d) => applyFormat(d, format));
     if (parsed.some((p) => p === null)) continue;
     const isos = (parsed as ParsedDateParts[]).map(toIso);
     const ordered = isos.every((iso, i) => i === 0 || isos[i - 1]! <= iso);
-    if (ordered) viable.push(format);
+    // Only formats that produce a DIFFERENT reading are genuinely competing. `d.M.yyyy` and
+    // `d/M/yyyy` are both day-first, so they agree and there is nothing to warn about.
+    if (ordered) viable.push({ format, signature: isos.join('|') });
   }
 
   if (viable.length === 0) {
@@ -198,7 +200,13 @@ export function detectDateFormat(
     return null;
   }
 
-  return { format: viable[0]!, ambiguous: viable.slice(1) };
+  const chosen = viable[0]!;
+  const disagreeing = viable
+    .slice(1)
+    .filter((v) => v.signature !== chosen.signature)
+    .map((v) => v.format);
+
+  return { format: chosen.format, ambiguous: disagreeing };
 }
 
 function parseDurationSeconds(raw: string): number | undefined {

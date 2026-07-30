@@ -1,0 +1,31 @@
+@import 'tailwindcss';
+
+:root {
+  color-scheme: dark;
+  --edge: #26324b;
+}
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  background: #0b1220;
+  color: #e8edf7;
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  /* Never let the page scroll sideways, whatever the content. */
+  overflow-x: hidden;
+}
+
+/* Respect the iPhone home indicator and notch. */
+.safe-b { padding-bottom: max(1rem, env(safe-area-inset-bottom)); }
+.safe-t { padding-top: max(0.75rem, env(safe-area-inset-top)); }
+
+/* Big numeric displays read better with tabular figures. */
+.tnum { font-variant-numeric: tabular-nums; }
+
+button { font: inherit; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}

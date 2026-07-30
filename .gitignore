@@ -5,3 +5,8 @@ dist/
 .env.local
 dev-dist/
 *.local
+
+# Source screenshots: the originals are ~6 MB of PNG. The committed WebP versions
+# (97% smaller, still legible) are the evidence; the raw PNGs stay local.
+example/*.PNG
+example/*.png

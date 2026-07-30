@@ -47,9 +47,8 @@ export function estimateBaselineFromImport(canonical: CanonicalImport): Baseline
     value,
     method: 'invert-coefficient-sum-v1',
     explanation:
-      `Estimated from your first session (${earliest.actualTotal} reps ÷ ` +
-      `${COEFFICIENT_SUM.toFixed(2)}). This is a guess from performance data, not a rested ` +
-      'max test — correct it if you remember your actual starting number.',
+      `Worked back from your first session (${earliest.actualTotal} reps). ` +
+      'Change it if you remember your real starting number.',
   };
 }
 
@@ -131,18 +130,10 @@ export function reconcile(
 
   const unlinked = assignments.filter((a) => !a.slot).length;
   const notes: string[] = [];
-  if (divergences.length > 0) {
-    notes.push(
-      `${divergences.length} of ${slots.length} sessions differ from what this app would ` +
-        'prescribe. That is expected: the original app\'s interior progression could not be ' +
-        'recovered from a single export, so your history is kept exactly as performed and ' +
-        'the generated plan is left untouched.',
-    );
-  }
   if (unlinked > 0) {
     notes.push(
-      `${unlinked} imported session(s) did not match any planned day and were kept as ` +
-        'standalone history rather than being forced onto a slot.',
+      `${unlinked} session${unlinked === 1 ? '' : 's'} didn't match a planned day and ` +
+        'were kept as separate history.',
     );
   }
 

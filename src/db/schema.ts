@@ -122,10 +122,10 @@ export interface WorkoutRecord {
 
 export interface SettingsRecord {
   id: 'settings';
-  bodyweightKg?: number;
+  bodyweightKg?: number | undefined;
   /** kcal per rep per kg. Configurable because it depends on body geometry and technique. */
   kcalCoefficient: number;
-  restOverrideSeconds?: number;
+  restOverrideSeconds?: number | undefined;
   /** ISO timestamp of the last successful data export, for backup nagging. */
   lastBackupAt?: string;
   /** Whether the user has seen the "this data lives only on this device" explanation. */

@@ -1,0 +1,191 @@
+/**
+ * History statistics.
+ *
+ * The three metrics are deliberately separate (STAT-05). Collapsing them would let deloading
+ * inflate a streak while dodging failure:
+ *
+ *   activityStreak    any logged workout counts — rewards showing up
+ *   planCompliance    only completed_as_planned + scaled_up — rewards hitting the number
+ *   challengeProgress advanced slots / total slots — rewards moving through the programme
+ *
+ * Likewise the cumulative chart has two series: `planned` advances once per slot, `actual`
+ * includes every attempt and deload (STAT-03).
+ */
+
+import type { WorkoutOutcome } from './types.js';
+
+export interface StatWorkout {
+  performedAt: string;
+  actualTotal: number;
+  durationSeconds?: number;
+  outcome: WorkoutOutcome;
+  planSlotId?: string;
+  kcal?: { value: number; source: 'external' | 'estimated' };
+}
+
+export interface StatSlot {
+  id: string;
+  ordinal: number;
+  targetTotal: number;
+  status: string;
+}
+
+export interface LifetimeTotals {
+  workouts: number;
+  reps: number;
+  seconds: number;
+  /** Sum of both external and estimated values — the display labels the mix. */
+  kcal: number;
+  hasExternalKcal: boolean;
+  hasEstimatedKcal: boolean;
+}
+
+export function lifetimeTotals(workouts: StatWorkout[]): LifetimeTotals {
+  let reps = 0;
+  let seconds = 0;
+  let kcal = 0;
+  let hasExternalKcal = false;
+  let hasEstimatedKcal = false;
+
+  for (const w of workouts) {
+    reps += w.actualTotal;
+    seconds += w.durationSeconds ?? 0;
+    if (w.kcal) {
+      kcal += w.kcal.value;
+      if (w.kcal.source === 'external') hasExternalKcal = true;
+      else hasEstimatedKcal = true;
+    }
+  }
+
+  return { workouts: workouts.length, reps, seconds, kcal, hasExternalKcal, hasEstimatedKcal };
+}
+
+const ADVANCING_OUTCOMES: WorkoutOutcome[] = [
+  'completed_as_planned',
+  'scaled_up',
+  'advanced_manually',
+];
+
+/** Outcomes that count toward plan compliance. Manual advance does NOT — it skipped. */
+const COMPLIANT_OUTCOMES: WorkoutOutcome[] = ['completed_as_planned', 'scaled_up'];
+
+export interface Metrics {
+  /** Consecutive calendar days with at least one workout, counting back from the latest. */
+  activityStreak: number;
+  /** Longest such run anywhere in the history. */
+  longestActivityStreak: number;
+  /** Fraction of attempts that hit their prescription. */
+  planCompliance: number;
+  compliantWorkouts: number;
+  totalAttempts: number;
+  /** Slots advanced / total slots. Undefined when the programme is open-ended. */
+  challengeProgress?: number;
+  slotsAdvanced: number;
+  slotsTotal?: number;
+}
+
+/** Local calendar day, so a 23:50 and a 00:10 session are different days. */
+function dayKey(iso: string): string {
+  return iso.slice(0, 10);
+}
+
+export function activityStreaks(workouts: StatWorkout[]): {
+  current: number;
+  longest: number;
+} {
+  if (workouts.length === 0) return { current: 0, longest: 0 };
+
+  const days = [...new Set(workouts.map((w) => dayKey(w.performedAt)))].sort();
+  let longest = 1;
+  let run = 1;
+
+  for (let i = 1; i < days.length; i += 1) {
+    const prev = new Date(`${days[i - 1]!}T00:00:00Z`).getTime();
+    const cur = new Date(`${days[i]!}T00:00:00Z`).getTime();
+    const gapDays = Math.round((cur - prev) / 86_400_000);
+    run = gapDays === 1 ? run + 1 : 1;
+    longest = Math.max(longest, run);
+  }
+
+  return { current: run, longest };
+}
+
+export function computeMetrics(workouts: StatWorkout[], slots: StatSlot[]): Metrics {
+  const streaks = activityStreaks(workouts);
+  const compliant = workouts.filter((w) => COMPLIANT_OUTCOMES.includes(w.outcome)).length;
+  const slotsAdvanced = slots.filter((s) => s.status === 'completed').length;
+  const slotsTotal = slots.length > 0 ? slots.length : undefined;
+
+  return {
+    activityStreak: streaks.current,
+    longestActivityStreak: streaks.longest,
+    planCompliance: workouts.length === 0 ? 0 : compliant / workouts.length,
+    compliantWorkouts: compliant,
+    totalAttempts: workouts.length,
+    slotsAdvanced,
+    ...(slotsTotal === undefined
+      ? {}
+      : { slotsTotal, challengeProgress: slotsAdvanced / slotsTotal }),
+  };
+}
+
+export interface CumulativePoint {
+  performedAt: string;
+  /** Running sum of every attempt, including deloads and failures. */
+  actual: number;
+  /**
+   * Running sum of prescribed totals for slots that advanced — one contribution per slot,
+   * never one per attempt.
+   */
+  planned: number;
+  actualTotal: number;
+  outcome: WorkoutOutcome;
+}
+
+export function cumulativeSeries(
+  workouts: StatWorkout[],
+  slots: StatSlot[],
+): CumulativePoint[] {
+  const targetBySlot = new Map(slots.map((s) => [s.id, s.targetTotal]));
+  const countedSlots = new Set<string>();
+  let actual = 0;
+  let planned = 0;
+
+  return [...workouts]
+    .sort((a, b) => a.performedAt.localeCompare(b.performedAt))
+    .map((w) => {
+      actual += w.actualTotal;
+      // Planned advances once per slot, on the attempt that advanced it.
+      if (
+        w.planSlotId !== undefined &&
+        !countedSlots.has(w.planSlotId) &&
+        ADVANCING_OUTCOMES.includes(w.outcome)
+      ) {
+        countedSlots.add(w.planSlotId);
+        planned += targetBySlot.get(w.planSlotId) ?? 0;
+      }
+      return {
+        performedAt: w.performedAt,
+        actual,
+        planned,
+        actualTotal: w.actualTotal,
+        outcome: w.outcome,
+      };
+    });
+}
+
+export function formatDuration(totalSeconds: number): string {
+  if (totalSeconds < 3600) {
+    const m = Math.floor(totalSeconds / 60);
+    const s = totalSeconds % 60;
+    return `${m}:${String(s).padStart(2, '0')}`;
+  }
+  const hours = totalSeconds / 3600;
+  return `${hours.toFixed(1)} h`;
+}
+
+export function formatClock(totalSeconds: number): string {
+  const m = Math.floor(totalSeconds / 60);
+  const s = Math.max(0, totalSeconds % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
