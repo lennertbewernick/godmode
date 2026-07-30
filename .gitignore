@@ -21,3 +21,12 @@ example/*.jpeg
 
 # TypeScript incremental build artifacts — reproducible output, machine-dependent diffs.
 *.tsbuildinfo
+
+# Agent tooling and process artifacts stay local — they are not part of the product.
+# GSD planning state, agent instructions, and review findings/transcripts.
+.planning/
+CLAUDE.md
+AGENTS.md
+docs/reviews/
+.claude/
+.codex/

@@ -21,8 +21,8 @@ rather than hidden: the CSV is reproducible evidence, a screenshot citation is t
 > (see the note on source material: screenshot-only claims are testimony, not reproducible).
 > **[INFERRED]** — a reasonable reading of the data, not proven.
 > **[OUR CHOICE]** — a transparent design decision of ours, *not* recovered from the
-> incumbent. Earlier drafts of this plan blurred these; a Codex round-0 review
-> (`Q1–Q7`, 2026-07-30) forced the separation. Do not re-blur them.
+> incumbent. Earlier drafts of this plan blurred these; an adversarial design review
+> (2026-07-30) forced the separation. Do not re-blur them.
 
 ---
 

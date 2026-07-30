@@ -514,14 +514,13 @@ The reverse-engineering, planning, and implementation are all in the repository 
 the corrections.
 
 - `PLAN.md` — the model, the data model, the import design, with verified/inferred/ours markers.
-- `.planning/` — GSD-framework project docs: requirements with stable IDs, a six-phase roadmap,
-  and current state.
-- `docs/reviews/` — captured verdicts from adversarial Codex design reviews.
 
-Two of those reviews changed the design materially before code existed. The first caught an
-overstated validation claim, an unsatisfiable invariant, and per-attempt overrides stored in the
-wrong place. The second, prompted by the "continue after six weeks" requirement, caught the
-three-different-numbers conflation described above.
+The design went through several adversarial review rounds before code existed, and two of them
+changed it materially. The first caught an overstated validation claim, an unsatisfiable
+invariant, and per-attempt overrides stored in the wrong place. The second, prompted by the
+"continue after six weeks" requirement, caught the three-different-numbers conflation described
+above. A later round caught a restore path that could clear the database from a file carrying
+nothing but a valid header.
 
 Three more bugs were caught only by running the app against real data rather than by tests: a
 spurious date-ambiguity warning, rest displaying as `3:30` for 150 seconds, and the import
