@@ -214,6 +214,84 @@ If restore fails: restore from `/var/lib/godmode/godmode.sqlite.pre-restore-*`.
 
 ### AGPL compliance
 
-- Repo is **public**: https://github.com/JustClose/godmode
+- Repo is **public**: https://github.com/lennertbewernick/godmode
 - `LICENSE` and all upstream copyright headers intact
 - Source link via `GODMODE_REPO_URL` env (SE wires into footer per AGPL §13)
+
+---
+
+## Web Push / VAPID (LBV-1479)
+
+### VAPID keys
+
+Generated 2026-07-31. Stored at `/etc/godmode/env` (chmod 600). Never committed to the repo.
+
+| Variable | Location | Notes |
+|---|---|---|
+| `VAPID_PUBLIC_KEY` | `/etc/godmode/env` | Exposed to the client as a build-time env var (SE wires) |
+| `VAPID_PRIVATE_KEY` | `/etc/godmode/env` | Infra secret only, never in client build |
+| `VAPID_SUBJECT` | `/etc/godmode/env` | `mailto:admin@lennert.cloud` |
+| `GODMODE_APP_URL` | `/etc/godmode/env` | `https://godmode.lennert.cloud` |
+
+To rotate VAPID keys (all existing subscriptions break — users must re-subscribe):
+
+```bash
+cd /opt/godmode-push
+node -e "const w = require('web-push'); const k = w.generateVAPIDKeys(); console.log('PUBLIC=' + k.publicKey); console.log('PRIVATE=' + k.privateKey);"
+# Update /etc/godmode/env with new values, then restart main service:
+systemctl restart godmode.service
+```
+
+### Reminder scheduler
+
+Script: `/opt/godmode-push/send-reminders.js` (infra glue — not in app repo).  
+Library: `web-push@3` in `/opt/godmode-push/node_modules/`.  
+Environment: loaded from `/etc/godmode/env`.
+
+```bash
+# Check timer
+systemctl list-timers godmode-reminders.timer
+
+# Run now (for testing / manual trigger)
+systemctl start godmode-reminders.service
+journalctl -u godmode-reminders.service -n 20
+
+# Change schedule (e.g. 07:00 UTC instead of 06:00)
+# Edit /etc/systemd/system/godmode-reminders.timer, change OnCalendar=, then:
+systemctl daemon-reload && systemctl restart godmode-reminders.timer
+```
+
+Default schedule: **daily 06:00 UTC** (08:00 Berlin summer / 07:00 winter).
+
+The script is a graceful no-op when the `push_subscriptions` table does not yet exist. Once
+SE's push-client ticket ships the table, reminders activate automatically on the next timer fire.
+
+Expected `push_subscriptions` schema (SE must match this):
+
+```sql
+CREATE TABLE push_subscriptions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT,
+  endpoint TEXT NOT NULL,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  created_at TEXT NOT NULL
+) STRICT;
+```
+
+### Google OAuth **[MANUAL]**
+
+Not yet provisioned. SE's auth ticket is blocked on these credentials. Steps:
+
+1. Go to https://console.cloud.google.com → APIs & Services → Credentials
+2. Create OAuth 2.0 Client ID (type: Web Application)
+3. Add authorized redirect URI: `https://godmode.lennert.cloud/auth/google/callback`
+4. Copy Client ID and Client Secret
+5. Add to `/etc/godmode/env`:
+   ```
+   GOOGLE_CLIENT_ID=<id>
+   GOOGLE_CLIENT_SECRET=<secret>
+   ```
+6. Restart: `systemctl restart godmode.service`
+
+Placeholder lines are already in `/etc/godmode/env` (commented out).
