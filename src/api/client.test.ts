@@ -8,10 +8,12 @@ import { DEFAULT_SETTINGS } from '../db/schema.js';
 import {
   ApiError,
   closeSession,
+  deletePushSubscription,
   getSnapshot,
   login,
   patchSettings,
   postWorkout,
+  putPushSubscription,
   register,
 } from './client.js';
 
@@ -168,5 +170,40 @@ describe('what goes on the wire', () => {
   it('accepts the empty 204 a sign-out answers with', async () => {
     stub(204, null);
     await expect(closeSession()).resolves.toBeUndefined();
+  });
+
+  it('PUTs a flat push subscription and resolves on the 204', async () => {
+    const fetchMock = stub(204, null);
+    await expect(
+      putPushSubscription({ endpoint: 'https://push.example/x', p256dh: 'BkeyX', auth: 'authX' }),
+    ).resolves.toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/push/subscription');
+    expect(init.method).toBe('PUT');
+    expect(JSON.parse(String(init.body))).toEqual({
+      endpoint: 'https://push.example/x',
+      p256dh: 'BkeyX',
+      auth: 'authX',
+    });
+  });
+
+  it('DELETEs a push subscription by endpoint', async () => {
+    const fetchMock = stub(204, null);
+    await expect(deletePushSubscription('https://push.example/x')).resolves.toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/push/subscription');
+    expect(init.method).toBe('DELETE');
+    expect(JSON.parse(String(init.body))).toEqual({ endpoint: 'https://push.example/x' });
+  });
+
+  it('surfaces an expired session on a push write as unauthorised', async () => {
+    stub(401, { error: 'unauthenticated', message: 'Sign in first.' });
+    const error = (await putPushSubscription({
+      endpoint: 'https://push.example/x',
+      p256dh: 'BkeyX',
+      auth: 'authX',
+    }).catch((e: unknown) => e)) as ApiError;
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.kind).toBe('unauthorised');
   });
 });
