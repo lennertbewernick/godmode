@@ -126,3 +126,94 @@ environments where that can fail, both described in full in `server/PERSISTENCE.
 
 Delete the token file, run `npm run token` for a new one, and restart. Sessions live in memory,
 so a restart ends every one of them.
+---
+
+## JustClose Production Deployment (LBV-1477)
+
+**Host:** `paperclip-cloud` (`178.105.34.133`)  
+**Repo:** https://github.com/JustClose/godmode
+
+### Environment variables (production)
+
+| Variable | Value | Notes |
+|---|---|---|
+| `GODMODE_DATA_DIR` | `/var/lib/godmode` | persistent, outside checkout |
+| `GODMODE_TOKEN_FILE` | `/etc/godmode/token` | chmod 600, survives restarts |
+| `GODMODE_SERVER_PORT` | `8787` | loopback only, behind Caddy |
+| `GODMODE_SERVER_HOST` | `127.0.0.1` | never 0.0.0.0 in prod |
+| `GODMODE_STATIC_DIR` | `/srv/godmode/dist` | built frontend |
+| `GODMODE_REPO_URL` | `https://github.com/JustClose/godmode` | AGPL §13 source link for footer |
+
+Secrets at `/etc/godmode/env` (chmod 600, root:root).
+
+### Routine deploy
+
+```bash
+/usr/local/bin/godmode-deploy.sh
+# or manually:
+cd /srv/godmode && git pull --ff-only && npm ci && npm run build && npm run build:server
+systemctl restart godmode.service
+curl -s -o /dev/null -w "HTTP %{http_code}
+" http://127.0.0.1:8787/
+```
+
+### Rollback
+
+```bash
+cd /srv/godmode
+git log --oneline -5              # find last-good SHA
+git checkout <sha>                # detach HEAD
+npm run build && npm run build:server
+systemctl restart godmode.service
+```
+
+### systemd
+
+```bash
+systemctl status godmode.service
+journalctl -u godmode -f
+journalctl -u godmode --since "10 minutes ago"
+```
+
+### Caddy / TLS
+
+`godmode.just-close-it.de` → `localhost:8787`. Auto-TLS via Let's Encrypt.  
+**[MANUAL]** DNS: `godmode.just-close-it.de` A → `178.105.34.133` (Lennert, DNS panel).
+
+### Backup
+
+- **Automated daily at 02:00 UTC:** `godmode-backup.timer` → `/usr/local/bin/godmode-backup.sh`
+- **Local copies:** `/backup/godmode/YYYY-MM-DD/` (7-day retention)
+- **Off-box:** set `GODMODE_BACKUP_REMOTE` in `/etc/godmode/backup.env`
+
+Check:
+
+```bash
+cat /var/log/godmode-backup.log
+ls /backup/godmode/
+systemctl list-timers godmode-backup.timer
+```
+
+Run now: `systemctl start godmode-backup.service`
+
+### Restore from backup
+
+```bash
+BACKUP_DATE=2026-07-31
+systemctl stop godmode.service
+cp /var/lib/godmode/godmode.sqlite "/var/lib/godmode/godmode.sqlite.pre-restore-$(date -u +%s)"
+cp "/backup/godmode/${BACKUP_DATE}/godmode.sqlite" /var/lib/godmode/godmode.sqlite
+sqlite3 /var/lib/godmode/godmode.sqlite "SELECT COUNT(*) FROM meta;"
+systemctl start godmode.service
+sleep 2 && curl -s -o /dev/null -w "HTTP %{http_code}
+" http://127.0.0.1:8787/
+```
+
+Rollback time: ~2 minutes.  
+If restore fails: restore from `/var/lib/godmode/godmode.sqlite.pre-restore-*`.
+
+### AGPL compliance
+
+- Repo is **public**: https://github.com/JustClose/godmode
+- `LICENSE` and all upstream copyright headers intact
+- Source link via `GODMODE_REPO_URL` env (SE wires into footer per AGPL §13)
