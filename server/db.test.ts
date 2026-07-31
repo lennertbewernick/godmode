@@ -33,6 +33,7 @@ import {
   foreignKeysEnabled,
   readSchemaSql,
 } from './schema.js';
+import { BOOTSTRAP_USER_ID, ensureBootstrapUser } from './users.js';
 import { validateBackupStrict } from './validate.js';
 import type { BackupFile } from '../src/data/exchange.js';
 
@@ -46,11 +47,24 @@ function at<T>(list: readonly T[], index: number): T {
 const open = (): DatabaseSync => {
   const db = new DatabaseSync(':memory:');
   applySchema(db);
+  // v2 records are owned by a user; every fixture load below belongs to the bootstrap owner.
+  ensureBootstrapUser(db);
   return db;
 };
 
+/** Insert one record, adding the bootstrap `user_id` for a `perUser` table — as `db.ts` does. */
 function insert<R>(db: DatabaseSync, mapping: TableMapping<R>, record: R): void {
-  db.prepare(insertSql(mapping)).run(...bindValues(mapping, mapping.encode(record)));
+  const values = bindValues(mapping, mapping.encode(record));
+  if (mapping.perUser) {
+    const columns = ['user_id', ...mapping.columns];
+    const placeholders = columns.map(() => '?').join(', ');
+    db.prepare(`INSERT INTO ${mapping.table} (${columns.join(', ')}) VALUES (${placeholders})`).run(
+      BOOTSTRAP_USER_ID,
+      ...values,
+    );
+    return;
+  }
+  db.prepare(insertSql(mapping)).run(...values);
 }
 
 function readAll<R>(db: DatabaseSync, mapping: TableMapping<R>): R[] {
@@ -87,25 +101,31 @@ describe('schema.sql', () => {
     const meta = db.prepare('SELECT * FROM meta').get() as Record<string, unknown>;
     expect(meta['id']).toBe('meta');
     expect(meta['schema_version']).toBe(SCHEMA_VERSION);
-    expect(meta['revision']).toBe(0);
+    // The revision is per-user in v2 (`user_revisions`), not on `meta`.
+    expect('revision' in meta).toBe(false);
+    const rev = db.prepare('SELECT revision FROM user_revisions WHERE user_id = ?').get(BOOTSTRAP_USER_ID);
+    expect(rev).toEqual({ revision: 0 });
     db.close();
   });
 
   it('holds the meta table to a single row', () => {
     const db = open();
     expect(() =>
-      db.prepare('INSERT INTO meta (id, schema_version, revision, created_at, updated_at) VALUES (?, 1, 0, ?, ?)')
+      db.prepare('INSERT INTO meta (id, schema_version, created_at, updated_at) VALUES (?, 2, ?, ?)')
         .run('other', '2026-07-30T00:00:00Z', '2026-07-30T00:00:00Z'),
     ).toThrow(/CHECK constraint failed/);
     db.close();
   });
 
-  it('holds the settings table to a single row', () => {
+  it('holds the settings table to one row per user', () => {
     const db = open();
-    load(db, clone(MINIMAL_BACKUP));
+    load(db, clone(MINIMAL_BACKUP)); // creates the bootstrap owner's single settings row
     expect(() =>
-      db.prepare('INSERT INTO settings (id, kcal_coefficient) VALUES (?, ?)').run('other', 0.003),
-    ).toThrow(/CHECK constraint failed/);
+      db.prepare('INSERT INTO settings (user_id, kcal_coefficient) VALUES (?, ?)').run(
+        BOOTSTRAP_USER_ID,
+        0.003,
+      ),
+    ).toThrow(/UNIQUE constraint failed|PRIMARY KEY/);
     db.close();
   });
 
@@ -114,7 +134,8 @@ describe('schema.sql', () => {
     const tables = db
       .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
       .all() as { name: string; sql: string }[];
-    expect(tables.length).toBe(7);
+    // v2 adds users, sessions, user_revisions to the original seven.
+    expect(tables.length).toBe(10);
     for (const table of tables) expect(table.sql).toMatch(/\)\s*STRICT\s*$/);
     db.close();
   });
@@ -133,17 +154,20 @@ describe('schema.sql', () => {
 
     const unarmed = new DatabaseSync(path, { enableForeignKeyConstraints: false });
     expect(foreignKeysEnabled(unarmed)).toBe(false);
+    // user_id is NOT NULL, so it must be bound even with foreign keys off; its value need not
+    // resolve here, which is precisely what this unarmed connection is demonstrating.
     const orphanSql =
-      'INSERT INTO challenges (id, exercise_id, chain_id, pattern_id, pattern_version, ' +
+      'INSERT INTO challenges (id, user_id, exercise_id, chain_id, pattern_id, pattern_version, ' +
       'pattern_params, rest_policy_id, rest_policy_version, rest_policy_params, ' +
       'evaluation_policy_id, evaluation_policy_version, baseline_value, baseline_source, ' +
-      'baseline_recorded_at, status, started_at) VALUES (?, ?, ?, ?, 1, ?, ?, 1, ?, ?, 1, 1, ?, ?, ?, ?)';
+      'baseline_recorded_at, status, started_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, 1, ?, ?, 1, 1, ?, ?, ?, ?)';
     expect(() =>
       unarmed
         .prepare(orphanSql)
-        .run('ch_x', 'ex_nonexistent', 'ch_x', 'p', '{}', 'r', '{}', 'e', 'user_entered', '2026-07-30T00:00:00Z', 'active', '2026-07-30T00:00:00Z'),
+        .run('ch_x', 'usr_nonexistent', 'ex_nonexistent', 'ch_x', 'p', '{}', 'r', '{}', 'e', 'user_entered', '2026-07-30T00:00:00Z', 'active', '2026-07-30T00:00:00Z'),
     ).not.toThrow();
-    expect(unarmed.prepare('PRAGMA foreign_key_check').all().length).toBe(1);
+    // Two dangling references now: the missing exercise and the missing user_id owner.
+    expect(unarmed.prepare('PRAGMA foreign_key_check').all().length).toBe(2);
 
     armConnection(unarmed);
     expect(foreignKeysEnabled(unarmed)).toBe(true);
@@ -169,7 +193,9 @@ describe('schema.sql', () => {
       const columns = (
         db.prepare(`PRAGMA table_info(${mapping.table})`).all() as { name: string }[]
       ).map((c) => c.name);
-      expect([...mapping.columns].sort()).toEqual([...columns].sort());
+      // A `perUser` table carries the `user_id` tenancy column the mapping deliberately omits.
+      const expected = mapping.perUser ? [...mapping.columns, 'user_id'] : [...mapping.columns];
+      expect(expected.sort()).toEqual([...columns].sort());
     }
     db.close();
   });
@@ -180,7 +206,7 @@ describe('schema.sql', () => {
     expect(() => assertSchemaVersion(db)).toThrow(SchemaVersionError);
     expect(() => assertSchemaVersion(db)).toThrow(/Nothing has been read or written/);
 
-    db.exec('UPDATE meta SET schema_version = 1');
+    db.exec(`UPDATE meta SET schema_version = ${String(SCHEMA_VERSION)}`);
     expect(() => assertSchemaVersion(db)).not.toThrow();
 
     db.exec("DELETE FROM meta");
@@ -382,6 +408,7 @@ describe('round trip through SQLite', () => {
     const path = tempFile();
     const first = new DatabaseSync(path);
     applySchema(first);
+    ensureBootstrapUser(first);
     load(first, clone(MAXIMAL_BACKUP));
     first.close();
 

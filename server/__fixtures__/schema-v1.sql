@@ -1,33 +1,10 @@
--- GodMode — server-owned SQLite schema, version 2.
+-- GodMode — server-owned SQLite schema, version 1.
 --
 -- Authority: this file is generated from nothing. It is written by hand against
 -- `src/db/schema.ts` and `src/core/types.ts`, and every column here has a row in
 -- `server/PERSISTENCE.md`. A field added to a record type without a row in that matrix and a
 -- column here is silently dropped on import — which, on the only copy of the training history,
 -- is data loss. `server/fields.ts` makes that failure a compile error rather than a surprise.
---
--- ─────────────────────────────────────────────────────────────────────────────────────────
--- VERSION 2 — MULTI-USER TENANCY (LBV-1478).
---
--- Version 1 was single-tenant: every table was global, `meta`/`settings` were single-row, and
--- one global `revision` served optimistic concurrency for the whole file. Version 2 adds
--- tenancy without swapping engines — still native `node:sqlite`.
---
--- `user_id` is a SERVER-SIDE tenancy column, not a domain field. The record types in
--- `src/db/schema.ts` are shared with the local-first IndexedDB client and the backup/export
--- format; they carry no `userId` and must not. So the server injects `user_id` on write and
--- filters on read (`server/db.ts`, `server/routes.ts`); `server/rows.ts` mappings stay pure
--- domain records. A workout is the same workout whoever owns it — ownership is metadata.
---
--- `exercises` stays GLOBAL/shared: it is an identity catalog (`{id,label,unit}`) with no
--- personal data, referenced by `challenges.exercise_id` and `performance_tests.exercise_id`.
--- Per-user exercises would force every user to re-create "push-ups" and fragment the shared
--- vocabulary. See `server/PERSISTENCE.md` §11.
---
--- `revision` is now PER USER (`user_revisions`), so one user's write never bumps the revision
--- another user's client is holding and never 409s it. `settings` is now one row per user, keyed
--- by `user_id` — the `id = 'settings'` singleton is gone.
--- ─────────────────────────────────────────────────────────────────────────────────────────
 --
 -- ─────────────────────────────────────────────────────────────────────────────────────────
 -- PRAGMA foreign_keys IS PER CONNECTION.
@@ -80,81 +57,24 @@ PRAGMA foreign_keys = ON;
 
 -- ── meta ────────────────────────────────────────────────────────────────────────────────────
 --
--- One row, FILE-GLOBAL. `schema_version` is the DDL version of this file — genuinely global,
--- one schema per file. `created_at`/`updated_at` are the file's own lifetime.
---
--- The `revision` used for optimistic concurrency is NO LONGER here: in v2 it is per-user, in
--- `user_revisions`. A global counter would make one user's write bump the revision every other
--- user's client is holding, and 409 their next command for a change that was not theirs.
+-- One row. `schema_version` is the DDL version of this file. `revision` is the dataset revision
+-- used for optimistic concurrency: `GET /api/snapshot` returns it, every ordinary mutation
+-- carries the revision it expects, and a mismatch is a 409. The server bumps it exactly once
+-- per accepted command, inside that command's transaction — deliberately not by trigger, since
+-- a per-row trigger would count rows rather than commands.
 
 CREATE TABLE meta (
   id             TEXT    NOT NULL PRIMARY KEY CHECK (id = 'meta'),
   schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
+  revision       INTEGER NOT NULL CHECK (revision >= 0),
   created_at     TEXT    NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'),
   updated_at     TEXT    NOT NULL CHECK (updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*')
 ) STRICT;
 
-INSERT INTO meta (id, schema_version, created_at, updated_at)
-VALUES ('meta', 2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-
--- ── users ───────────────────────────────────────────────────────────────────────────────────
---
--- One row per person. `email` is unique case-insensitively (`idx_users_email` on `lower(email)`);
--- `google_sub` is unique among the rows that have one (partial UNIQUE index, since SQLite treats
--- NULLs as distinct anyway — the WHERE clause states the intent). `password_hash` and
--- `google_sub` are both nullable: a user may authenticate by password, by Google, or (once the
--- auth ticket lands) both. This ticket only needs the table to exist and every per-user query to
--- be scoped by it; registration/login/SSO is a separate SE ticket that sits on top.
-
-CREATE TABLE users (
-  id            TEXT NOT NULL PRIMARY KEY CHECK (length(id) > 0),
-  email         TEXT NOT NULL CHECK (length(email) > 0),
-  display_name  TEXT NOT NULL CHECK (length(display_name) > 0),
-  password_hash TEXT     NULL CHECK (password_hash IS NULL OR length(password_hash) > 0),
-  google_sub    TEXT     NULL CHECK (google_sub IS NULL OR length(google_sub) > 0),
-  created_at    TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*')
-) STRICT;
-
-CREATE UNIQUE INDEX idx_users_email      ON users (lower(email));
-CREATE UNIQUE INDEX idx_users_google_sub ON users (google_sub) WHERE google_sub IS NOT NULL;
-
--- ── sessions ────────────────────────────────────────────────────────────────────────────────
---
--- Persisted, so a deploy or restart does not log everyone out — the in-memory `Map` this
--- replaces died with the process. `id` is the same 256-bit opaque token minted from the CSPRNG
--- that the cookie carries (`server/session.ts`). `created_at`/`last_seen_at` are epoch
--- milliseconds, NOT ISO text: they are compared arithmetically for absolute/idle expiry, and the
--- in-memory store they replace held numbers. This is infra state, not part of the domain dataset
--- (`COLLECTIONS` in `server/dataset.ts` does not include it), so it is free to be shaped for the
--- expiry math rather than for the timestamp convention the training records use.
-
-CREATE TABLE sessions (
-  id           TEXT    NOT NULL PRIMARY KEY CHECK (length(id) > 0),
-  user_id      TEXT    NOT NULL REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
-  created_at   INTEGER NOT NULL CHECK (created_at >= 0),
-  last_seen_at INTEGER NOT NULL CHECK (last_seen_at >= created_at)
-) STRICT;
-
-CREATE INDEX idx_sessions_user ON sessions (user_id);
-
--- ── user_revisions ──────────────────────────────────────────────────────────────────────────
---
--- The per-user optimistic-concurrency counter (v1's `meta.revision`, made tenant-scoped). One
--- row per user, created with revision 0 when the user is created. `GET /api/snapshot` returns
--- this user's revision, every ordinary mutation carries the revision it expects, and a mismatch
--- is a 409 — but only against the same user's counter, so two users never conflict. The server
--- bumps it exactly once per accepted command, inside that command's transaction.
-
-CREATE TABLE user_revisions (
-  user_id    TEXT    NOT NULL PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
-  revision   INTEGER NOT NULL CHECK (revision >= 0),
-  updated_at TEXT    NOT NULL CHECK (updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*')
-) STRICT;
+INSERT INTO meta (id, schema_version, revision, created_at, updated_at)
+VALUES ('meta', 1, 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 
 -- ── exercises ───────────────────────────────────────────────────────────────────────────────
---
--- GLOBAL / shared across all users (LBV-1478 decision, `server/PERSISTENCE.md` §11). No
--- `user_id`: exercises are an identity catalog, not personal data.
 
 CREATE TABLE exercises (
   id         TEXT NOT NULL PRIMARY KEY CHECK (length(id) > 0),
@@ -173,12 +93,9 @@ CREATE TABLE exercises (
 -- `chain_id` deliberately has NO foreign key. It names the first challenge of a continuation
 -- chain, and a partial restore or a merge can legitimately produce a chain whose head is not
 -- present. An FK here would refuse to store history that the app can render perfectly well.
---
--- `user_id` (v2) scopes the row to its owner. Indexed on the child side (`idx_challenges_user`).
 
 CREATE TABLE challenges (
   id                        TEXT    NOT NULL PRIMARY KEY CHECK (length(id) > 0),
-  user_id                   TEXT    NOT NULL REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   exercise_id               TEXT    NOT NULL REFERENCES exercises (id) ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   chain_id                  TEXT    NOT NULL CHECK (length(chain_id) > 0),
   previous_challenge_id     TEXT        NULL REFERENCES challenges (id) ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
@@ -206,7 +123,6 @@ CREATE TABLE challenges (
 
 CREATE TABLE performance_tests (
   id               TEXT    NOT NULL PRIMARY KEY CHECK (length(id) > 0),
-  user_id          TEXT    NOT NULL REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   exercise_id      TEXT    NOT NULL REFERENCES exercises (id) ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   challenge_id     TEXT        NULL REFERENCES challenges (id) ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   performed_at     TEXT    NOT NULL CHECK (performed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'),
@@ -229,7 +145,6 @@ CREATE TABLE performance_tests (
 
 CREATE TABLE plan_slots (
   id              TEXT    NOT NULL PRIMARY KEY CHECK (length(id) > 0),
-  user_id         TEXT    NOT NULL REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   challenge_id    TEXT    NOT NULL REFERENCES challenges (id) ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   ordinal         INTEGER NOT NULL CHECK (ordinal >= 1),
   week            INTEGER     NULL CHECK (week IS NULL OR week >= 1),
@@ -263,7 +178,6 @@ CREATE TABLE plan_slots (
 
 CREATE TABLE workouts (
   id                        TEXT    NOT NULL PRIMARY KEY CHECK (length(id) > 0),
-  user_id                   TEXT    NOT NULL REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   challenge_id              TEXT    NOT NULL REFERENCES challenges (id) ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   chain_id                  TEXT    NOT NULL CHECK (length(chain_id) > 0),
   plan_slot_id              TEXT        NULL REFERENCES plan_slots (id) ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
@@ -300,19 +214,16 @@ CREATE TABLE workouts (
 
 -- ── settings ────────────────────────────────────────────────────────────────────────────────
 --
--- One row PER USER, keyed by `user_id` — v1's `id = 'settings'` singleton is gone (LBV-1478).
--- The domain `SettingsRecord` still carries `id: 'settings'` for the client and the backup
--- format; the server does not store it (it is a constant, synthesised on decode in
--- `server/rows.ts`). A missing row means "defaults", exactly as `src/db/repo.ts:69` treats it,
--- so a fresh user with no saved settings reads `DEFAULT_SETTINGS_ROW`.
+-- One row, enforced by the primary key CHECK.
 --
 -- `selected_challenge_id` deliberately has NO foreign key. It is documented as a preference and
 -- not a source of truth: when it names a challenge that has ended or was never restored, the app
 -- falls back to the newest active one (`src/db/schema.ts:144-151`). A RESTRICT would refuse the
--- restore; a SET NULL would silently rewrite a user preference on someone else's device.
+-- restore; a SET NULL would silently rewrite a user preference on someone else's device. Neither
+-- is what the record means, so the reference is left unenforced and the app keeps resolving it.
 
 CREATE TABLE settings (
-  user_id               TEXT NOT NULL PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  id                    TEXT NOT NULL PRIMARY KEY CHECK (id = 'settings'),
   bodyweight_kg         REAL     NULL CHECK (bodyweight_kg IS NULL OR bodyweight_kg > 0),
   kcal_coefficient      REAL NOT NULL CHECK (kcal_coefficient >= 0),
   rest_override_seconds REAL     NULL CHECK (rest_override_seconds IS NULL OR rest_override_seconds >= 0),
@@ -325,8 +236,7 @@ CREATE TABLE settings (
 --
 -- The first block mirrors the IndexedDB indexes one for one, so no read path that exists today
 -- becomes a table scan. The second block indexes the child side of each foreign key, which is
--- what SQLite scans when a parent row is deleted or updated. The third block indexes the
--- per-user tenancy column, which every scoped read filters on.
+-- what SQLite scans when a parent row is deleted or updated.
 
 CREATE INDEX idx_challenges_chain              ON challenges (chain_id);
 CREATE INDEX idx_challenges_status             ON challenges (status);
@@ -344,11 +254,6 @@ CREATE INDEX idx_challenges_baseline_evidence  ON challenges (baseline_evidence_
 CREATE INDEX idx_performance_tests_challenge   ON performance_tests (challenge_id);
 CREATE INDEX idx_plan_slots_supersedes         ON plan_slots (supersedes_id);
 
-CREATE INDEX idx_challenges_user               ON challenges (user_id);
-CREATE INDEX idx_performance_tests_user        ON performance_tests (user_id);
-CREATE INDEX idx_plan_slots_user               ON plan_slots (user_id);
-CREATE INDEX idx_workouts_user                 ON workouts (user_id);
-
 -- One attempt number per slot, forever. This is the constraint that makes a retried offline
 -- POST safe: a duplicate command cannot quietly become a second attempt.
 --
@@ -357,9 +262,6 @@ CREATE INDEX idx_workouts_user                 ON workouts (user_id);
 -- (`src/import/reconcile.ts:100-107`). SQLite already treats NULLs as distinct in a UNIQUE
 -- index, so the WHERE clause changes no behaviour — it states the intent so nobody later
 -- "fixes" the index into one that rejects the unlinked history.
---
--- Slots are already scoped to one user (a slot belongs to a challenge, which belongs to a user),
--- so uniqueness on (plan_slot_id, attempt_no) is inherently per-user without naming user_id here.
 CREATE UNIQUE INDEX idx_workouts_slot_attempt
   ON workouts (plan_slot_id, attempt_no)
   WHERE plan_slot_id IS NOT NULL;

@@ -17,6 +17,7 @@ import { canonicalJson } from './canonical.js';
 import { readDataset, writeDataset, type Dataset } from './dataset.js';
 import { MAXIMAL_BACKUP, MINIMAL_BACKUP, clone } from './fixtures.js';
 import { applySchema, readSchemaSql } from './schema.js';
+import { BOOTSTRAP_USER_ID, ensureBootstrapUser } from './users.js';
 import { validateBackupStrict } from './validate.js';
 import { VerificationFailure, verifyDatabase, type ExpectedState } from './verify.js';
 import type { BackupFile } from '../src/data/exchange.js';
@@ -52,10 +53,11 @@ function build(source: BackupFile = MAXIMAL_BACKUP): {
   const path = join(tempDir(), 'godmode.sqlite');
   const db = new DatabaseSync(path);
   applySchema(db);
+  ensureBootstrapUser(db);
   const backup = validateBackupStrict(clone(source));
   const dataset = datasetOfBackup(backup);
-  writeDataset(db, dataset);
-  return { db, path, expected: { dataset, revision: 0 } };
+  writeDataset(db, dataset, BOOTSTRAP_USER_ID);
+  return { db, path, expected: { dataset, revision: 0, userId: BOOTSTRAP_USER_ID } };
 }
 
 /**
@@ -76,8 +78,9 @@ function openWithModifiedSchema(mutate: (ddl: string) => string): {
   const db = new DatabaseSync(join(tempDir(), 'modified.sqlite'));
   db.exec(ddl);
   db.exec('PRAGMA foreign_keys = ON');
+  ensureBootstrapUser(db);
   const dataset = datasetOfBackup(validateBackupStrict(clone(MAXIMAL_BACKUP)));
-  writeDataset(db, dataset);
+  writeDataset(db, dataset, BOOTSTRAP_USER_ID);
   return { db, dataset };
 }
 
@@ -142,9 +145,12 @@ describe('verifyDatabase — each check can fail', () => {
 
   it('3. meta: a revision that is not the one the import decided on', () => {
     const { db, expected } = build();
-    db.exec('UPDATE meta SET revision = 99');
+    // The revision is per-user in v2 (`user_revisions`), not on `meta`.
+    db.prepare('UPDATE user_revisions SET revision = 99 WHERE user_id = ?').run(BOOTSTRAP_USER_ID);
     const failure = failuresFrom(() => verifyDatabase(db, expected));
-    expect(failure.issues.some((i) => i.check === 'meta' && i.path === 'meta.revision')).toBe(true);
+    expect(
+      failure.issues.some((i) => i.check === 'meta' && i.path === 'user_revisions.revision'),
+    ).toBe(true);
     db.close();
   });
 
@@ -256,7 +262,7 @@ describe('verifyDatabase — each check can fail', () => {
     const { db, dataset } = openWithModifiedSchema((ddl) =>
       ddl.replace('  note                      TEXT        NULL,', '  note TEXT NULL,\n  surprise TEXT NULL,'),
     );
-    const failure = failuresFrom(() => verifyDatabase(db, { dataset, revision: 0 }));
+    const failure = failuresFrom(() => verifyDatabase(db, { dataset, revision: 0, userId: BOOTSTRAP_USER_ID }));
     expect(
       failure.issues.some(
         (i) =>
@@ -296,7 +302,7 @@ describe('verifyDatabase — each check can fail', () => {
     // workout, and this test is about the primary key rather than that index.
     db.exec("INSERT INTO workouts SELECT * FROM workouts WHERE id = 'wo_2'");
 
-    const failure = failuresFrom(() => verifyDatabase(db, { dataset, revision: 0 }));
+    const failure = failuresFrom(() => verifyDatabase(db, { dataset, revision: 0, userId: BOOTSTRAP_USER_ID }));
     const duplicates = failure.issues.filter((i) => i.check === 'duplicate primary keys');
     expect(duplicates).toHaveLength(1);
     expect(duplicates[0]?.path).toBe('workouts.wo_2');
@@ -324,11 +330,12 @@ describe('verifyDatabase — each check can fail', () => {
     const path = join(tempDir(), 'dangling.sqlite');
     const db = new DatabaseSync(path);
     applySchema(db);
+    ensureBootstrapUser(db);
     const dataset = datasetOfBackup(validateBackupStrict(source));
-    writeDataset(db, dataset);
+    writeDataset(db, dataset, BOOTSTRAP_USER_ID);
 
-    expect(() => verifyDatabase(db, { dataset, revision: 0 })).toThrow(VerificationFailure);
-    expect(verifyDatabase(db, { dataset, revision: 0 }, { allowDanglingChainHead: true }).length).toBe(13);
+    expect(() => verifyDatabase(db, { dataset, revision: 0, userId: BOOTSTRAP_USER_ID })).toThrow(VerificationFailure);
+    expect(verifyDatabase(db, { dataset, revision: 0, userId: BOOTSTRAP_USER_ID }, { allowDanglingChainHead: true }).length).toBe(13);
     db.close();
   });
 
@@ -435,10 +442,19 @@ describe('readDataset', () => {
   });
 
   it('refuses a database carrying more than one settings row', () => {
+    // v2 keys settings by user_id; drop its PRIMARY KEY so a second row for the same user can be
+    // inserted, which is the state readDataset must refuse. (The import machinery reads a
+    // single-user file, so more than one settings row is corruption.)
     const { db } = openWithModifiedSchema((ddl) =>
-      ddl.replace("id                    TEXT NOT NULL PRIMARY KEY CHECK (id = 'settings'),", 'id                    TEXT NOT NULL,'),
+      ddl.replace(
+        'user_id               TEXT NOT NULL PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,\n  bodyweight_kg',
+        'user_id               TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,\n  bodyweight_kg',
+      ),
     );
-    db.prepare('INSERT INTO settings (id, kcal_coefficient) VALUES (?, ?)').run('settings', 0.5);
+    db.prepare('INSERT INTO settings (user_id, kcal_coefficient) VALUES (?, ?)').run(
+      BOOTSTRAP_USER_ID,
+      0.5,
+    );
     expect(() => readDataset(db)).toThrow(/exactly one is allowed/);
     db.close();
   });

@@ -94,6 +94,7 @@ import {
 import { SCHEMA_VERSION } from './schema.js';
 import { clearedSessionCookie, readSessionId, sessionCookie } from './session.js';
 import type { SessionStore } from './session.js';
+import { BOOTSTRAP_USER_ID } from './users.js';
 import { BackupValidationError, validateOne } from './validate.js';
 import type { PerformanceTest } from '../src/core/types.js';
 import type {
@@ -142,17 +143,19 @@ export interface Snapshot {
  *
  * Workouts come back in `performed_at` order because that is the order they happened in.
  */
-export function readSnapshot(db: DatabaseSync): Snapshot {
+export function readSnapshot(db: DatabaseSync, userId: string): Snapshot {
   return {
     apiVersion: API_VERSION,
     schemaVersion: SCHEMA_VERSION,
-    revision: readRevision(db),
-    exercises: listRecords(db, EXERCISES, 'created_at, id'),
-    challenges: listRecords(db, CHALLENGES, 'started_at, id'),
-    planSlots: listRecords(db, PLAN_SLOTS, 'challenge_id, ordinal, id'),
-    workouts: listRecords(db, WORKOUTS, 'performed_at, id'),
-    performanceTests: listRecords(db, PERFORMANCE_TESTS, 'performed_at, id'),
-    settings: readSettings(db),
+    revision: readRevision(db, userId),
+    // `exercises` is global (`server/schema.sql`), so `listRecords` returns the shared catalog for
+    // every user; the rest are filtered to this user's rows.
+    exercises: listRecords(db, EXERCISES, 'created_at, id', userId),
+    challenges: listRecords(db, CHALLENGES, 'started_at, id', userId),
+    planSlots: listRecords(db, PLAN_SLOTS, 'challenge_id, ordinal, id', userId),
+    workouts: listRecords(db, WORKOUTS, 'performed_at, id', userId),
+    performanceTests: listRecords(db, PERFORMANCE_TESTS, 'performed_at, id', userId),
+    settings: readSettings(db, userId),
   };
 }
 
@@ -225,8 +228,8 @@ function validateRecord<T>(value: unknown, fields: FieldSpecMap, path: string): 
   }
 }
 
-function checkRevision(db: DatabaseSync, expected: number): void {
-  const actual = readRevision(db);
+function checkRevision(db: DatabaseSync, userId: string, expected: number): void {
+  const actual = readRevision(db, userId);
   if (actual !== expected) {
     throw new HttpError(
       409,
@@ -252,10 +255,11 @@ function insertOrVerify<R extends { id: string }>(
   db: DatabaseSync,
   mapping: TableMapping<R>,
   record: R,
+  userId: string,
 ): WriteOutcome {
-  const existing = findRecord(db, mapping, record.id);
+  const existing = findRecord(db, mapping, record.id, userId);
   if (existing === undefined) {
-    insertRecord(db, mapping, record);
+    insertRecord(db, mapping, record, userId);
     return 'inserted';
   }
   if (canonicallyEqual(existing, record)) return 'identical';
@@ -267,11 +271,18 @@ function insertOrVerify<R extends { id: string }>(
   );
 }
 
-/** Overwrite every non-id column from a validated record. */
+/**
+ * Overwrite every non-id column from a validated record, within the user's scope.
+ *
+ * The `AND user_id = ?` on a `perUser` table is defence in depth: the record was already fetched
+ * through a user-scoped `findRecord`, so it cannot name another user's row, but stating the tenant
+ * on the write too means no update can ever cross users even if a future caller skips the read.
+ */
 function updateRecord<R extends { id: string }>(
   db: DatabaseSync,
   mapping: TableMapping<R>,
   record: R,
+  userId: string,
 ): void {
   const columns = mapping.columns.filter((column) => column !== 'id');
   const assignments = columns.map((column) => `${column} = ?`).join(', ');
@@ -279,6 +290,14 @@ function updateRecord<R extends { id: string }>(
   const all = bindValues(mapping, row);
   const byColumn = new Map(mapping.columns.map((column, index) => [column, all[index]]));
   const values = columns.map((column) => byColumn.get(column) ?? null);
+  if (mapping.perUser) {
+    db.prepare(`UPDATE ${mapping.table} SET ${assignments} WHERE id = ? AND user_id = ?`).run(
+      ...values,
+      record.id,
+      userId,
+    );
+    return;
+  }
   db.prepare(`UPDATE ${mapping.table} SET ${assignments} WHERE id = ?`).run(...values, record.id);
 }
 
@@ -310,7 +329,11 @@ interface CommandResult {
  * because throwing away performed training is never the right answer, but a slot that is no
  * longer part of the plan does not re-enter it.
  */
-function appendWorkout(ctx: ApiContext, body: Record<string, unknown>): CommandResult {
+function appendWorkout(
+  ctx: ApiContext,
+  userId: string,
+  body: Record<string, unknown>,
+): CommandResult {
   requireKeys(body, ['workout'], 'POST /api/workouts');
   const submitted = asObject(body['workout'], 'workout');
 
@@ -326,17 +349,17 @@ function appendWorkout(ctx: ApiContext, body: Record<string, unknown>): CommandR
   const planSlotId = requireString(submitted, 'planSlotId', 'A finished workout');
 
   return inWriteTransaction(ctx.db, (): CommandResult => {
-    const stored = findRecord(ctx.db, WORKOUTS, workoutId);
+    const stored = findRecord(ctx.db, WORKOUTS, workoutId, userId);
     if (stored !== undefined) {
       return {
         workout: stored,
         attemptNo: stored.attemptNo,
         duplicate: true,
-        snapshot: readSnapshot(ctx.db),
+        snapshot: readSnapshot(ctx.db, userId),
       };
     }
 
-    const slot = findRecord(ctx.db, PLAN_SLOTS, planSlotId);
+    const slot = findRecord(ctx.db, PLAN_SLOTS, planSlotId, userId);
     if (slot === undefined) {
       throw new HttpError(
         409,
@@ -345,7 +368,7 @@ function appendWorkout(ctx: ApiContext, body: Record<string, unknown>): CommandR
       );
     }
     const challengeId = requireString(submitted, 'challengeId', 'A workout');
-    const challenge = findRecord(ctx.db, CHALLENGES, challengeId);
+    const challenge = findRecord(ctx.db, CHALLENGES, challengeId, userId);
     if (challenge === undefined) {
       throw new HttpError(
         409,
@@ -370,9 +393,11 @@ function appendWorkout(ctx: ApiContext, body: Record<string, unknown>): CommandR
       );
     }
 
+    // Scoped by user as well as slot: attempt numbers are a sequence per this user's slot. A slot
+    // id belongs to one user already, so this is belt-and-braces, but it keeps the query honest.
     const highest = ctx.db
-      .prepare('SELECT MAX(attempt_no) AS highest FROM workouts WHERE plan_slot_id = ?')
-      .get(planSlotId) as { highest: number | null } | undefined;
+      .prepare('SELECT MAX(attempt_no) AS highest FROM workouts WHERE plan_slot_id = ? AND user_id = ?')
+      .get(planSlotId, userId) as { highest: number | null } | undefined;
     const attemptNo = (highest?.highest ?? 0) + 1;
 
     const workout = validateRecord<WorkoutRecord>(
@@ -380,19 +405,19 @@ function appendWorkout(ctx: ApiContext, body: Record<string, unknown>): CommandR
       WORKOUT_FIELDS,
       'workout',
     );
-    insertRecord(ctx.db, WORKOUTS, workout);
+    insertRecord(ctx.db, WORKOUTS, workout, userId);
 
     const nextStatus = ratchet(slot.status, workout.evaluation?.advances === true);
     if (nextStatus !== slot.status) {
-      updateRecord(ctx.db, PLAN_SLOTS, { ...slot, status: nextStatus });
+      updateRecord(ctx.db, PLAN_SLOTS, { ...slot, status: nextStatus }, userId);
     }
 
-    bumpRevision(ctx.db, isoNow(ctx));
+    bumpRevision(ctx.db, userId, isoNow(ctx));
     return {
       workout,
       attemptNo,
       duplicate: false,
-      snapshot: readSnapshot(ctx.db),
+      snapshot: readSnapshot(ctx.db, userId),
     };
   });
 }
@@ -413,7 +438,11 @@ export function ratchet(
  * same breath as the exercise it trains and the rested max that seeded it. Today that is three
  * separate IndexedDB transactions and a failure between them leaves an orphan; here it is one.
  */
-function createChallenge(ctx: ApiContext, body: Record<string, unknown>): CommandResult {
+function createChallenge(
+  ctx: ApiContext,
+  userId: string,
+  body: Record<string, unknown>,
+): CommandResult {
   requireKeys(
     body,
     ['expectedRevision', 'exercise', 'performanceTest', 'challenge', 'slots', 'select'],
@@ -456,20 +485,22 @@ function createChallenge(ctx: ApiContext, body: Record<string, unknown>): Comman
   }
 
   return inWriteTransaction(ctx.db, (): CommandResult => {
-    checkRevision(ctx.db, expected);
-    if (exercise !== undefined) insertOrVerify(ctx.db, EXERCISES, exercise);
-    if (performanceTest !== undefined) insertOrVerify(ctx.db, PERFORMANCE_TESTS, performanceTest);
-    insertOrVerify(ctx.db, CHALLENGES, challenge);
-    for (const slot of slots) insertOrVerify(ctx.db, PLAN_SLOTS, slot);
-    if (select) selectChallenge(ctx.db, challenge.id);
-    bumpRevision(ctx.db, isoNow(ctx));
-    return { challengeId: challenge.id, snapshot: readSnapshot(ctx.db) };
+    checkRevision(ctx.db, userId, expected);
+    if (exercise !== undefined) insertOrVerify(ctx.db, EXERCISES, exercise, userId);
+    if (performanceTest !== undefined)
+      insertOrVerify(ctx.db, PERFORMANCE_TESTS, performanceTest, userId);
+    insertOrVerify(ctx.db, CHALLENGES, challenge, userId);
+    for (const slot of slots) insertOrVerify(ctx.db, PLAN_SLOTS, slot, userId);
+    if (select) selectChallenge(ctx.db, userId, challenge.id);
+    bumpRevision(ctx.db, userId, isoNow(ctx));
+    return { challengeId: challenge.id, snapshot: readSnapshot(ctx.db, userId) };
   });
 }
 
 /** `repo.ts:283`. Ending an already-ended challenge is refused, not silently redone. */
 function endChallenge(
   ctx: ApiContext,
+  userId: string,
   challengeId: string,
   body: Record<string, unknown>,
 ): CommandResult {
@@ -479,8 +510,8 @@ function endChallenge(
   const endedAt = requireString(body, 'endedAt', 'Ending a challenge');
 
   return inWriteTransaction(ctx.db, (): CommandResult => {
-    checkRevision(ctx.db, expected);
-    const challenge = findRecord(ctx.db, CHALLENGES, challengeId);
+    checkRevision(ctx.db, userId, expected);
+    const challenge = findRecord(ctx.db, CHALLENGES, challengeId, userId);
     if (challenge === undefined) {
       throw new HttpError(404, 'unknown_challenge', `No challenge "${challengeId}" exists.`);
     }
@@ -497,9 +528,9 @@ function endChallenge(
       CHALLENGE_FIELDS,
       'challenge',
     );
-    updateRecord(ctx.db, CHALLENGES, ended);
-    bumpRevision(ctx.db, isoNow(ctx));
-    return { challengeId, snapshot: readSnapshot(ctx.db) };
+    updateRecord(ctx.db, CHALLENGES, ended, userId);
+    bumpRevision(ctx.db, userId, isoNow(ctx));
+    return { challengeId, snapshot: readSnapshot(ctx.db, userId) };
   });
 }
 
@@ -511,7 +542,11 @@ function endChallenge(
  * "create" over HTTP would reintroduce exactly the failure this function was written to remove:
  * an ended plan with no successor, no next session and no obvious way back.
  */
-function startNextBlock(ctx: ApiContext, body: Record<string, unknown>): CommandResult {
+function startNextBlock(
+  ctx: ApiContext,
+  userId: string,
+  body: Record<string, unknown>,
+): CommandResult {
   requireKeys(
     body,
     ['expectedRevision', 'previousChallengeId', 'endedAt', 'performanceTest', 'challenge', 'slots'],
@@ -550,8 +585,8 @@ function startNextBlock(ctx: ApiContext, body: Record<string, unknown>): Command
   }
 
   return inWriteTransaction(ctx.db, (): CommandResult => {
-    checkRevision(ctx.db, expected);
-    const previous = findRecord(ctx.db, CHALLENGES, previousId);
+    checkRevision(ctx.db, userId, expected);
+    const previous = findRecord(ctx.db, CHALLENGES, previousId, userId);
     if (previous === undefined) {
       throw new HttpError(404, 'unknown_challenge', `No challenge "${previousId}" exists.`);
     }
@@ -596,13 +631,14 @@ function startNextBlock(ctx: ApiContext, body: Record<string, unknown>): Command
       CHALLENGE_FIELDS,
       'challenge',
     );
-    updateRecord(ctx.db, CHALLENGES, ended);
-    if (performanceTest !== undefined) insertOrVerify(ctx.db, PERFORMANCE_TESTS, performanceTest);
-    insertOrVerify(ctx.db, CHALLENGES, challenge);
-    for (const slot of slots) insertOrVerify(ctx.db, PLAN_SLOTS, slot);
-    selectChallenge(ctx.db, challenge.id);
-    bumpRevision(ctx.db, isoNow(ctx));
-    return { challengeId: challenge.id, snapshot: readSnapshot(ctx.db) };
+    updateRecord(ctx.db, CHALLENGES, ended, userId);
+    if (performanceTest !== undefined)
+      insertOrVerify(ctx.db, PERFORMANCE_TESTS, performanceTest, userId);
+    insertOrVerify(ctx.db, CHALLENGES, challenge, userId);
+    for (const slot of slots) insertOrVerify(ctx.db, PLAN_SLOTS, slot, userId);
+    selectChallenge(ctx.db, userId, challenge.id);
+    bumpRevision(ctx.db, userId, isoNow(ctx));
+    return { challengeId: challenge.id, snapshot: readSnapshot(ctx.db, userId) };
   });
 }
 
@@ -614,7 +650,11 @@ function startNextBlock(ctx: ApiContext, body: Record<string, unknown>): Command
  * (`src/import/reconcile.ts:100-107`), and the partial unique index in `schema.sql` exists
  * precisely so those can coexist.
  */
-function commitImport(ctx: ApiContext, body: Record<string, unknown>): CommandResult {
+function commitImport(
+  ctx: ApiContext,
+  userId: string,
+  body: Record<string, unknown>,
+): CommandResult {
   requireKeys(
     body,
     ['expectedRevision', 'exercise', 'challenge', 'slots', 'workouts', 'select'],
@@ -645,19 +685,19 @@ function commitImport(ctx: ApiContext, body: Record<string, unknown>): CommandRe
   }
 
   return inWriteTransaction(ctx.db, (): CommandResult => {
-    checkRevision(ctx.db, expected);
-    assertImportedWorkouts(ctx.db, workouts, challenge, slots);
-    insertOrVerify(ctx.db, EXERCISES, exercise);
-    insertOrVerify(ctx.db, CHALLENGES, challenge);
-    for (const slot of slots) insertOrVerify(ctx.db, PLAN_SLOTS, slot);
-    for (const workout of workouts) insertOrVerify(ctx.db, WORKOUTS, workout);
-    if (select) selectChallenge(ctx.db, challenge.id);
-    bumpRevision(ctx.db, isoNow(ctx));
+    checkRevision(ctx.db, userId, expected);
+    assertImportedWorkouts(ctx.db, userId, workouts, challenge, slots);
+    insertOrVerify(ctx.db, EXERCISES, exercise, userId);
+    insertOrVerify(ctx.db, CHALLENGES, challenge, userId);
+    for (const slot of slots) insertOrVerify(ctx.db, PLAN_SLOTS, slot, userId);
+    for (const workout of workouts) insertOrVerify(ctx.db, WORKOUTS, workout, userId);
+    if (select) selectChallenge(ctx.db, userId, challenge.id);
+    bumpRevision(ctx.db, userId, isoNow(ctx));
     return {
       exerciseId: exercise.id,
       challengeId: challenge.id,
       workoutCount: workouts.length,
-      snapshot: readSnapshot(ctx.db),
+      snapshot: readSnapshot(ctx.db, userId),
     };
   });
 }
@@ -670,7 +710,11 @@ function commitImport(ctx: ApiContext, body: Record<string, unknown>): CommandRe
  * choosing a spelling for "remove this". `null` is that spelling; an absent key means "leave it
  * alone". Sending `undefined` is impossible and sending the string `"null"` is a value.
  */
-function patchSettings(ctx: ApiContext, body: Record<string, unknown>): CommandResult {
+function patchSettings(
+  ctx: ApiContext,
+  userId: string,
+  body: Record<string, unknown>,
+): CommandResult {
   requireKeys(body, ['expectedRevision', 'patch'], 'PATCH /api/settings');
   const expected = requireExpectedRevision(body);
   const patch = asObject(body['patch'], 'patch');
@@ -684,22 +728,22 @@ function patchSettings(ctx: ApiContext, body: Record<string, unknown>): CommandR
   }
 
   return inWriteTransaction(ctx.db, (): CommandResult => {
-    checkRevision(ctx.db, expected);
-    const merged: Record<string, unknown> = { ...readSettings(ctx.db) };
+    checkRevision(ctx.db, userId, expected);
+    const merged: Record<string, unknown> = { ...readSettings(ctx.db, userId) };
     for (const [key, value] of Object.entries(patch)) {
       if (value === null) delete merged[key];
       else merged[key] = value;
     }
     merged['id'] = SETTINGS_ROW_ID;
     const settings = validateRecord<SettingsRecord>(merged, SETTINGS_FIELDS, 'settings');
-    writeSettings(ctx.db, settings);
-    bumpRevision(ctx.db, isoNow(ctx));
-    return { snapshot: readSnapshot(ctx.db) };
+    writeSettings(ctx.db, userId, settings);
+    bumpRevision(ctx.db, userId, isoNow(ctx));
+    return { snapshot: readSnapshot(ctx.db, userId) };
   });
 }
 
-function selectChallenge(db: DatabaseSync, challengeId: string): void {
-  writeSettings(db, { ...readSettings(db), selectedChallengeId: challengeId });
+function selectChallenge(db: DatabaseSync, userId: string, challengeId: string): void {
+  writeSettings(db, userId, { ...readSettings(db, userId), selectedChallengeId: challengeId });
 }
 
 function assertSlotsBelongTo(slots: readonly PlanSlotRecord[], challenge: ChallengeRecord): void {
@@ -760,6 +804,7 @@ function assertFreshPlan(slots: readonly PlanSlotRecord[]): void {
  */
 function assertImportedWorkouts(
   db: DatabaseSync,
+  userId: string,
   workouts: readonly WorkoutRecord[],
   challenge: ChallengeRecord,
   slots: readonly PlanSlotRecord[],
@@ -784,7 +829,8 @@ function assertImportedWorkouts(
     }
     if (workout.planSlotId === undefined) continue;
 
-    const slot = known.get(workout.planSlotId) ?? findRecord(db, PLAN_SLOTS, workout.planSlotId);
+    const slot =
+      known.get(workout.planSlotId) ?? findRecord(db, PLAN_SLOTS, workout.planSlotId, userId);
     if (slot === undefined) {
       throw new HttpError(
         422,
@@ -859,7 +905,10 @@ async function openSession(
   ctx.limiter.recordSuccess(key);
   // Drop whatever session the caller was carrying before issuing a new one.
   ctx.sessions.destroy(readSessionId(req));
-  const id = ctx.sessions.create(now);
+  // One shared token, one owner (the bootstrap user). The auth ticket replaces this with real
+  // per-user credentials; until then the token authenticates the single existing person, whose
+  // history the v1 → v2 migration carried onto this row.
+  const id = ctx.sessions.create(BOOTSTRAP_USER_ID, now);
   const expiresAt = ctx.sessions.expiresAt(id) ?? now;
   sendJson(
     res,
@@ -898,20 +947,26 @@ export async function handleApi(
   const rest = segments.slice(1);
   const route = `/${rest.join('/')}`;
 
+  // Resolved for the protected routes below: the user this session authenticates, and therefore
+  // the tenant every read and write is scoped to. `undefined` for a public route or a request with
+  // no live session.
+  let userId: string | undefined;
+
   try {
     if (rest[0] === 'session') {
       if (rest.length !== 1) throw notFound(route);
       if (method === 'POST') return await openSession(ctx, req, res);
       if (method === 'DELETE') return closeSession(ctx, req, res);
       if (method === 'GET') {
-        const authenticated = ctx.sessions.validate(readSessionId(req), ctx.now());
+        const authenticated = ctx.sessions.validate(readSessionId(req), ctx.now()) !== undefined;
         return sendJson(res, 200, { authenticated, apiVersion: API_VERSION });
       }
       throw methodNotAllowed(method, route);
     }
 
     if (!PUBLIC_ROUTES.has(`${method} ${route}`)) {
-      if (!ctx.sessions.validate(readSessionId(req), ctx.now())) {
+      userId = ctx.sessions.validate(readSessionId(req), ctx.now());
+      if (userId === undefined) {
         throw new HttpError(
           401,
           'unauthenticated',
@@ -922,31 +977,32 @@ export async function handleApi(
 
     if (rest[0] === 'snapshot' && rest.length === 1) {
       if (method !== 'GET') throw methodNotAllowed(method, route);
-      const snapshot = inReadTransaction(ctx.db, () => readSnapshot(ctx.db));
+      const scopedTo = userId!;
+      const snapshot = inReadTransaction(ctx.db, () => readSnapshot(ctx.db, scopedTo));
       return sendJson(res, 200, snapshot);
     }
 
     if (rest[0] === 'workouts' && rest.length === 1) {
       if (method !== 'POST') throw methodNotAllowed(method, route);
       const body = asObject(await readJsonBody(req, MAX_BODY_BYTES), 'The request body');
-      return sendJson(res, 201, appendWorkout(ctx, body));
+      return sendJson(res, 201, appendWorkout(ctx, userId!, body));
     }
 
     if (rest[0] === 'challenges') {
       if (rest.length === 1) {
         if (method !== 'POST') throw methodNotAllowed(method, route);
         const body = asObject(await readJsonBody(req, MAX_BODY_BYTES), 'The request body');
-        return sendJson(res, 201, createChallenge(ctx, body));
+        return sendJson(res, 201, createChallenge(ctx, userId!, body));
       }
       if (rest.length === 2 && rest[1] === 'next-block') {
         if (method !== 'POST') throw methodNotAllowed(method, route);
         const body = asObject(await readJsonBody(req, MAX_BODY_BYTES), 'The request body');
-        return sendJson(res, 201, startNextBlock(ctx, body));
+        return sendJson(res, 201, startNextBlock(ctx, userId!, body));
       }
       if (rest.length === 3 && rest[2] === 'end') {
         if (method !== 'POST') throw methodNotAllowed(method, route);
         const body = asObject(await readJsonBody(req, MAX_BODY_BYTES), 'The request body');
-        return sendJson(res, 200, endChallenge(ctx, rest[1] ?? '', body));
+        return sendJson(res, 200, endChallenge(ctx, userId!, rest[1] ?? '', body));
       }
       throw notFound(route);
     }
@@ -954,18 +1010,18 @@ export async function handleApi(
     if (rest[0] === 'import' && rest.length === 1) {
       if (method !== 'POST') throw methodNotAllowed(method, route);
       const body = asObject(await readJsonBody(req, MAX_IMPORT_BODY_BYTES), 'The request body');
-      return sendJson(res, 201, commitImport(ctx, body));
+      return sendJson(res, 201, commitImport(ctx, userId!, body));
     }
 
     if (rest[0] === 'settings' && rest.length === 1) {
       if (method !== 'PATCH') throw methodNotAllowed(method, route);
       const body = asObject(await readJsonBody(req, MAX_BODY_BYTES), 'The request body');
-      return sendJson(res, 200, patchSettings(ctx, body));
+      return sendJson(res, 200, patchSettings(ctx, userId!, body));
     }
 
     throw notFound(route);
   } catch (cause) {
-    respondToFailure(ctx, res, cause);
+    respondToFailure(ctx, res, userId, cause);
   }
 }
 
@@ -977,12 +1033,20 @@ export async function handleApi(
  * is a bug in this server and is reported as a 500 with a generic message: the details go to
  * stderr, not to the client, so a stack trace or a file path never leaves the process.
  */
-function respondToFailure(ctx: ApiContext, res: ServerResponse, cause: unknown): void {
+function respondToFailure(
+  ctx: ApiContext,
+  res: ServerResponse,
+  userId: string | undefined,
+  cause: unknown,
+): void {
   if (res.headersSent) return;
 
   if (cause instanceof HttpError) {
-    if (cause.status === 409) {
-      const snapshot = inReadTransaction(ctx.db, () => readSnapshot(ctx.db));
+    // Every 409 carries the fresh snapshot. A 409 can only be thrown from a command, which only
+    // runs after the session resolved a `userId`, so it is defined here; the guard is belt-only.
+    if (cause.status === 409 && userId !== undefined) {
+      const scopedTo = userId;
+      const snapshot = inReadTransaction(ctx.db, () => readSnapshot(ctx.db, scopedTo));
       const body: Record<string, unknown> = {
         error: cause.code,
         message: cause.message,

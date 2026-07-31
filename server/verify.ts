@@ -52,6 +52,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { canonicalJson, isPlainObject } from './canonical.js';
 import { COLLECTIONS, idOf, recordsOf, type CollectionKey, type Dataset } from './dataset.js';
+import { TENANT_COLUMN } from './rows.js';
 import { SCHEMA_VERSION } from './schema.js';
 
 export interface VerificationIssue {
@@ -81,6 +82,12 @@ export class VerificationFailure extends Error {
 export interface ExpectedState {
   readonly dataset: Dataset;
   readonly revision: number;
+  /**
+   * The user the built file's records belong to. The import machinery builds a single-user file
+   * (a backup, or a v1 upgrade, is one person's history), so every per-user row carries this id
+   * and the revision is checked against this user's `user_revisions` row.
+   */
+  readonly userId: string;
 }
 
 export interface VerifyOptions {
@@ -236,11 +243,17 @@ function checkMeta(db: DatabaseSync, expected: ExpectedState, issues: Issues): v
       `expected ${String(SCHEMA_VERSION)}, found ${String(row['schema_version'])}`,
     );
   }
-  if (row['revision'] !== expected.revision) {
+  // The revision is per-user in v2 (`user_revisions`), not on `meta`.
+  const revisionRow = db
+    .prepare(`SELECT revision FROM user_revisions WHERE ${TENANT_COLUMN} = ?`)
+    .get(expected.userId) as { revision?: unknown } | undefined;
+  if (revisionRow === undefined) {
+    issues.add('meta', 'user_revisions', `no revision row for user "${expected.userId}"`);
+  } else if (revisionRow.revision !== expected.revision) {
     issues.add(
       'meta',
-      'meta.revision',
-      `expected ${String(expected.revision)}, found ${String(row['revision'])}`,
+      'user_revisions.revision',
+      `expected ${String(expected.revision)}, found ${String(revisionRow.revision)}`,
     );
   }
 }
@@ -476,7 +489,6 @@ const COLUMN_ORACLE: Readonly<Record<CollectionKey, readonly ColumnSource[]>> = 
     { column: 'import_source', path: 'importSource' },
   ],
   settings: [
-    { column: 'id', path: 'id' },
     { column: 'bodyweight_kg', path: 'bodyweightKg' },
     { column: 'kcal_coefficient', path: 'kcalCoefficient' },
     { column: 'rest_override_seconds', path: 'restOverrideSeconds' },
@@ -512,16 +524,26 @@ function checkColumns(db: DatabaseSync, expected: Dataset, issues: Issues): void
     // trip that cannot see a symmetric defect.
     const info = db.prepare(`PRAGMA table_info(${collection.table})`).all() as { name?: unknown }[];
     for (const { name } of info) {
-      if (typeof name === 'string' && !named.has(name)) {
+      // `user_id` is the tenancy column, not a source property — the oracle deliberately omits it.
+      if (typeof name === 'string' && name !== TENANT_COLUMN && !named.has(name)) {
         issues.add(check, `${collection.table}.${name}`, 'no source property is declared for it');
       }
     }
 
-    const statement = db.prepare(`SELECT * FROM ${collection.table} WHERE id = ?`);
+    // `settings` has no physical `id` column (v2 keys it by `user_id`), and the import machinery
+    // builds a single-user file, so its one row is fetched without a key rather than by id.
+    const isSettings = collection.key === 'settings';
+    const statement = db.prepare(
+      isSettings
+        ? `SELECT * FROM ${collection.table} LIMIT 1`
+        : `SELECT * FROM ${collection.table} WHERE id = ?`,
+    );
     for (const record of recordsOf(expected, collection.key)) {
       const id = idOf(record);
       if (id === undefined) continue;
-      const row = statement.get(id) as Record<string, unknown> | undefined;
+      const row = (isSettings ? statement.get() : statement.get(id)) as
+        | Record<string, unknown>
+        | undefined;
       if (row === undefined) continue; // already reported by the id-set check
       for (const source of oracle) {
         const wanted = expectedColumnValue(record, source);
@@ -548,6 +570,9 @@ function checkColumns(db: DatabaseSync, expected: Dataset, issues: Issues): void
  */
 function checkDuplicatePrimaryKeys(db: DatabaseSync, issues: Issues): void {
   for (const collection of COLLECTIONS) {
+    // `settings` has no `id` column; its primary key is `user_id`, and its single-row-per-user
+    // shape is asserted by `checkSettings`. Every other table keys on `id`.
+    if (collection.key === 'settings') continue;
     const rows = db
       .prepare(`SELECT id, COUNT(*) AS n FROM ${collection.table} GROUP BY id HAVING n > 1`)
       .all() as { id?: unknown; n?: unknown }[];

@@ -1,10 +1,48 @@
 # Persistence matrix — every field, every column
 
-**Written:** 2026-07-30 · **Schema version:** 1 · **Backup format read:** 1
+**Written:** 2026-07-30 · **Schema version:** 2 · **Backup format read:** 1
 
 This is the field-by-field contract between the record types in `src/` and the SQLite schema in
 `server/schema.sql`. It is exhaustive, not illustrative. Every property of every persisted record
 and every nested type appears below exactly once.
+
+## 0. Multi-user tenancy (schema v2, LBV-1478)
+
+Version 2 turned the single-tenant server multi-user **without adding a field to any record
+type**. The record types in `src/db/schema.ts` are shared with the local-first IndexedDB client and
+the backup/export format; they carry no `userId` and must not. So tenancy lives entirely in the
+server layer:
+
+- **`user_id` is a server-side tenancy column, not a domain property.** It is added to the four
+  per-user tables — `challenges`, `performance_tests`, `plan_slots`, `workouts` — as
+  `TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE`, indexed on the child side
+  (`idx_<table>_user`). The domain encoders (`server/rows.ts`) never produce it; `server/db.ts`
+  and `server/dataset.ts` inject it on write and filter on read. Because it is not a record field,
+  it does **not** appear in the tables below — it has no source property to map. `server/verify.ts`
+  skips it in its column oracle for the same reason.
+- **`exercises` stays GLOBAL / shared** — no `user_id`. It is an identity catalog
+  (`{id, label, unit}`) with no personal data, referenced by `challenges.exercise_id` and
+  `performance_tests.exercise_id`. Per-user exercises would force every user to re-create
+  "push-ups" and fragment the shared vocabulary. If a private exercise is ever needed, that is an
+  additive `user_id NULL = global` change, not a rework.
+- **`settings` is one row per user**, keyed by `user_id` — the `id = 'settings'` singleton is gone
+  (see §7).
+- **`revision` is per user**, in the new `user_revisions` table, so one user's write never bumps
+  the revision another user's client is holding (which would 409 their next command). `meta` keeps
+  only the file-global `schema_version` and timestamps; it no longer has a `revision` column.
+
+Two infra tables are new and are **not** part of the backup/import matrix (they are never
+exported): `users` and `sessions`.
+
+| Table | Columns | Notes |
+|---|---|---|
+| `users` | `id` PK, `email` (unique, ci via `idx_users_email` on `lower(email)`), `display_name`, `password_hash` NULL, `google_sub` NULL (unique-when-present), `created_at` | The auth ticket adds credentials; this ticket only needs the table to exist. A `UserRecord` compile guard lives in `server/fields.ts` (`USER_FIELDS`). |
+| `sessions` | `id` PK, `user_id` FK→`users`, `created_at` INTEGER (epoch ms), `last_seen_at` INTEGER | Persisted so a deploy no longer logs everyone out. Epoch-ms, not ISO, because expiry is arithmetic. |
+| `user_revisions` | `user_id` PK FK→`users`, `revision` INTEGER ≥ 0, `updated_at` | The per-user optimistic-concurrency counter. Every user gets a row (revision 0) at creation. |
+
+Until the auth ticket lands there is one **bootstrap owner** (`server/users.ts`,
+`BOOTSTRAP_USER_ID`); the token exchange mints sessions for them and the v1→v2 migration
+(`server/migrate-schema.ts`) carries the existing single-tenant history onto their row.
 
 It exists because the previous draft of this design shipped a table that omitted `evaluation`,
 `evaluationPolicyId`, `evaluationPolicyVersion` and `note` from workouts, `supersedesId` from plan
@@ -233,11 +271,14 @@ to migrate irreplaceable history over an arithmetic disagreement would be the wo
 
 ## 7. `settings` — `SettingsRecord` (`src/db/schema.ts:134`) — 7 fields
 
-One row: `CHECK (id = 'settings')`.
+One row **per user**, keyed by `user_id` (v2). The `id = 'settings'` singleton column is gone: `id`
+is a constant on the domain record, so `server/rows.ts` does not store it (it is synthesised as
+`'settings'` on decode) and it has no physical column. The physical primary key is `user_id`
+(`REFERENCES users(id) ON DELETE CASCADE`); a missing row means "defaults".
 
 | Property | TS type | Optional? | SQL column | SQL type | Nullable | Validation rule | Index / FK |
 |---|---|---|---|---|---|---|---|
-| `id` | `'settings'` | no | `id` | TEXT | no | `CHECK (id = 'settings')` | PRIMARY KEY |
+| `id` | `'settings'` | no | — (synthesised, not stored) | — | — | constant `'settings'`; the physical PK is `user_id` | — |
 | `bodyweightKg` | `number \| undefined` | **yes** | `bodyweight_kg` | REAL | yes | finite, `> 0` | — |
 | `kcalCoefficient` | `number` | no | `kcal_coefficient` | REAL | no | finite, `>= 0` (default `0.003`) | — |
 | `restOverrideSeconds` | `number \| undefined` | **yes** | `rest_override_seconds` | REAL | yes | finite ≥ 0. Typed into a number input (`Settings.tsx:202`) | — |

@@ -23,6 +23,7 @@ import {
 } from './index.js';
 import { API_VERSION, ratchet, type Snapshot } from './routes.js';
 import { SESSION_COOKIE, SessionStore } from './session.js';
+import { createUser } from './users.js';
 
 const TOKEN = 'a-token-long-enough-to-be-accepted';
 
@@ -48,7 +49,13 @@ afterEach(async () => {
   }
 });
 
-async function start(options: { limiter?: AttemptLimiter; sessions?: SessionStore } = {}): Promise<Harness> {
+async function start(
+  options: {
+    limiter?: AttemptLimiter;
+    sessions?: SessionStore;
+    sessionOptions?: { maxAgeMs?: number; idleMs?: number };
+  } = {},
+): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'godmode-api-'));
   dirs.push(dir);
   const staticRoot = join(dir, 'static');
@@ -62,6 +69,7 @@ async function start(options: { limiter?: AttemptLimiter; sessions?: SessionStor
     now: () => now,
     ...(options.limiter === undefined ? {} : { limiter: options.limiter }),
     ...(options.sessions === undefined ? {} : { sessions: options.sessions }),
+    ...(options.sessionOptions === undefined ? {} : { sessionOptions: options.sessionOptions }),
   });
   await new Promise<void>((done) => {
     running.server.listen(0, '127.0.0.1', done);
@@ -294,7 +302,7 @@ describe('authentication', () => {
   });
 
   it('expires a session and reports it as unauthenticated', async () => {
-    const harness = await start({ sessions: new SessionStore({ maxAgeMs: 1000, idleMs: 1000 }) });
+    const harness = await start({ sessionOptions: { maxAgeMs: 1000, idleMs: 1000 } });
     const client = new Client(harness.base);
     await client.login();
     expect((await client.send('GET', '/api/session')).body['authenticated']).toBe(true);
@@ -429,7 +437,7 @@ describe('GET /api/snapshot', () => {
     const snapshot = await client.snapshot();
     expect(snapshot).toMatchObject({
       apiVersion: API_VERSION,
-      schemaVersion: 1,
+      schemaVersion: 2,
       revision: 0,
       exercises: [],
       challenges: [],
@@ -1314,5 +1322,100 @@ describe('listener configuration', () => {
     expect(resolvePort('9000')).toBe(9000);
     expect(() => resolvePort('not-a-port')).toThrow();
     expect(() => resolvePort('70000')).toThrow();
+  });
+});
+
+// ── Multi-user isolation (LBV-1478) ───────────────────────────────────────────────────────────
+
+/**
+ * A second authenticated client, for the isolation tests.
+ *
+ * The token exchange only ever mints sessions for the bootstrap owner — real per-user credentials
+ * are a separate auth ticket — so a second user is created directly in the server's own database
+ * and given a session through the server's own store. These are exactly the rows a real
+ * registration will one day write; here they let us prove no endpoint reads or writes across users.
+ */
+function loginAsSecondUser(harness: Harness, userId = 'usr_second'): Client {
+  const { db, sessions, now } = harness.running.context;
+  createUser(db, {
+    id: userId,
+    email: `${userId}@godmode.local`,
+    displayName: 'Second',
+    createdAt: '2026-07-30T00:00:00.000Z',
+  });
+  db.prepare('INSERT INTO user_revisions (user_id, revision, updated_at) VALUES (?, 0, ?)').run(
+    userId,
+    '2026-07-30T00:00:00.000Z',
+  );
+  const client = new Client(harness.base);
+  client.cookie = sessions.create(userId, now());
+  return client;
+}
+
+describe('multi-user isolation', () => {
+  it('user B cannot see user A’s snapshot, records or revision', async () => {
+    const harness = await start();
+    const { client: a } = await seeded(harness); // owner: 1 exercise, 1 challenge, 1 slot
+    const b = loginAsSecondUser(harness);
+
+    const bSnap = await b.snapshot();
+    expect(bSnap.challenges).toEqual([]);
+    expect(bSnap.planSlots).toEqual([]);
+    expect(bSnap.workouts).toEqual([]);
+    expect(bSnap.performanceTests).toEqual([]);
+    expect(bSnap.revision).toBe(0);
+    // Exercises are the global shared catalog (per the LBV-1478 decision), so B does see it.
+    expect(bSnap.exercises.length).toBe(1);
+
+    const aSnap = await a.snapshot();
+    expect(aSnap.challenges.length).toBe(1);
+    expect(aSnap.revision).toBeGreaterThan(0);
+  });
+
+  it('each user’s revision is independent — one user’s writes do not 409 another’s command', async () => {
+    const harness = await start();
+    const { client: a, revision: aRev } = await seeded(harness);
+    expect(aRev).toBeGreaterThan(0);
+    const b = loginAsSecondUser(harness);
+
+    // B is still at revision 0 despite A’s writes, so a command B composed against 0 is accepted.
+    expect((await b.snapshot()).revision).toBe(0);
+    const patched = await b.send('PATCH', '/api/settings', {
+      expectedRevision: 0,
+      patch: { bodyweightKg: 70 },
+    });
+    expect(patched.status).toBe(200);
+    // A’s settings are untouched by B’s write.
+    expect((await a.snapshot()).settings).not.toMatchObject({ bodyweightKg: 70 });
+  });
+
+  it('a workout for one user is invisible to the other', async () => {
+    const harness = await start();
+    const { client: a } = await seeded(harness);
+    const posted = await a.send('POST', '/api/workouts', { workout: workoutCommand() });
+    expect(posted.status).toBe(201);
+
+    const b = loginAsSecondUser(harness);
+    expect((await b.snapshot()).workouts).toEqual([]);
+    expect((await a.snapshot()).workouts.length).toBe(1);
+  });
+
+  it('user B cannot end or append to user A’s challenge even knowing its id', async () => {
+    const harness = await start();
+    await seeded(harness); // owner has challenge ch_1 / slot slot_1
+    const b = loginAsSecondUser(harness);
+
+    // The id is known (say, leaked), but the record is not in B’s scope.
+    const ended = await b.send('POST', '/api/challenges/ch_1/end', {
+      expectedRevision: 0,
+      endReason: 'closed_manually',
+      endedAt: '2026-07-30T10:00:00.000Z',
+    });
+    expect(ended.status).toBe(404);
+    expect(ended.body['error']).toBe('unknown_challenge');
+
+    const appended = await b.send('POST', '/api/workouts', { workout: workoutCommand() });
+    expect(appended.status).toBe(409);
+    expect(appended.body['error']).toBe('unknown_plan_slot');
   });
 });

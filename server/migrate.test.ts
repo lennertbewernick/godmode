@@ -21,6 +21,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { canonicalJson } from './canonical.js';
 import { datasetOfBackup, readDataset, writeDataset } from './dataset.js';
 import { MAXIMAL_BACKUP, MINIMAL_BACKUP, clone } from './fixtures.js';
+import { BOOTSTRAP_USER_ID, ensureBootstrapUser } from './users.js';
 import {
   ImportConflictError,
   MigrationError,
@@ -431,10 +432,11 @@ describe('importBackup — the boundaries Codex named', () => {
     // foreign keys fire at COMMIT and the transaction rolls back rather than half-landing.
     const db = new DatabaseSync(join(tempDir(), 'rollback.sqlite'));
     applySchema(db);
+    ensureBootstrapUser(db);
     const dataset = datasetOfBackup(clone(MAXIMAL_BACKUP) as BackupFile);
     const orphan: WorkoutRecord = { ...extraWorkout(), challengeId: 'ch_does_not_exist' };
     expect(() =>
-      writeDataset(db, { ...dataset, workouts: [...dataset.workouts, orphan] }),
+      writeDataset(db, { ...dataset, workouts: [...dataset.workouts, orphan] }, BOOTSTRAP_USER_ID),
     ).toThrow(/FOREIGN KEY constraint failed/);
     expect((db.prepare('SELECT COUNT(*) AS n FROM workouts').get() as { n: number }).n).toBe(0);
     expect((db.prepare('SELECT COUNT(*) AS n FROM exercises').get() as { n: number }).n).toBe(0);

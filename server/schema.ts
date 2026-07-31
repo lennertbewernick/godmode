@@ -13,7 +13,21 @@ import { fileURLToPath } from 'node:url';
 import type { DatabaseSync } from 'node:sqlite';
 
 /** Must equal `meta.schema_version` seeded by `schema.sql`. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
+
+/**
+ * The `meta.schema_version` currently in a file, or `undefined` if there is no readable meta row.
+ *
+ * Used by the in-place upgrade path (`server/migrate-schema.ts`) to decide whether a file needs
+ * migrating before `assertSchemaVersion` would refuse it. Reads exactly one column and never
+ * throws on a missing table — a database without `meta` is one this build did not create.
+ */
+export function readSchemaVersion(db: DatabaseSync): number | undefined {
+  const row = db.prepare('SELECT schema_version FROM meta WHERE id = ?').get('meta') as
+    | { schema_version?: unknown }
+    | undefined;
+  return typeof row?.schema_version === 'number' ? row.schema_version : undefined;
+}
 
 export const SCHEMA_PATH = fileURLToPath(new URL('./schema.sql', import.meta.url));
 
