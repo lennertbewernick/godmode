@@ -1173,7 +1173,7 @@ export async function handleApi(
         throw new HttpError(
           401,
           'unauthenticated',
-          'Sign in with the shared token before using this endpoint.',
+          'Sign in before using this endpoint.',
         );
       }
     }

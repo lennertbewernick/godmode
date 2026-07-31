@@ -8,11 +8,12 @@
  * legitimately talks to anywhere else.
  *
  * Two entry points:
- *   node server/index.js          start the server; refuses without GODMODE_TOKEN
- *   node server/index.js token    print the generated secret, creating it on first use
+ *   node server/index.js          start the server; runs on real accounts (LBV-1480), no token needed
+ *   node server/index.js token    print the generated dev token, creating it on first use
  *
- * The second exists so the owner is never trained to paste a dummy value: `npm run serve` reads
- * a real secret from a 0600 file outside the repository and puts it in the child's environment.
+ * The second exists for the dev-only `GODMODE_DEV_TOKEN` path: `npm run serve` reads a real secret
+ * from a 0600 file outside the repository and puts it in the child's environment, so a developer is
+ * never trained to paste a dummy value. Production leaves the token unset and signs in with accounts.
  */
 
 import { existsSync } from 'node:fs';
