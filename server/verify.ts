@@ -52,6 +52,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { canonicalJson, isPlainObject } from './canonical.js';
 import { COLLECTIONS, idOf, recordsOf, type CollectionKey, type Dataset } from './dataset.js';
+import { TENANT_COLUMN } from './rows.js';
 import { SCHEMA_VERSION } from './schema.js';
 
 export interface VerificationIssue {
@@ -81,6 +82,12 @@ export class VerificationFailure extends Error {
 export interface ExpectedState {
   readonly dataset: Dataset;
   readonly revision: number;
+  /**
+   * The user the built file's records belong to. The import machinery builds a single-user file
+   * (a backup, or a v1 upgrade, is one person's history), so every per-user row carries this id
+   * and the revision is checked against this user's `user_revisions` row.
+   */
+  readonly userId: string;
 }
 
 export interface VerifyOptions {
@@ -236,11 +243,17 @@ function checkMeta(db: DatabaseSync, expected: ExpectedState, issues: Issues): v
       `expected ${String(SCHEMA_VERSION)}, found ${String(row['schema_version'])}`,
     );
   }
-  if (row['revision'] !== expected.revision) {
+  // The revision is per-user in v2 (`user_revisions`), not on `meta`.
+  const revisionRow = db
+    .prepare(`SELECT revision FROM user_revisions WHERE ${TENANT_COLUMN} = ?`)
+    .get(expected.userId) as { revision?: unknown } | undefined;
+  if (revisionRow === undefined) {
+    issues.add('meta', 'user_revisions', `no revision row for user "${expected.userId}"`);
+  } else if (revisionRow.revision !== expected.revision) {
     issues.add(
       'meta',
-      'meta.revision',
-      `expected ${String(expected.revision)}, found ${String(row['revision'])}`,
+      'user_revisions.revision',
+      `expected ${String(expected.revision)}, found ${String(revisionRow.revision)}`,
     );
   }
 }
@@ -476,7 +489,6 @@ const COLUMN_ORACLE: Readonly<Record<CollectionKey, readonly ColumnSource[]>> = 
     { column: 'import_source', path: 'importSource' },
   ],
   settings: [
-    { column: 'id', path: 'id' },
     { column: 'bodyweight_kg', path: 'bodyweightKg' },
     { column: 'kcal_coefficient', path: 'kcalCoefficient' },
     { column: 'rest_override_seconds', path: 'restOverrideSeconds' },
@@ -512,7 +524,8 @@ function checkColumns(db: DatabaseSync, expected: Dataset, issues: Issues): void
     // trip that cannot see a symmetric defect.
     const info = db.prepare(`PRAGMA table_info(${collection.table})`).all() as { name?: unknown }[];
     for (const { name } of info) {
-      if (typeof name === 'string' && !named.has(name)) {
+      // `user_id` is the tenancy column, not a source property — the oracle deliberately omits it.
+      if (typeof name === 'string' && name !== TENANT_COLUMN && !named.has(name)) {
         issues.add(check, `${collection.table}.${name}`, 'no source property is declared for it');
       }
     }

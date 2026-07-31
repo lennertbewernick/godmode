@@ -32,8 +32,10 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { acquireLock, type HeldLock } from './lock.js';
 import { SETTINGS_ROW_ID } from './fields.js';
-import { SETTINGS, bindValues, insertSql, type TableMapping } from './rows.js';
+import { migrateFileToCurrent } from './migrate-schema.js';
+import { SETTINGS, TENANT_COLUMN, bindValues, insertSql, type TableMapping } from './rows.js';
 import { SCHEMA_VERSION, applySchema, armConnection, assertSchemaVersion } from './schema.js';
+import { ensureBootstrapUser, resolveOwner } from './users.js';
 import type { SettingsRecord } from '../src/db/schema.js';
 
 /** The file inside the data directory. Named, not derived, so a rename is a deliberate edit. */
@@ -168,14 +170,28 @@ export interface OpenedDatabase {
  * The lock comes first, before the file is touched at all, so a refusal means nothing was opened.
  */
 export function openDatabase(options: OpenOptions = {}): OpenedDatabase {
-  const dataDir = ensureDataDir(options.dataDir ?? resolveDataDir(options.host ?? currentHost()));
+  const host = options.host ?? currentHost();
+  const dataDir = ensureDataDir(options.dataDir ?? resolveDataDir(host));
   const path = join(dataDir, options.filename ?? DATABASE_FILENAME);
+  const owner = resolveOwner(host.env);
 
   const warn =
     options.onStaleLockReclaimed ??
     ((message: string) => {
       console.warn(message);
     });
+
+  // Bring an older on-disk schema up to this build's version before anything opens the file for
+  // writing. The migration takes and releases its own ownership lock (`server/migrate-schema.ts`),
+  // so it must run before the server's lock below, not after — a rename under an open connection is
+  // exactly what the lock exists to prevent. Skipped for the non-exclusive test connection, which
+  // deliberately opens a second handle to a file another connection already owns.
+  if (options.exclusive !== false) {
+    migrateFileToCurrent(path, {
+      owner: { email: owner.email, displayName: owner.displayName },
+      onMigrated: warn,
+    });
+  }
 
   const lock =
     options.exclusive === false
@@ -214,6 +230,10 @@ export function openDatabase(options: OpenOptions = {}): OpenedDatabase {
     } else {
       assertSchemaVersion(db);
     }
+    // Every database — fresh or migrated — has exactly one bootstrap owner (`server/users.ts`), so
+    // the token exchange has a user to mint sessions for and every per-user query has a tenant.
+    // Idempotent: a migrated file already carries the owner, and this leaves it untouched.
+    ensureBootstrapUser(db, { email: owner.email, displayName: owner.displayName });
     let closed = false;
     return {
       db,
@@ -309,55 +329,88 @@ function rollbackQuietly(db: DatabaseSync): void {
 // ── The revision counter ────────────────────────────────────────────────────────────────────
 
 /**
- * `meta.revision` is the dataset's version for optimistic concurrency.
+ * The per-user dataset version for optimistic concurrency (`user_revisions`, v2).
  *
- * One counter for the whole dataset rather than per record, because the commands here are
- * multi-record by nature — starting the next block touches challenges, plan slots, performance
- * tests and settings in one transaction — and a per-record version would have to be checked in
- * a set the client cannot know in advance.
+ * One counter per user rather than per record, because the commands here are multi-record by
+ * nature — starting the next block touches challenges, plan slots, performance tests and settings
+ * in one transaction — and a per-record version would have to be checked in a set the client
+ * cannot know in advance. Per *user* rather than per *file* (v1's `meta.revision`) so one user's
+ * write never bumps the revision another user's client is holding and 409s their next command.
+ *
+ * Every user has a `user_revisions` row from the moment they are created (`server/users.ts`); a
+ * missing row is a bug, not a fresh-user default, and is reported rather than silently zeroed.
  */
-export function readRevision(db: DatabaseSync): number {
-  const row = db.prepare('SELECT revision FROM meta WHERE id = ?').get('meta') as
-    | { revision: number }
-    | undefined;
+export function readRevision(db: DatabaseSync, userId: string): number {
+  const row = db.prepare(`SELECT revision FROM user_revisions WHERE ${TENANT_COLUMN} = ?`).get(
+    userId,
+  ) as { revision: number } | undefined;
   if (row === undefined) {
-    throw new Error('meta row is missing: this database was not created by schema.sql');
+    throw new Error(`no user_revisions row for user "${userId}": the user was not created cleanly`);
   }
   return row.revision;
 }
 
-/** Bump the revision. Called exactly once per accepted command, inside its transaction. */
-export function bumpRevision(db: DatabaseSync, nowIso: string): number {
-  const next = readRevision(db) + 1;
-  db.prepare('UPDATE meta SET revision = ?, updated_at = ? WHERE id = ?').run(next, nowIso, 'meta');
+/** Bump one user's revision. Called exactly once per accepted command, inside its transaction. */
+export function bumpRevision(db: DatabaseSync, userId: string, nowIso: string): number {
+  const next = readRevision(db, userId) + 1;
+  db.prepare(`UPDATE user_revisions SET revision = ?, updated_at = ? WHERE ${TENANT_COLUMN} = ?`).run(
+    next,
+    nowIso,
+    userId,
+  );
   return next;
 }
 
 // ── Record helpers ──────────────────────────────────────────────────────────────────────────
+//
+// `userId` scopes every `perUser` table (`server/rows.ts`): it is injected on insert and required
+// on read, so no helper can reach across users. For a global table (`exercises`) it is ignored —
+// the argument is still required so call sites are uniform and cannot forget it for a table that
+// does need it.
 
 /** Insert one record through its table mapping. Plain INSERT — never `INSERT OR REPLACE`. */
-export function insertRecord<R>(db: DatabaseSync, mapping: TableMapping<R>, record: R): void {
+export function insertRecord<R>(
+  db: DatabaseSync,
+  mapping: TableMapping<R>,
+  record: R,
+  userId: string,
+): void {
   const values = bindValues(mapping, mapping.encode(record));
+  if (mapping.perUser) {
+    const columns = [TENANT_COLUMN, ...mapping.columns];
+    const placeholders = columns.map(() => '?').join(', ');
+    db.prepare(`INSERT INTO ${mapping.table} (${columns.join(', ')}) VALUES (${placeholders})`).run(
+      userId,
+      ...values,
+    );
+    return;
+  }
   db.prepare(insertSql(mapping)).run(...values);
 }
 
-/** Read one record by primary key, or `undefined`. Decoding re-validates it on the way out. */
+/** Read one record by primary key within the user's scope. Decoding re-validates it. */
 export function findRecord<R>(
   db: DatabaseSync,
   mapping: TableMapping<R>,
   id: string,
+  userId: string,
 ): R | undefined {
-  const row = db.prepare(`SELECT * FROM ${mapping.table} WHERE id = ?`).get(id);
+  const row = mapping.perUser
+    ? db.prepare(`SELECT * FROM ${mapping.table} WHERE id = ? AND ${TENANT_COLUMN} = ?`).get(id, userId)
+    : db.prepare(`SELECT * FROM ${mapping.table} WHERE id = ?`).get(id);
   return row === undefined ? undefined : mapping.decode(row as Record<string, unknown>);
 }
 
-/** Read every record of a table in a stated order. */
+/** Read every record of a table the user owns, in a stated order. */
 export function listRecords<R>(
   db: DatabaseSync,
   mapping: TableMapping<R>,
   orderBy: string,
+  userId: string,
 ): R[] {
-  const rows = db.prepare(`SELECT * FROM ${mapping.table} ORDER BY ${orderBy}`).all();
+  const rows = mapping.perUser
+    ? db.prepare(`SELECT * FROM ${mapping.table} WHERE ${TENANT_COLUMN} = ? ORDER BY ${orderBy}`).all(userId)
+    : db.prepare(`SELECT * FROM ${mapping.table} ORDER BY ${orderBy}`).all();
   return rows.map((row) => mapping.decode(row as Record<string, unknown>));
 }
 
@@ -375,24 +428,31 @@ export const DEFAULT_SETTINGS_ROW: SettingsRecord = {
   kcalCoefficient: 0.003,
 };
 
-export function readSettings(db: DatabaseSync): SettingsRecord {
-  return findRecord(db, SETTINGS, SETTINGS_ROW_ID) ?? { ...DEFAULT_SETTINGS_ROW };
+export function readSettings(db: DatabaseSync, userId: string): SettingsRecord {
+  const row = db.prepare(`SELECT * FROM settings WHERE ${TENANT_COLUMN} = ?`).get(userId);
+  return row === undefined
+    ? { ...DEFAULT_SETTINGS_ROW }
+    : SETTINGS.decode(row as Record<string, unknown>);
 }
 
 /**
- * Write the settings row, creating it if this is the first save.
+ * Write one user's settings row, creating it if this is their first save.
  *
- * `ON CONFLICT ... DO UPDATE`, never `INSERT OR REPLACE`: replace deletes the existing row and
- * inserts a new one, which fires `ON DELETE` actions and would make settings a foreign-key
- * hazard for no reason.
+ * `ON CONFLICT (user_id) DO UPDATE`, never `INSERT OR REPLACE`: replace deletes the existing row
+ * and inserts a new one, which fires `ON DELETE` actions and would make settings a foreign-key
+ * hazard for no reason. `SETTINGS.columns` is the domain columns only; `user_id` is prepended
+ * here, exactly as `insertRecord` does for every other `perUser` table.
  */
-export function writeSettings(db: DatabaseSync, record: SettingsRecord): void {
+export function writeSettings(db: DatabaseSync, userId: string, record: SettingsRecord): void {
+  const columns = [TENANT_COLUMN, ...SETTINGS.columns];
+  const placeholders = columns.map(() => '?').join(', ');
   const assignments = SETTINGS.columns
-    .filter((column) => column !== 'id')
     .map((column) => `${column} = excluded.${column}`)
     .join(', ');
-  const sql = `${insertSql(SETTINGS)} ON CONFLICT (id) DO UPDATE SET ${assignments}`;
-  db.prepare(sql).run(...bindValues(SETTINGS, SETTINGS.encode(record)));
+  const sql =
+    `INSERT INTO settings (${columns.join(', ')}) VALUES (${placeholders}) ` +
+    `ON CONFLICT (${TENANT_COLUMN}) DO UPDATE SET ${assignments}`;
+  db.prepare(sql).run(userId, ...bindValues(SETTINGS, SETTINGS.encode(record)));
 }
 
 /** Re-exported so callers do not have to know which module owns the number. */

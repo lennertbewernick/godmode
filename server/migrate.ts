@@ -80,6 +80,7 @@ import {
   type Dataset,
 } from './dataset.js';
 import { applySchema, armConnection, assertSchemaVersion } from './schema.js';
+import { BOOTSTRAP_USER_ID, ensureBootstrapUser } from './users.js';
 import { validateBackupStrict } from './validate.js';
 import { verifyDatabase, type ExpectedState } from './verify.js';
 
@@ -472,13 +473,19 @@ function importUnderLock(options: ImportOptions, incoming: Dataset, lock: HeldLo
       try {
         armConnection(current);
         assertSchemaVersion(current);
-        const meta = current.prepare('SELECT revision, created_at FROM meta').get() as
-          | { revision: number; created_at: string }
+        const meta = current.prepare('SELECT created_at FROM meta').get() as
+          | { created_at: string }
           | undefined;
-        existingRevision = meta?.revision ?? 0;
+        // The revision is per-user in v2 (`user_revisions`). The import machinery works on a
+        // single-user file — the bootstrap owner — so this reads that owner's counter.
+        const revisionRow = current
+          .prepare('SELECT revision FROM user_revisions WHERE user_id = ?')
+          .get(BOOTSTRAP_USER_ID) as { revision: number } | undefined;
+        existingRevision = revisionRow?.revision ?? 0;
       if (!Number.isSafeInteger(existingRevision) || existingRevision < 0) {
         throw new Error(
-          `meta.revision is ${String(existingRevision)}, which is not a usable revision number.`,
+          `user_revisions.revision is ${String(existingRevision)}, which is not a usable ` +
+            'revision number.',
         );
       }
         createdAt = meta?.created_at;
@@ -506,7 +513,11 @@ function importUnderLock(options: ImportOptions, incoming: Dataset, lock: HeldLo
   // A rebuilt dataset invalidates any revision a client is holding, so the revision moves whenever
   // a record was added. A true no-op keeps it, because nothing a client could be holding changed.
   const revision = existingRevision + (plan.insertedTotal > 0 ? 1 : 0);
-  const expectedState: ExpectedState = { dataset: plan.expected, revision };
+  const expectedState: ExpectedState = {
+    dataset: plan.expected,
+    revision,
+    userId: BOOTSTRAP_USER_ID,
+  };
 
   // 5. Build — in the target's own directory, so the rename at the end is a same-filesystem move
   //    and therefore atomic. A temporary file under /tmp would make it a copy, which is not.
@@ -518,11 +529,16 @@ function importUnderLock(options: ImportOptions, incoming: Dataset, lock: HeldLo
     const fresh = new DatabaseSync(temporaryPath);
     try {
       applySchema(fresh);
-      writeDataset(fresh, plan.expected);
       const now = new Date().toISOString();
+      // One owner for the whole file (the import machinery is single-user); all records land on it.
+      ensureBootstrapUser(fresh, { now });
+      writeDataset(fresh, plan.expected, BOOTSTRAP_USER_ID);
       fresh
-        .prepare('UPDATE meta SET revision = ?, created_at = ?, updated_at = ? WHERE id = ?')
-        .run(revision, createdAt ?? now, now, 'meta');
+        .prepare('UPDATE meta SET created_at = ?, updated_at = ? WHERE id = ?')
+        .run(createdAt ?? now, now, 'meta');
+      fresh
+        .prepare('UPDATE user_revisions SET revision = ?, updated_at = ? WHERE user_id = ?')
+        .run(revision, now, BOOTSTRAP_USER_ID);
 
       options.hooks?.afterInsert?.(fresh);
 

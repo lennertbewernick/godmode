@@ -157,7 +157,7 @@ export function createGodmodeServer(options: ServerOptions = {}): RunningServer 
 
   const context: ApiContext = {
     db: opened.db,
-    sessions: options.sessions ?? new SessionStore(),
+    sessions: options.sessions ?? new SessionStore(opened.db),
     tokenDigest: digest(token),
     limiter: options.limiter ?? new AttemptLimiter(),
     now: options.now ?? (() => Date.now()),

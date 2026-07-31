@@ -50,6 +50,7 @@
 
 import { randomBytes } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
+import type { DatabaseSync } from 'node:sqlite';
 
 export const SESSION_COOKIE = 'godmode_session';
 
@@ -59,79 +60,115 @@ export const SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** Idle lifetime. Sliding, so an app left open for a month is not logged out mid-workout. */
 export const SESSION_IDLE_MS = 7 * 24 * 60 * 60 * 1000;
 
-interface SessionEntry {
-  readonly createdAt: number;
-  lastSeenAt: number;
-}
-
 export interface SessionOptions {
   readonly maxAgeMs?: number;
   readonly idleMs?: number;
 }
 
+interface SessionRow {
+  user_id: string;
+  created_at: number;
+  last_seen_at: number;
+}
+
+/**
+ * Sessions persisted in SQLite instead of an in-memory `Map`.
+ *
+ * ## Why persisted
+ *
+ * The in-memory map died with the process, so every deploy or restart logged everyone out. That
+ * is tolerable for a single owner on a laptop; it is not for a hosted app a group of people share.
+ * The rows live in the `sessions` table (`server/schema.sql`), keyed by the same opaque 256-bit id
+ * the cookie carries, and each names the `user_id` it authenticates — that is how a request
+ * becomes a `req.userId` in `server/routes.ts`.
+ *
+ * The absolute/idle expiry semantics are unchanged from the map: a session is dead when it is
+ * older than `maxAgeMs` however recently used, or idle for longer than `idleMs`. Expiry is still
+ * enforced on read, and an expired row is deleted rather than merely rejected, so a leaked old id
+ * cannot be kept alive by probing it.
+ */
 export class SessionStore {
-  readonly #sessions = new Map<string, SessionEntry>();
+  readonly #db: DatabaseSync;
   readonly #maxAgeMs: number;
   readonly #idleMs: number;
 
-  constructor(options: SessionOptions = {}) {
+  constructor(db: DatabaseSync, options: SessionOptions = {}) {
+    this.#db = db;
     this.#maxAgeMs = options.maxAgeMs ?? SESSION_MAX_AGE_MS;
     this.#idleMs = options.idleMs ?? SESSION_IDLE_MS;
   }
 
-  /** 256 bits from the CSPRNG. Opaque: it encodes nothing, so nothing leaks if it is seen. */
-  create(now: number): string {
+  /**
+   * Mint a session for `userId`. 256 bits from the CSPRNG — opaque, so nothing leaks if it is
+   * seen. A new id is always generated and never adopted from the caller (fixation impossibility;
+   * see the note above).
+   */
+  create(userId: string, now: number): string {
     this.prune(now);
     const id = randomBytes(32).toString('base64url');
-    this.#sessions.set(id, { createdAt: now, lastSeenAt: now });
+    this.#db
+      .prepare('INSERT INTO sessions (id, user_id, created_at, last_seen_at) VALUES (?, ?, ?, ?)')
+      .run(id, userId, now, now);
     return id;
   }
 
   /**
-   * True when this id names a live session, refreshing its idle clock as a side effect.
+   * The `user_id` this session authenticates, or `undefined` if it is unknown or expired.
    *
-   * An expired entry is deleted here rather than merely rejected, so an attacker who somehow
-   * learned an old id cannot keep it alive in the map by probing it.
+   * Refreshes the idle clock as a side effect. An expired row is deleted here rather than merely
+   * rejected.
    */
-  validate(id: string | undefined, now: number): boolean {
-    if (id === undefined || id === '') return false;
-    const entry = this.#sessions.get(id);
-    if (entry === undefined) return false;
-    if (this.#isExpired(entry, now)) {
-      this.#sessions.delete(id);
-      return false;
+  validate(id: string | undefined, now: number): string | undefined {
+    if (id === undefined || id === '') return undefined;
+    const row = this.#db
+      .prepare('SELECT user_id, created_at, last_seen_at FROM sessions WHERE id = ?')
+      .get(id) as SessionRow | undefined;
+    if (row === undefined) return undefined;
+    if (this.#isExpired(row, now)) {
+      this.#db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
+      return undefined;
     }
-    entry.lastSeenAt = now;
-    return true;
+    this.#db.prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ?').run(now, id);
+    return row.user_id;
   }
 
   destroy(id: string | undefined): void {
-    if (id !== undefined && id !== '') this.#sessions.delete(id);
+    if (id !== undefined && id !== '') this.#db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
   }
 
   /** Used when the token is rotated: every existing session must stop working at once. */
   destroyAll(): void {
-    this.#sessions.clear();
+    this.#db.prepare('DELETE FROM sessions').run();
+  }
+
+  /** Every session belonging to one user — the shape a per-user "sign out everywhere" needs. */
+  destroyAllForUser(userId: string): void {
+    this.#db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
   }
 
   prune(now: number): void {
-    for (const [id, entry] of this.#sessions) {
-      if (this.#isExpired(entry, now)) this.#sessions.delete(id);
-    }
+    const absoluteCutoff = now - this.#maxAgeMs;
+    const idleCutoff = now - this.#idleMs;
+    this.#db
+      .prepare('DELETE FROM sessions WHERE created_at <= ? OR last_seen_at <= ?')
+      .run(absoluteCutoff, idleCutoff);
   }
 
   get size(): number {
-    return this.#sessions.size;
+    const row = this.#db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number };
+    return row.n;
   }
 
   /** When the given session stops being valid even if used continuously. */
   expiresAt(id: string): number | undefined {
-    const entry = this.#sessions.get(id);
-    return entry === undefined ? undefined : entry.createdAt + this.#maxAgeMs;
+    const row = this.#db.prepare('SELECT created_at FROM sessions WHERE id = ?').get(id) as
+      | { created_at: number }
+      | undefined;
+    return row === undefined ? undefined : row.created_at + this.#maxAgeMs;
   }
 
-  #isExpired(entry: SessionEntry, now: number): boolean {
-    return now - entry.createdAt >= this.#maxAgeMs || now - entry.lastSeenAt >= this.#idleMs;
+  #isExpired(row: SessionRow, now: number): boolean {
+    return now - row.created_at >= this.#maxAgeMs || now - row.last_seen_at >= this.#idleMs;
   }
 }
 

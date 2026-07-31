@@ -27,6 +27,7 @@ import {
   PERFORMANCE_TEST_FIELDS,
   PLAN_SLOT_FIELDS,
   SETTINGS_FIELDS,
+  SETTINGS_ROW_ID,
   WORKOUT_FIELDS,
   type FieldSpecMap,
 } from './fields.js';
@@ -85,9 +86,21 @@ export interface TableMapping<R> {
   readonly table: string;
   readonly columns: readonly string[];
   readonly fields: FieldSpecMap;
+  /**
+   * Whether this table carries a `user_id` tenancy column (`server/schema.sql`, v2).
+   *
+   * `columns`/`encode`/`decode` deliberately describe only the DOMAIN record — `user_id` is not a
+   * property of any record type in `src/db/schema.ts`. The writers and readers in `server/db.ts`
+   * and `server/dataset.ts` add and filter `user_id` themselves for a `perUser` table, so the
+   * mapping stays a pure record ↔ row translation. `exercises` is global and sets this `false`.
+   */
+  readonly perUser: boolean;
   readonly encode: (record: R) => SqlRow;
   readonly decode: (row: Readonly<Record<string, unknown>>) => R;
 }
+
+/** The tenancy column, named once. Injected on write and filtered on read for `perUser` tables. */
+export const TENANT_COLUMN = 'user_id';
 
 /**
  * `INSERT INTO t (a, b) VALUES (?, ?)` — never `INSERT OR REPLACE`.
@@ -118,6 +131,7 @@ export const EXERCISES: TableMapping<ExerciseRecord> = {
   table: 'exercises',
   columns: ['id', 'label', 'unit', 'created_at'],
   fields: EXERCISE_FIELDS,
+  perUser: false,
   encode: (record) => ({
     id: record.id,
     label: record.label,
@@ -165,6 +179,7 @@ export const CHALLENGES: TableMapping<ChallengeRecord> = {
     'end_reason',
   ],
   fields: CHALLENGE_FIELDS,
+  perUser: true,
   encode: (record) => ({
     id: record.id,
     exercise_id: record.exerciseId,
@@ -236,6 +251,7 @@ export const PERFORMANCE_TESTS: TableMapping<PerformanceTest> = {
     'note',
   ],
   fields: PERFORMANCE_TEST_FIELDS,
+  perUser: true,
   encode: (record) => ({
     id: record.id,
     exercise_id: record.exerciseId,
@@ -288,6 +304,7 @@ export const PLAN_SLOTS: TableMapping<PlanSlotRecord> = {
     'supersedes_id',
   ],
   fields: PLAN_SLOT_FIELDS,
+  perUser: true,
   encode: (record) => ({
     id: record.id,
     challenge_id: record.challengeId,
@@ -367,6 +384,7 @@ export const WORKOUTS: TableMapping<WorkoutRecord> = {
     'import_source',
   ],
   fields: WORKOUT_FIELDS,
+  perUser: true,
   encode: (record) => ({
     id: record.id,
     challenge_id: record.challengeId,
@@ -448,10 +466,18 @@ export const WORKOUTS: TableMapping<WorkoutRecord> = {
 
 // ── settings ────────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Settings, one row per user (v2), keyed by `user_id` — the `id = 'settings'` singleton is gone.
+ *
+ * The domain `SettingsRecord` still carries `id: 'settings'` for the client and the backup format,
+ * but the server does not store it: `id` is a constant, so `encode` never emits it and `decode`
+ * synthesises it. `columns` therefore lists only the persisted domain columns — `user_id` is added
+ * by the writers/readers in `server/db.ts` and `server/dataset.ts` like every other `perUser`
+ * table.
+ */
 export const SETTINGS: TableMapping<SettingsRecord> = {
   table: 'settings',
   columns: [
-    'id',
     'bodyweight_kg',
     'kcal_coefficient',
     'rest_override_seconds',
@@ -460,8 +486,8 @@ export const SETTINGS: TableMapping<SettingsRecord> = {
     'selected_challenge_id',
   ],
   fields: SETTINGS_FIELDS,
+  perUser: true,
   encode: (record) => ({
-    id: record.id,
     bodyweight_kg: record.bodyweightKg ?? null,
     kcal_coefficient: record.kcalCoefficient,
     rest_override_seconds: record.restOverrideSeconds ?? null,
@@ -472,7 +498,7 @@ export const SETTINGS: TableMapping<SettingsRecord> = {
   decode: (row) =>
     validateOne<SettingsRecord>(
       {
-        id: row['id'],
+        id: SETTINGS_ROW_ID,
         ...optional('bodyweightKg', row['bodyweight_kg']),
         kcalCoefficient: row['kcal_coefficient'],
         ...optional('restOverrideSeconds', row['rest_override_seconds']),

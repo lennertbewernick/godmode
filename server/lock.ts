@@ -122,7 +122,7 @@ export function lockPathFor(databasePath: string): string {
   return `${databasePath}${LOCK_SUFFIX}`;
 }
 
-export type LockRole = 'server' | 'import';
+export type LockRole = 'server' | 'import' | 'migrate';
 
 /** What one holder writes about itself. JSON, human-readable, one file. */
 export interface LockRecord {
@@ -382,6 +382,7 @@ export class LockUnavailableError extends Error {
 const ROLE_LABEL: Record<LockRole, string> = {
   server: 'the GodMode server',
   import: 'another import',
+  migrate: 'a schema migration',
 };
 
 /**

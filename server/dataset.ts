@@ -22,6 +22,7 @@ import {
   PERFORMANCE_TESTS,
   PLAN_SLOTS,
   SETTINGS,
+  TENANT_COLUMN,
   WORKOUTS,
   type SqlRow,
   type TableMapping,
@@ -74,6 +75,8 @@ export interface CollectionSpec {
   readonly key: CollectionKey;
   readonly table: string;
   readonly columns: readonly string[];
+  /** Whether the table carries a `user_id` tenancy column — injected on write (`writeDataset`). */
+  readonly perUser: boolean;
   readonly encode: (record: unknown) => SqlRow;
   readonly decode: (row: Readonly<Record<string, unknown>>) => unknown;
 }
@@ -83,6 +86,7 @@ function erase<R>(key: CollectionKey, mapping: TableMapping<R>): CollectionSpec 
     key,
     table: mapping.table,
     columns: mapping.columns,
+    perUser: mapping.perUser,
     // The cast is safe because `encode` is only ever reached with a record that came out of
     // `decode` or out of `validateBackupStrict` — both of which have already checked it against
     // the very field map this mapping carries. Nothing else in this layer constructs a record.
@@ -175,34 +179,40 @@ export function readDataset(db: DatabaseSync): Dataset {
 }
 
 /**
- * Insert a whole dataset in one transaction.
+ * Insert a whole dataset in one transaction, owned by `userId`.
+ *
+ * Every `perUser` table (`server/rows.ts`) gets `user_id` prepended to its columns and bound to
+ * `userId`; the global `exercises` table does not. The domain encoders never produce `user_id` —
+ * it is not a record field — so it is added here, exactly as `insertRecord` does on the live path.
  *
  * Plain `INSERT`, from `rows.ts`, which has no other mode. Never `INSERT OR REPLACE`: SQLite's
  * `REPLACE` deletes the conflicting row and re-inserts it, firing `ON DELETE` actions and
  * cascading through foreign keys (`server/rows.ts:92-98`). A re-run of an import must be
  * insert / no-op / abort, never a silent delete-and-reinsert.
  */
-export function writeDataset(db: DatabaseSync, dataset: Dataset): void {
+export function writeDataset(db: DatabaseSync, dataset: Dataset, userId: string): void {
   db.exec('BEGIN IMMEDIATE');
   try {
     for (const collection of COLLECTIONS) {
       const records = recordsOf(dataset, collection.key);
       if (records.length === 0) continue;
+      const columns = collection.perUser
+        ? [TENANT_COLUMN, ...collection.columns]
+        : collection.columns;
       const statement = db.prepare(
-        `INSERT INTO ${collection.table} (${collection.columns.join(', ')}) ` +
-          `VALUES (${collection.columns.map(() => '?').join(', ')})`,
+        `INSERT INTO ${collection.table} (${columns.join(', ')}) ` +
+          `VALUES (${columns.map(() => '?').join(', ')})`,
       );
       for (const record of records) {
         const row = collection.encode(record);
-        statement.run(
-          ...collection.columns.map((column) => {
-            const value = row[column];
-            if (value === undefined) {
-              throw new Error(`${collection.table}: encoder produced no value for "${column}"`);
-            }
-            return value;
-          }),
-        );
+        const values = collection.columns.map((column) => {
+          const value = row[column];
+          if (value === undefined) {
+            throw new Error(`${collection.table}: encoder produced no value for "${column}"`);
+          }
+          return value;
+        });
+        statement.run(...(collection.perUser ? [userId, ...values] : values));
       }
     }
     db.exec('COMMIT');
