@@ -10,7 +10,7 @@
     "build": "tsc -b && vite build",
     "build:server": "tsc -p tsconfig.server.build.json && cp server/schema.sql dist-server/server/schema.sql",
     "token": "npm run --silent build:server && node dist-server/server/index.js token",
-    "serve": "npm run build:server && GODMODE_TOKEN=\"$(node dist-server/server/index.js token)\" node dist-server/server/index.js",
+    "serve": "npm run build:server && GODMODE_DEV_TOKEN=\"$(node dist-server/server/index.js token)\" node dist-server/server/index.js",
     "start": "npm run build && npm run serve",
     "import-backup": "npm run --silent build:server && node dist-server/server/import-backup.js",
     "preview": "vite preview",

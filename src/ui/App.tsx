@@ -31,6 +31,7 @@ import {
   postWorkout,
   sessionState,
   startNextBlock as startNextBlockCommand,
+  type RegistrationMode,
   type Snapshot,
 } from '../api/client.js';
 import { drainOutbox } from '../api/drain.js';
@@ -83,7 +84,7 @@ import { AddWorkout, ImportHistory, Welcome } from './Welcome.js';
 import { chooseDraftOffer, draftProgress, newDraft } from './draft.js';
 import { TABS, shouldShowWorkoutBar, type Tab } from './nav.js';
 import { buildShareCard, toStatWorkouts } from './shareCardData.js';
-import { Banner, Button, Card, NumberField, Segmented, Spinner } from './kit.js';
+import { Banner, Button, Card, NumberField, Segmented, SourceFooter, Spinner } from './kit.js';
 // The update seam only. Nothing here imports ../pwa/lifecycle.js: that module owns the
 // `virtual:pwa-register` import, which does not resolve under Vitest, and pulling it into this
 // file's module graph would take every App test down with it.
@@ -151,6 +152,29 @@ function daysPerWeek(challenge: ChallengeRecord): number {
   return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : 3;
 }
 
+/**
+ * Read and clear a `?authError=<why>` the Google callback may have redirected back with.
+ *
+ * Returns a human sentence for the sign-in screen, or `undefined` when there is none. Strips the
+ * parameter from the address bar with `replaceState` so a reload does not resurrect the message
+ * and so the code never lingers in a shareable URL.
+ */
+function takeAuthError(): string | undefined {
+  try {
+    const url = new URL(window.location.href);
+    const why = url.searchParams.get('authError');
+    if (why === null) return undefined;
+    url.searchParams.delete('authError');
+    window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
+    if (why === 'invite') {
+      return 'That account needs an invite. Enter your invite code, then continue with Google.';
+    }
+    return 'Google sign-in did not complete. Please try again.';
+  } catch {
+    return undefined;
+  }
+}
+
 function rememberTab(tab: Tab): void {
   try {
     window.localStorage.setItem(TAB_KEY, tab);
@@ -176,6 +200,16 @@ interface State {
 
 export function App() {
   const [session, setSession] = useState<Session>({ kind: 'checking' });
+  /**
+   * Which sign-in affordances the server offers: the Google button only when an OAuth client is
+   * configured, and the invite field only in invite mode. Resolved once from `GET /api/session`.
+   */
+  const [signInOptions, setSignInOptions] = useState<{
+    googleEnabled: boolean;
+    registrationMode: RegistrationMode;
+  }>({ googleEnabled: false, registrationMode: 'invite' });
+  /** A message set when the browser returns from a failed Google sign-in (`?authError=`). */
+  const [authErrorReason, setAuthErrorReason] = useState<string | undefined>(undefined);
   /** Exactly as the server last described it. Never edited in place. */
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   /** Finished workouts this device is still holding. */
@@ -310,6 +344,10 @@ export function App() {
     void (async () => {
       try {
         const state = await sessionState();
+        setSignInOptions({
+          googleEnabled: state.googleEnabled,
+          registrationMode: state.registrationMode,
+        });
         if (!state.authenticated) {
           setSession({ kind: 'signed-out' });
           await readLocal().catch(() => undefined);
@@ -323,6 +361,14 @@ export function App() {
       }
     })();
   }, [load, handleFailure, readLocal]);
+
+  // The Google callback redirects here with `?authError=<why>` when a sign-in did not complete.
+  // Turn it into a message for the sign-in screen and strip it from the URL, so a reload does not
+  // keep showing it.
+  useEffect(() => {
+    const message = takeAuthError();
+    if (message !== undefined) setAuthErrorReason(message);
+  }, []);
 
   // Asked for once, early. Best-effort: the answer is reported in Settings rather than acted on.
   useEffect(() => {
@@ -751,7 +797,12 @@ export function App() {
   if (session.kind === 'signed-out') {
     return (
       <>
-        <SignIn reason={session.reason} onSignedIn={() => void load()} />
+        <SignIn
+          reason={session.reason ?? authErrorReason}
+          googleEnabled={signInOptions.googleEnabled}
+          registrationMode={signInOptions.registrationMode}
+          onSignedIn={() => void load()}
+        />
         {pending.length > 0 ? (
           <div className="mx-auto w-full px-4 pb-6 md:max-w-md">
             <Banner tone="info">
@@ -760,6 +811,7 @@ export function App() {
             </Banner>
           </div>
         ) : null}
+        <SourceFooter className="mx-auto w-full px-4 md:max-w-md" />
       </>
     );
   }
@@ -1175,6 +1227,8 @@ export function App() {
           {...(card === undefined ? {} : { card })}
         />
       ) : null}
+
+      <SourceFooter />
     </div>
   );
 }

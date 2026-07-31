@@ -5,6 +5,34 @@
 
 import { useEffect, useId, useRef, type ReactNode } from 'react';
 
+/** The repository this build is served from; a deployment overrides it at build time (see below). */
+const SOURCE_URL =
+  import.meta.env.VITE_GODMODE_REPO_URL?.trim() || 'https://github.com/lennertbewernick/godmode';
+
+/**
+ * The AGPL §13 "Source code" link.
+ *
+ * This app is served to users over a network, so the AGPL requires offering them the source of
+ * the exact version they are interacting with. A visible link to the repository satisfies that.
+ * The URL is a build-time env var (`VITE_SOURCE_URL`) so a deployment points at its own tree
+ * rather than at wherever this happened to be forked from.
+ */
+export function SourceFooter({ className = '' }: { className?: string }) {
+  return (
+    <footer className={`pb-6 pt-4 text-center text-xs text-slate-600 ${className}`}>
+      <a
+        href={SOURCE_URL}
+        target="_blank"
+        rel="noreferrer"
+        className="underline underline-offset-2 hover:text-slate-400"
+      >
+        Source code
+      </a>{' '}
+      · AGPL-3.0
+    </footer>
+  );
+}
+
 export function Card({
   children,
   className = '',

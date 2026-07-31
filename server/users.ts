@@ -22,6 +22,7 @@
  * to be scoped by it.
  */
 
+import { randomBytes } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 
 /**
@@ -70,6 +71,18 @@ function decodeUser(row: UserRow): UserRecord {
     ...(row.google_sub === null ? {} : { googleSub: row.google_sub }),
     createdAt: row.created_at,
   };
+}
+
+/**
+ * A fresh, opaque user id.
+ *
+ * `usr_` + 96 bits of base64url. Random rather than sequential so an id reveals neither how many
+ * users exist nor the order they joined in, and prefixed so it is recognisable in a log line as a
+ * user id and not a session or a record id. The owner keeps the fixed `usr_owner`
+ * (`BOOTSTRAP_USER_ID`); every account the auth ticket creates gets one of these.
+ */
+export function generateUserId(): string {
+  return `usr_${randomBytes(12).toString('base64url')}`;
 }
 
 /** Insert one user. Plain INSERT — a duplicate id, email or google_sub is a caller error. */
@@ -160,4 +173,61 @@ export function ensureBootstrapUser(
     now,
   );
   return owner;
+}
+
+export interface NewUser {
+  readonly email: string;
+  readonly displayName: string;
+  readonly passwordHash?: string;
+  readonly googleSub?: string;
+  readonly now?: string;
+}
+
+/**
+ * Create a real account and everything a per-user tenant needs to exist.
+ *
+ * A user with no `user_revisions` row would have no revision counter, and their first write would
+ * have nothing to bump (`server/db.ts:bumpRevision`), so the two rows are created together in one
+ * transaction — the same pairing `ensureBootstrapUser` makes for the owner. The id is generated
+ * here, not supplied, so a caller can never collide with the owner's fixed id or another user's.
+ *
+ * A duplicate email or `google_sub` raises SQLite's `UNIQUE` constraint from `createUser`; the
+ * caller turns that into the right HTTP answer rather than this module guessing at one.
+ */
+export function registerUser(db: DatabaseSync, user: NewUser): UserRecord {
+  const now = user.now ?? new Date().toISOString();
+  const record: UserRecord = {
+    id: generateUserId(),
+    email: user.email,
+    displayName: user.displayName,
+    ...(user.passwordHash === undefined ? {} : { passwordHash: user.passwordHash }),
+    ...(user.googleSub === undefined ? {} : { googleSub: user.googleSub }),
+    createdAt: now,
+  };
+  const tx = db.prepare('BEGIN');
+  tx.run();
+  try {
+    createUser(db, record);
+    db.prepare('INSERT INTO user_revisions (user_id, revision, updated_at) VALUES (?, 0, ?)').run(
+      record.id,
+      now,
+    );
+    db.prepare('COMMIT').run();
+  } catch (cause) {
+    db.prepare('ROLLBACK').run();
+    throw cause;
+  }
+  return record;
+}
+
+/**
+ * Link a Google identity to an account that already exists.
+ *
+ * Used when someone who first registered by password later signs in with a Google account of the
+ * same email: rather than a second, duplicate account, the `google_sub` is attached to the one
+ * they have, so both methods reach the same training history. Scoped by `id`; the caller has
+ * already established that the row is the right one.
+ */
+export function attachGoogleSub(db: DatabaseSync, id: string, googleSub: string): void {
+  db.prepare('UPDATE users SET google_sub = ? WHERE id = ?').run(googleSub, id);
 }

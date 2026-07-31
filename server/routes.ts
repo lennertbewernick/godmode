@@ -94,7 +94,11 @@ import {
 import { SCHEMA_VERSION } from './schema.js';
 import { clearedSessionCookie, readSessionId, sessionCookie } from './session.js';
 import type { SessionStore } from './session.js';
-import { BOOTSTRAP_USER_ID } from './users.js';
+import { hashPassword, passwordTooShort, verifyPassword } from './passwords.js';
+import { evaluate as evaluateGate } from './registration.js';
+import type { RegistrationGate } from './registration.js';
+import type { GoogleOAuthConfig } from './google-oauth.js';
+import { BOOTSTRAP_USER_ID, findUserByEmail, registerUser } from './users.js';
 import { BackupValidationError, validateOne } from './validate.js';
 import type { PerformanceTest } from '../src/core/types.js';
 import type {
@@ -116,8 +120,21 @@ export const API_VERSION = 1;
 export interface ApiContext {
   readonly db: DatabaseSync;
   readonly sessions: SessionStore;
-  readonly tokenDigest: Buffer;
+  /**
+   * The digest of the dev/global token, present only when the token login is enabled.
+   *
+   * Production leaves this `undefined`: real accounts replaced the single shared token (LBV-1480).
+   * The tests and an explicit `GODMODE_DEV_TOKEN` deployment set it, and only then does
+   * `POST /api/session` accept a `{ token }` body — for the bootstrap owner and no one else.
+   */
+  readonly devTokenDigest?: Buffer | undefined;
   readonly limiter: AttemptLimiter;
+  /** The single registration policy, consulted by both password and Google account creation. */
+  readonly registration: RegistrationGate;
+  /** The Google OAuth client, present only when Google Sign-In is configured. */
+  readonly google?: GoogleOAuthConfig | undefined;
+  /** Injected for the Google token exchange; defaults to the global `fetch` in production. */
+  readonly fetch?: typeof fetch | undefined;
   /** Epoch milliseconds. Injectable so session expiry and rate limits are testable. */
   readonly now: () => number;
 }
@@ -865,11 +882,90 @@ function isoNow(ctx: ApiContext): string {
 
 // ── Session endpoints ───────────────────────────────────────────────────────────────────────
 
+/** Long enough for any real address, short enough that scrypt is never handed an abusive input. */
+const MAX_EMAIL_LENGTH = 320;
+const MAX_PASSWORD_LENGTH = 4096;
+const MAX_DISPLAY_NAME_LENGTH = 200;
+
 /**
- * Exchange the shared token for a session cookie.
+ * A pragmatic email check: present, one `@` with something either side, within length.
  *
- * A new session id is minted every time and whatever cookie the caller presented is discarded,
- * which is what makes session fixation impossible — see the note in `server/session.ts`.
+ * Deliberately not RFC 5322 — the only authority on whether an address is real is whether mail
+ * reaches it, which this server does not test. What it rejects is the shapes that are certainly
+ * not addresses, so a typo fails here rather than as a login that can never succeed.
+ */
+function requireEmail(body: Record<string, unknown>): string {
+  const value = body['email'];
+  if (typeof value !== 'string') {
+    throw new HttpError(400, 'invalid_field', 'An email address is required.');
+  }
+  const email = value.trim();
+  const at = email.indexOf('@');
+  if (email.length === 0 || email.length > MAX_EMAIL_LENGTH || at <= 0 || at === email.length - 1) {
+    throw new HttpError(400, 'invalid_email', 'That does not look like an email address.');
+  }
+  return email;
+}
+
+function requirePassword(body: Record<string, unknown>): string {
+  const value = body['password'];
+  if (typeof value !== 'string' || value === '') {
+    throw new HttpError(400, 'invalid_field', 'A password is required.');
+  }
+  if (value.length > MAX_PASSWORD_LENGTH) {
+    throw new HttpError(400, 'invalid_field', 'That password is too long.');
+  }
+  return value;
+}
+
+/**
+ * Discard whatever session the caller presented, mint a fresh one for `userId`, and answer.
+ *
+ * A new id is always generated and the presented one dropped first — the two moves that make
+ * session fixation impossible (see `server/session.ts`). Shared by password login, registration
+ * and (via the cookie it returns) the Google callback, so all three routes are fixation-safe by
+ * construction rather than by each remembering to be.
+ */
+function establishSession(
+  ctx: ApiContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+  userId: string,
+  now: number,
+  status: number,
+): void {
+  ctx.sessions.destroy(readSessionId(req));
+  const id = ctx.sessions.create(userId, now);
+  const expiresAt = ctx.sessions.expiresAt(id) ?? now;
+  sendJson(
+    res,
+    status,
+    { authenticated: true, expiresAt: new Date(expiresAt).toISOString(), apiVersion: API_VERSION },
+    { 'Set-Cookie': sessionCookie(id, Math.floor((expiresAt - now) / 1000)) },
+  );
+}
+
+/** The 429 every credential endpoint sends once the attempt limiter has closed the window. */
+function tooManyAttempts(res: ServerResponse, retryAfterSeconds: number): void {
+  sendJson(
+    res,
+    429,
+    { error: 'too_many_attempts', message: 'Too many failed attempts. Wait and try again.' },
+    { 'Retry-After': String(retryAfterSeconds) },
+  );
+}
+
+/**
+ * Sign in: `{ email, password }` for a real account, or `{ token }` for the dev/global token.
+ *
+ * The single shared token is gone from production (LBV-1480). It survives only as a developer
+ * convenience, accepted **exactly when `ctx.devTokenDigest` is set** — by the tests, or by an
+ * explicit `GODMODE_DEV_TOKEN` deployment — and even then only for the bootstrap owner. A `token`
+ * body against a server without it configured is refused like any other bad credential.
+ *
+ * Rate limiting is unchanged from the token era: keyed by remote address, a success below the
+ * threshold clears the counter, and once the window is closed even a correct credential waits.
+ * The same limiter guards registration, so neither passwords nor invite codes can be brute-forced.
  */
 async function openSession(
   ctx: ApiContext,
@@ -880,42 +976,131 @@ async function openSession(
   const now = ctx.now();
   const decision = ctx.limiter.check(key, now);
   if (!decision.allowed) {
-    sendJson(
-      res,
-      429,
-      {
-        error: 'too_many_attempts',
-        message: 'Too many failed attempts. Wait and try again.',
-      },
-      { 'Retry-After': String(decision.retryAfterSeconds) },
-    );
+    tooManyAttempts(res, decision.retryAfterSeconds);
     return;
   }
 
   const body = asObject(await readJsonBody(req, MAX_BODY_BYTES), 'The request body');
-  requireKeys(body, ['token'], 'POST /api/session');
-  const token = body['token'];
-  const ok = typeof token === 'string' && token !== '' && tokenMatches(token, ctx.tokenDigest);
-  if (!ok) {
+
+  // Dev/global token path: only offered when a token is configured, and only for the owner.
+  if (Object.hasOwn(body, 'token') && !Object.hasOwn(body, 'email')) {
+    requireKeys(body, ['token'], 'POST /api/session');
+    const token = body['token'];
+    const ok =
+      ctx.devTokenDigest !== undefined &&
+      typeof token === 'string' &&
+      token !== '' &&
+      tokenMatches(token, ctx.devTokenDigest);
+    if (!ok) {
+      ctx.limiter.recordFailure(key, now);
+      // Never echo any part of what was sent: a reflected token ends up in a log or a screenshot.
+      throw new HttpError(401, 'invalid_token', 'That token is not correct.');
+    }
+    ctx.limiter.recordSuccess(key);
+    establishSession(ctx, req, res, BOOTSTRAP_USER_ID, now, 200);
+    return;
+  }
+
+  // Real account: email + password.
+  requireKeys(body, ['email', 'password'], 'POST /api/session');
+  const email = requireEmail(body);
+  const password = requirePassword(body);
+
+  const user = findUserByEmail(ctx.db, email);
+  // Verify against the found hash, or against a throwaway to keep the timing of "no such user" and
+  // "wrong password" indistinguishable — a login form must not double as an email-enumeration
+  // oracle. `verifyPassword` on a non-match still runs scrypt, so both branches cost the same.
+  const ok =
+    user?.passwordHash !== undefined
+      ? verifyPassword(password, user.passwordHash)
+      : (verifyPassword(password, INVALID_HASH), false);
+  if (!ok || user === undefined) {
     ctx.limiter.recordFailure(key, now);
-    // Never echo any part of what was sent: a reflected token ends up in a log or a screenshot.
-    throw new HttpError(401, 'invalid_token', 'That token is not correct.');
+    throw new HttpError(401, 'invalid_credentials', 'That email or password is not correct.');
   }
 
   ctx.limiter.recordSuccess(key);
-  // Drop whatever session the caller was carrying before issuing a new one.
-  ctx.sessions.destroy(readSessionId(req));
-  // One shared token, one owner (the bootstrap user). The auth ticket replaces this with real
-  // per-user credentials; until then the token authenticates the single existing person, whose
-  // history the v1 → v2 migration carried onto this row.
-  const id = ctx.sessions.create(BOOTSTRAP_USER_ID, now);
-  const expiresAt = ctx.sessions.expiresAt(id) ?? now;
-  sendJson(
-    res,
-    200,
-    { authenticated: true, expiresAt: new Date(expiresAt).toISOString(), apiVersion: API_VERSION },
-    { 'Set-Cookie': sessionCookie(id, Math.floor((expiresAt - now) / 1000)) },
-  );
+  establishSession(ctx, req, res, user.id, now, 200);
+}
+
+/**
+ * A well-formed scrypt hash of a value nobody has, so the "no such user" branch of login spends
+ * the same time as the "wrong password" branch. Its plaintext is irrelevant — it is never matched.
+ */
+const INVALID_HASH = hashPassword(' invalid-account ');
+
+/**
+ * Create an account: `{ email, password, inviteCode?, displayName? }`.
+ *
+ * Gated by the single registration policy (`ctx.registration`) — open, invite-coded, or closed —
+ * so this endpoint on an internet-reachable box is not an open sign-up form. On success it mints a
+ * user-bound session immediately, so registering signs you in; there is no separate confirm step.
+ *
+ * Shares the login rate limiter: a wrong invite code records a failure, so the code cannot be
+ * brute-forced any more than a password can. A duplicate email is a `409`, not a limiter failure —
+ * it is a user error, not an attack, and penalising it would let one person lock others out by
+ * guessing their address.
+ */
+async function register(ctx: ApiContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const key = req.socket.remoteAddress ?? 'unknown';
+  const now = ctx.now();
+  const decision = ctx.limiter.check(key, now);
+  if (!decision.allowed) {
+    tooManyAttempts(res, decision.retryAfterSeconds);
+    return;
+  }
+
+  const body = asObject(await readJsonBody(req, MAX_BODY_BYTES), 'The request body');
+  requireKeys(body, ['email', 'password', 'inviteCode', 'displayName'], 'POST /api/register');
+  const email = requireEmail(body);
+  const password = requirePassword(body);
+  if (passwordTooShort(password)) {
+    throw new HttpError(
+      422,
+      'password_too_short',
+      'That password is too short. Use at least eight characters.',
+    );
+  }
+
+  const inviteCode = typeof body['inviteCode'] === 'string' ? body['inviteCode'] : undefined;
+  const gate = evaluateGate(ctx.registration, inviteCode);
+  if (!gate.allowed) {
+    // An invalid code is a guess; a closed door or a missing code is not, so only the guess costs
+    // an attempt.
+    if (gate.reason === 'invite_invalid') ctx.limiter.recordFailure(key, now);
+    throw new HttpError(
+      gate.reason === 'registration_closed' ? 403 : 422,
+      gate.reason ?? 'registration_refused',
+      gate.message ?? 'Registration is not allowed.',
+    );
+  }
+
+  const displayName = resolveDisplayName(body['displayName'], email);
+  if (findUserByEmail(ctx.db, email) !== undefined) {
+    throw new HttpError(
+      409,
+      'email_taken',
+      'An account with that email already exists. Sign in instead.',
+    );
+  }
+
+  const user = registerUser(ctx.db, {
+    email,
+    displayName,
+    passwordHash: hashPassword(password),
+    now: new Date(now).toISOString(),
+  });
+  ctx.limiter.recordSuccess(key);
+  establishSession(ctx, req, res, user.id, now, 201);
+}
+
+/** A display name from the body if it is a usable string, else the local part of the email. */
+export function resolveDisplayName(raw: unknown, email: string): string {
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    return raw.trim().slice(0, MAX_DISPLAY_NAME_LENGTH);
+  }
+  const local = email.slice(0, email.indexOf('@')).trim();
+  return local === '' ? email : local.slice(0, MAX_DISPLAY_NAME_LENGTH);
 }
 
 function closeSession(ctx: ApiContext, req: IncomingMessage, res: ServerResponse): void {
@@ -926,7 +1111,12 @@ function closeSession(ctx: ApiContext, req: IncomingMessage, res: ServerResponse
 
 // ── Dispatch ────────────────────────────────────────────────────────────────────────────────
 
-const PUBLIC_ROUTES = new Set(['POST /session', 'DELETE /session', 'GET /session']);
+const PUBLIC_ROUTES = new Set([
+  'POST /session',
+  'DELETE /session',
+  'GET /session',
+  'POST /register',
+]);
 
 /**
  * Route one `/api` request.
@@ -959,9 +1149,22 @@ export async function handleApi(
       if (method === 'DELETE') return closeSession(ctx, req, res);
       if (method === 'GET') {
         const authenticated = ctx.sessions.validate(readSessionId(req), ctx.now()) !== undefined;
-        return sendJson(res, 200, { authenticated, apiVersion: API_VERSION });
+        // The client uses these to decide which sign-in affordances to show: the Google button
+        // only when a real OAuth client is configured, and the invite field only in invite mode.
+        return sendJson(res, 200, {
+          authenticated,
+          apiVersion: API_VERSION,
+          googleEnabled: ctx.google !== undefined,
+          registrationMode: ctx.registration.mode,
+        });
       }
       throw methodNotAllowed(method, route);
+    }
+
+    if (rest[0] === 'register') {
+      if (rest.length !== 1) throw notFound(route);
+      if (method !== 'POST') throw methodNotAllowed(method, route);
+      return await register(ctx, req, res);
     }
 
     if (!PUBLIC_ROUTES.has(`${method} ${route}`)) {
@@ -970,7 +1173,7 @@ export async function handleApi(
         throw new HttpError(
           401,
           'unauthenticated',
-          'Sign in with the shared token before using this endpoint.',
+          'Sign in before using this endpoint.',
         );
       }
     }
