@@ -233,10 +233,12 @@ Generated 2026-07-31. Stored at `/etc/godmode/env` (chmod 600). Never committed 
 
 | Variable | Location | Notes |
 |---|---|---|
-| `VAPID_PUBLIC_KEY` | `/etc/godmode/env` | Exposed to the client as a build-time env var (SE wires) |
+| `VAPID_PUBLIC_KEY` | `/etc/godmode/env` | Public key. Wired to the client build as **`VITE_GODMODE_VAPID_PUBLIC_KEY`** (LBV-1481) — must be `VITE_`-prefixed and set in the **build** environment, not `/etc/godmode/env`, to reach the bundle. Unset, the reminder opt-in is simply hidden. |
 | `VAPID_PRIVATE_KEY` | `/etc/godmode/env` | Infra secret only, never in client build |
 | `VAPID_SUBJECT` | `/etc/godmode/env` | `mailto:admin@lennert.cloud` |
 | `GODMODE_APP_URL` | `/etc/godmode/env` | `https://godmode.lennert.cloud` |
+
+The client side (LBV-1481) is wired: with `VITE_GODMODE_VAPID_PUBLIC_KEY` set, Settings → Reminders offers an opt-in that requests notification permission, subscribes with the public key, and POSTs the subscription to `PUT /api/push/subscription`. Stale endpoints (a `410` from the push service) are dropped via `DELETE /api/push/subscription`. The scheduler below sends to the rows those endpoints store in the `push_subscriptions` table.
 
 To rotate VAPID keys (all existing subscriptions break — users must re-subscribe):
 

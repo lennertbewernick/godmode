@@ -17,6 +17,7 @@ import { useState } from 'react';
 import { daysSinceBackup } from '../data/exchange.js';
 import type { ChallengeRecord, SettingsRecord } from '../db/schema.js';
 import { Banner, Button, Card, NumberField } from './kit.js';
+import { Reminders } from './Reminders.js';
 
 export function Settings({
   settings,
@@ -136,6 +137,11 @@ export function Settings({
           </Button>
         </div>
       </Card>
+
+      <Reminders
+        goalText={settings.goalText}
+        onSaveGoal={(goalText) => onSave({ goalText })}
+      />
 
       <Card className="lg:mb-4 lg:break-inside-avoid">
         <h3 className="font-semibold text-slate-100">Backups</h3>
