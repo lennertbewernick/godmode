@@ -25,7 +25,8 @@ import { API_VERSION, ratchet, type Snapshot } from './routes.js';
 import { resolveRegistrationGate, type RegistrationGate } from './registration.js';
 import { type GoogleOAuthConfig } from './google-oauth.js';
 import { SESSION_COOKIE, SessionStore } from './session.js';
-import { createUser, findUserByEmail } from './users.js';
+import { BOOTSTRAP_USER_ID, createUser, findUserByEmail } from './users.js';
+import { listSubscriptions } from './push.js';
 
 const TOKEN = 'a-token-long-enough-to-be-accepted';
 
@@ -1291,6 +1292,98 @@ describe('PATCH /api/settings', () => {
     });
     expect(reply.status).toBe(400);
     expect(reply.body['error']).toBe('unknown_field');
+  });
+
+  it('stores the onboarding goal text and clears it with null', async () => {
+    const harness = await start();
+    const client = new Client(harness.base);
+    await client.login();
+    const saved = await client.send('PATCH', '/api/settings', {
+      expectedRevision: 0,
+      patch: { goalText: 'So I can keep up with my kids.' },
+    });
+    expect(snapshotOf(saved).settings.goalText).toBe('So I can keep up with my kids.');
+    const cleared = await client.send('PATCH', '/api/settings', {
+      expectedRevision: 1,
+      patch: { goalText: null },
+    });
+    expect(Object.hasOwn(snapshotOf(cleared).settings, 'goalText')).toBe(false);
+  });
+
+  it('rejects a goal text past the length cap, and changes nothing', async () => {
+    const harness = await start();
+    const client = new Client(harness.base);
+    await client.login();
+    const reply = await client.send('PATCH', '/api/settings', {
+      expectedRevision: 0,
+      patch: { goalText: 'x'.repeat(1001) },
+    });
+    expect(reply.status).toBe(422);
+    expect((await client.snapshot()).revision).toBe(0);
+  });
+});
+
+describe('push subscriptions', () => {
+  const SUB = {
+    endpoint: 'https://push.example.com/abc',
+    p256dh: 'BPublicKeyMaterial',
+    auth: 'authSecret',
+  };
+
+  it('refuses a subscription without a session', async () => {
+    const harness = await start();
+    const anon = new Client(harness.base);
+    const reply = await anon.send('PUT', '/api/push/subscription', SUB);
+    expect(reply.status).toBe(401);
+  });
+
+  it('stores a subscription and replaces the row for the same endpoint', async () => {
+    const harness = await start();
+    const client = new Client(harness.base);
+    await client.login();
+
+    expect((await client.send('PUT', '/api/push/subscription', SUB)).status).toBe(204);
+    let rows = listSubscriptions(harness.running.context.db, BOOTSTRAP_USER_ID);
+    expect(rows).toEqual([SUB]);
+
+    // Same endpoint, new keys: the row is replaced, not duplicated.
+    const rotated = { ...SUB, p256dh: 'BRotatedKey', auth: 'newSecret' };
+    expect((await client.send('PUT', '/api/push/subscription', rotated)).status).toBe(204);
+    rows = listSubscriptions(harness.running.context.db, BOOTSTRAP_USER_ID);
+    expect(rows).toEqual([rotated]);
+
+    // A second, distinct endpoint is an additional device, so it is kept alongside.
+    const other = { ...SUB, endpoint: 'https://push.example.com/def' };
+    expect((await client.send('PUT', '/api/push/subscription', other)).status).toBe(204);
+    expect(listSubscriptions(harness.running.context.db, BOOTSTRAP_USER_ID)).toHaveLength(2);
+  });
+
+  it('drops a subscription by endpoint, and is idempotent about one already gone', async () => {
+    const harness = await start();
+    const client = new Client(harness.base);
+    await client.login();
+    await client.send('PUT', '/api/push/subscription', SUB);
+
+    expect(
+      (await client.send('DELETE', '/api/push/subscription', { endpoint: SUB.endpoint })).status,
+    ).toBe(204);
+    expect(listSubscriptions(harness.running.context.db, BOOTSTRAP_USER_ID)).toEqual([]);
+
+    // Removing one that is not there is still a 204, never an error.
+    expect(
+      (await client.send('DELETE', '/api/push/subscription', { endpoint: SUB.endpoint })).status,
+    ).toBe(204);
+  });
+
+  it('rejects a subscription missing a required field', async () => {
+    const harness = await start();
+    const client = new Client(harness.base);
+    await client.login();
+    const reply = await client.send('PUT', '/api/push/subscription', {
+      endpoint: SUB.endpoint,
+      p256dh: SUB.p256dh,
+    });
+    expect(reply.status).toBe(400);
   });
 });
 

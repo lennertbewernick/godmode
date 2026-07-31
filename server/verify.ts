@@ -494,6 +494,7 @@ const COLUMN_ORACLE: Readonly<Record<CollectionKey, readonly ColumnSource[]>> = 
     { column: 'rest_override_seconds', path: 'restOverrideSeconds' },
     { column: 'last_backup_at', path: 'lastBackupAt' },
     { column: 'onboarded_at', path: 'onboardedAt' },
+    { column: 'goal_text', path: 'goalText' },
     { column: 'selected_challenge_id', path: 'selectedChallengeId' },
   ],
 };

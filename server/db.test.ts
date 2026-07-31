@@ -134,8 +134,9 @@ describe('schema.sql', () => {
     const tables = db
       .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
       .all() as { name: string; sql: string }[];
-    // v2 adds users, sessions, user_revisions to the original seven.
-    expect(tables.length).toBe(10);
+    // v2 adds users, sessions, user_revisions to the original seven, plus push_subscriptions
+    // (LBV-1481).
+    expect(tables.length).toBe(11);
     for (const table of tables) expect(table.sql).toMatch(/\)\s*STRICT\s*$/);
     db.close();
   });

@@ -46,20 +46,33 @@ function tempDir(): string {
   return dir;
 }
 
-/** Insert one record into a v1 table (no `user_id`), with any leading fixed columns. */
+/**
+ * Insert one record into a v1 table (no `user_id`), with any leading fixed columns.
+ *
+ * Only columns the v1 table actually has are written: a column that v2 added to the mapping but v1
+ * never had (`settings.goal_text`, LBV-1481) is skipped, so this helper keeps modelling a genuine
+ * v1 row rather than one carrying a field that version could not hold. The migration is what fills
+ * such a column in on the way to v2.
+ */
 function insertV1<R>(
   db: DatabaseSync,
   mapping: TableMapping<R>,
   record: R,
   leading: Record<string, SqlRow[string]> = {},
 ): void {
+  const present = new Set(
+    (db.prepare(`PRAGMA table_info(${mapping.table})`).all() as { name: string }[]).map(
+      (info) => info.name,
+    ),
+  );
   const row = mapping.encode(record);
   const leadCols = Object.keys(leading);
-  const columns = [...leadCols, ...mapping.columns];
+  const dataCols = mapping.columns.filter((c) => present.has(c));
+  const columns = [...leadCols, ...dataCols];
   const placeholders = columns.map(() => '?').join(', ');
   db.prepare(`INSERT INTO ${mapping.table} (${columns.join(', ')}) VALUES (${placeholders})`).run(
     ...leadCols.map((c) => leading[c]!),
-    ...mapping.columns.map((c) => row[c]!),
+    ...dataCols.map((c) => row[c]!),
   );
 }
 

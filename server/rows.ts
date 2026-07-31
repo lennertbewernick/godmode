@@ -483,6 +483,7 @@ export const SETTINGS: TableMapping<SettingsRecord> = {
     'rest_override_seconds',
     'last_backup_at',
     'onboarded_at',
+    'goal_text',
     'selected_challenge_id',
   ],
   fields: SETTINGS_FIELDS,
@@ -493,6 +494,7 @@ export const SETTINGS: TableMapping<SettingsRecord> = {
     rest_override_seconds: record.restOverrideSeconds ?? null,
     last_backup_at: record.lastBackupAt ?? null,
     onboarded_at: record.onboardedAt ?? null,
+    goal_text: record.goalText ?? null,
     selected_challenge_id: record.selectedChallengeId ?? null,
   }),
   decode: (row) =>
@@ -504,6 +506,7 @@ export const SETTINGS: TableMapping<SettingsRecord> = {
         ...optional('restOverrideSeconds', row['rest_override_seconds']),
         ...optional('lastBackupAt', row['last_backup_at']),
         ...optional('onboardedAt', row['onboarded_at']),
+        ...optional('goalText', row['goal_text']),
         ...optional('selectedChallengeId', row['selected_challenge_id']),
       },
       SETTINGS_FIELDS,

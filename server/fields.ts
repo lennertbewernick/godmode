@@ -130,8 +130,8 @@ export function isTimestamp(value: string): boolean {
 // ── Field specification vocabulary ──────────────────────────────────────────────────────────
 
 export type FieldSpec =
-  /** TEXT. `minLength` guards ids, which must never be empty. */
-  | { readonly kind: 'string'; readonly optional?: boolean; readonly minLength?: number }
+  /** TEXT. `minLength` guards ids, which must never be empty; `maxLength` caps free text. */
+  | { readonly kind: 'string'; readonly optional?: boolean; readonly minLength?: number; readonly maxLength?: number }
   /** TEXT matching `TIMESTAMP_RE`. */
   | { readonly kind: 'timestamp'; readonly optional?: boolean }
   /** INTEGER. Rejects non-integers outright rather than rounding them. */
@@ -335,6 +335,15 @@ export const WORKOUT_FIELDS = {
  */
 export const SETTINGS_ROW_ID = 'settings' as const satisfies SettingsRecord['id'];
 
+/**
+ * The onboarding "why" length cap (LBV-1481).
+ *
+ * Must match `GOAL_TEXT_MAX_LENGTH` in `src/db/schema.ts`, which the client textarea reads.
+ * Duplicated rather than imported for the same reason `API_VERSION`/`EXPECTED_API_VERSION` are:
+ * production server code does not value-import `src/db/schema.js` (it pulls `idb`), only its types.
+ */
+export const GOAL_TEXT_MAX_LENGTH = 1000;
+
 export const SETTINGS_FIELDS = {
   id: { kind: 'enum', values: [SETTINGS_ROW_ID] },
   bodyweightKg: { kind: 'real', exclusiveMin: 0, optional: true },
@@ -342,6 +351,7 @@ export const SETTINGS_FIELDS = {
   restOverrideSeconds: { kind: 'real', min: 0, optional: true },
   lastBackupAt: { kind: 'timestamp', optional: true },
   onboardedAt: { kind: 'timestamp', optional: true },
+  goalText: { kind: 'string', optional: true, maxLength: GOAL_TEXT_MAX_LENGTH },
   selectedChallengeId: { kind: 'string', minLength: 1, optional: true },
 } as const satisfies SpecFor<SettingsRecord>;
 
