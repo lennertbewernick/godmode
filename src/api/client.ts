@@ -1,14 +1,15 @@
 /**
  * The typed API client. Everything the app knows about its own data comes through here.
  *
- * ## One origin, cookie auth, no token in JavaScript
+ * ## One origin, cookie auth, no credential in JavaScript
  *
- * The session is an `HttpOnly; Secure; SameSite=Strict` cookie the server sets when the token
- * is exchanged at `POST /api/session` (`.planning/DESIGN-server-sqlite.md` §9). Script cannot
- * read it, so there is nothing here to leak: **the raw token appears in exactly one place, the
- * argument to `openSession`, and is never stored, logged, put in a URL or attached to an error.**
- * Every request is same-origin and relative, so the cookie rides along by itself and
- * `SameSite=Strict` stays a complete CSRF defence.
+ * The session is an `HttpOnly; Secure; SameSite=Strict` cookie the server sets when credentials
+ * are exchanged at `POST /api/session` or `POST /api/register` (`.planning/DESIGN-server-sqlite.md`
+ * §9). Script cannot read it, so there is nothing here to leak: **a password appears in exactly one
+ * place, the argument to `login`/`register`, and is never stored, logged, put in a URL or attached
+ * to an error.** Every request is same-origin and relative, so the cookie rides along by itself and
+ * `SameSite=Strict` stays a complete CSRF defence. (Google sign-in is a top-level navigation to
+ * `/auth/google/*`, handled by the server, not a call from here.)
  *
  * ## Failures are classified, because the UI has to say different things
  *
@@ -187,23 +188,58 @@ function checkVersion(snapshot: Snapshot): Snapshot {
 
 // ── Session ─────────────────────────────────────────────────────────────────────
 
+export type RegistrationMode = 'invite' | 'open' | 'closed';
+
 export interface SessionState {
   authenticated: boolean;
   apiVersion: number;
+  /** Whether the server has a Google OAuth client configured; the button is hidden otherwise. */
+  googleEnabled: boolean;
+  /** How registration is gated, so the form can ask for an invite code only when it is needed. */
+  registrationMode: RegistrationMode;
 }
 
 export function sessionState(): Promise<SessionState> {
   return request<SessionState>({ method: 'GET', path: '/session', expect: [200] });
 }
 
+export interface Credentials {
+  email: string;
+  password: string;
+}
+
 /**
- * Exchange the shared token for the session cookie.
+ * Sign in with an email and password, minting the session cookie.
  *
- * The token is a parameter and nothing else: it is not stored, not echoed into any error
- * message here, and the server is careful never to reflect it either (`server/routes.ts:856`).
+ * The password is a parameter and nothing else: it is not stored, not echoed into any error
+ * message here, and the server never reflects it either (`server/routes.ts`). Same-origin, so the
+ * cookie the server sets rides along by itself on every later request.
  */
-export function openSession(token: string): Promise<{ authenticated: true; expiresAt: string }> {
-  return request({ method: 'POST', path: '/session', body: { token }, expect: [200] });
+export function login(credentials: Credentials): Promise<{ authenticated: true; expiresAt: string }> {
+  return request({ method: 'POST', path: '/session', body: credentials, expect: [200] });
+}
+
+/**
+ * Create an account, which signs it in on success.
+ *
+ * `inviteCode` is required only when the server is in invite mode (`sessionState().registrationMode`);
+ * the form supplies it or not accordingly. Like `login`, nothing here retains the password.
+ */
+export function register(body: {
+  email: string;
+  password: string;
+  inviteCode?: string;
+  displayName?: string;
+}): Promise<{ authenticated: true; expiresAt: string }> {
+  return request({ method: 'POST', path: '/register', body, expect: [201] });
+}
+
+/** Where the browser goes to start Google Sign-In; a top-level navigation, not a `fetch`. */
+export function googleLoginUrl(inviteCode?: string): string {
+  const code = inviteCode?.trim();
+  return code === undefined || code === ''
+    ? '/auth/google/login'
+    : `/auth/google/login?invite=${encodeURIComponent(code)}`;
 }
 
 export function closeSession(): Promise<void> {

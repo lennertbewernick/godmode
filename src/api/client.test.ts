@@ -9,9 +9,10 @@ import {
   ApiError,
   closeSession,
   getSnapshot,
-  openSession,
+  login,
   patchSettings,
   postWorkout,
+  register,
 } from './client.js';
 
 afterEach(() => {
@@ -98,22 +99,36 @@ describe('what goes on the wire', () => {
     expect(init.credentials).toBe('same-origin');
   });
 
-  it('never puts the token in the URL', async () => {
+  it('never puts the password in the URL, only in the body', async () => {
     const fetchMock = stub(200, { authenticated: true, expiresAt: 'x' });
-    await openSession('super-secret-token');
+    await login({ email: 'runner@example.com', password: 'super-secret-password' });
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('/api/session');
-    expect(url).not.toContain('super-secret-token');
+    expect(url).not.toContain('super-secret-password');
     // It is in the body, once, which is the whole point of the endpoint.
-    expect(String(init.body)).toContain('super-secret-token');
+    expect(String(init.body)).toContain('super-secret-password');
   });
 
-  it('keeps the token out of the error when the server rejects it', async () => {
-    stub(401, { error: 'invalid_token', message: 'That token is not correct.' });
-    const error = (await openSession('super-secret-token').catch((e: unknown) => e)) as ApiError;
+  it('keeps the password out of the error when the server rejects the credentials', async () => {
+    stub(401, { error: 'invalid_credentials', message: 'That email or password is not correct.' });
+    const error = (await login({
+      email: 'runner@example.com',
+      password: 'super-secret-password',
+    }).catch((e: unknown) => e)) as ApiError;
     expect(JSON.stringify({ message: error.message, details: error.details })).not.toContain(
-      'super-secret-token',
+      'super-secret-password',
     );
+  });
+
+  it('registers with a 201 and carries the invite code in the body', async () => {
+    const fetchMock = stub(201, { authenticated: true, expiresAt: 'x' });
+    await register({ email: 'new@example.com', password: 'a-good-password', inviteCode: 'let-me-in' });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/register');
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      email: 'new@example.com',
+      inviteCode: 'let-me-in',
+    });
   });
 
   it('spells a cleared optional as null, because JSON has no undefined', async () => {
