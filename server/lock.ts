@@ -296,7 +296,7 @@ export function parseLockRecord(text: string): LockRecord | undefined {
   const c = parsed as Record<string, unknown>;
 
   if (c['kind'] !== 'godmode-database-lock' || c['version'] !== 1) return undefined;
-  if (c['role'] !== 'server' && c['role'] !== 'import') return undefined;
+  if (c['role'] !== 'server' && c['role'] !== 'import' && c['role'] !== 'migrate') return undefined;
   if (!Number.isSafeInteger(c['pid']) || (c['pid'] as number) <= 0) return undefined;
   if (!Number.isSafeInteger(c['bootSeconds'])) return undefined;
   if (typeof c['host'] !== 'string' || c['host'] === '') return undefined;

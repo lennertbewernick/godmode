@@ -530,11 +530,20 @@ function checkColumns(db: DatabaseSync, expected: Dataset, issues: Issues): void
       }
     }
 
-    const statement = db.prepare(`SELECT * FROM ${collection.table} WHERE id = ?`);
+    // `settings` has no physical `id` column (v2 keys it by `user_id`), and the import machinery
+    // builds a single-user file, so its one row is fetched without a key rather than by id.
+    const isSettings = collection.key === 'settings';
+    const statement = db.prepare(
+      isSettings
+        ? `SELECT * FROM ${collection.table} LIMIT 1`
+        : `SELECT * FROM ${collection.table} WHERE id = ?`,
+    );
     for (const record of recordsOf(expected, collection.key)) {
       const id = idOf(record);
       if (id === undefined) continue;
-      const row = statement.get(id) as Record<string, unknown> | undefined;
+      const row = (isSettings ? statement.get() : statement.get(id)) as
+        | Record<string, unknown>
+        | undefined;
       if (row === undefined) continue; // already reported by the id-set check
       for (const source of oracle) {
         const wanted = expectedColumnValue(record, source);
@@ -561,6 +570,9 @@ function checkColumns(db: DatabaseSync, expected: Dataset, issues: Issues): void
  */
 function checkDuplicatePrimaryKeys(db: DatabaseSync, issues: Issues): void {
   for (const collection of COLLECTIONS) {
+    // `settings` has no `id` column; its primary key is `user_id`, and its single-row-per-user
+    // shape is asserted by `checkSettings`. Every other table keys on `id`.
+    if (collection.key === 'settings') continue;
     const rows = db
       .prepare(`SELECT id, COUNT(*) AS n FROM ${collection.table} GROUP BY id HAVING n > 1`)
       .all() as { id?: unknown; n?: unknown }[];

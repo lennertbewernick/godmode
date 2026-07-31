@@ -36,6 +36,7 @@ import type {
   SettingsRecord,
   WorkoutRecord,
 } from '../src/db/schema.js';
+import type { UserRecord } from './users.js';
 
 // ── Enumerations ────────────────────────────────────────────────────────────────────────────
 //
@@ -343,3 +344,21 @@ export const SETTINGS_FIELDS = {
   onboardedAt: { kind: 'timestamp', optional: true },
   selectedChallengeId: { kind: 'string', minLength: 1, optional: true },
 } as const satisfies SpecFor<SettingsRecord>;
+
+/**
+ * `users` (schema v2, LBV-1478) — the one table that is about people rather than training.
+ *
+ * Guarded by the same `SpecFor` mechanism as the domain records so a column added to `UserRecord`
+ * without a description here is a compile error. This table is NOT part of the backup/import
+ * matrix — a user is never exported — so it has no §-numbered row above; the guard is what keeps
+ * `server/users.ts` and `server/schema.sql` from drifting. `user_id` on the per-user tables has no
+ * entry anywhere, because it is a tenancy column, not a property of any record (see §0).
+ */
+export const USER_FIELDS = {
+  id: { kind: 'string', minLength: 1 },
+  email: { kind: 'string', minLength: 1 },
+  displayName: { kind: 'string', minLength: 1 },
+  passwordHash: { kind: 'string', minLength: 1, optional: true },
+  googleSub: { kind: 'string', minLength: 1, optional: true },
+  createdAt: { kind: 'timestamp' },
+} as const satisfies SpecFor<UserRecord>;
