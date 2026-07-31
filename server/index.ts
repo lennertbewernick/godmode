@@ -29,7 +29,7 @@ import {
   sendFile,
 } from './http.js';
 import { API_VERSION, handleApi, type ApiContext } from './routes.js';
-import { SessionStore } from './session.js';
+import { SessionStore, type SessionOptions } from './session.js';
 
 /**
  * The floor, and why it is not `>=22`.
@@ -112,6 +112,8 @@ export interface ServerOptions {
   readonly token?: string;
   readonly now?: () => number;
   readonly sessions?: SessionStore;
+  /** Expiry overrides for the default sqlite-backed session store. Ignored if `sessions` is set. */
+  readonly sessionOptions?: SessionOptions;
   readonly limiter?: AttemptLimiter;
 }
 
@@ -157,7 +159,7 @@ export function createGodmodeServer(options: ServerOptions = {}): RunningServer 
 
   const context: ApiContext = {
     db: opened.db,
-    sessions: options.sessions ?? new SessionStore(opened.db),
+    sessions: options.sessions ?? new SessionStore(opened.db, options.sessionOptions),
     tokenDigest: digest(token),
     limiter: options.limiter ?? new AttemptLimiter(),
     now: options.now ?? (() => Date.now()),

@@ -26,6 +26,7 @@ import {
 } from './db.js';
 import { acquireLock, bootSecondsNow, lockPathFor, readLockRecord } from './lock.js';
 import { foreignKeysEnabled } from './schema.js';
+import { BOOTSTRAP_USER_ID } from './users.js';
 
 const temporaries: string[] = [];
 
@@ -127,7 +128,7 @@ describe('openDatabase', () => {
     try {
       expect(opened.created).toBe(true);
       expect(opened.path).toBe(join(dir, DATABASE_FILENAME));
-      expect(readRevision(opened.db)).toBe(0);
+      expect(readRevision(opened.db, BOOTSTRAP_USER_ID)).toBe(0);
     } finally {
       opened.close();
     }
@@ -136,13 +137,13 @@ describe('openDatabase', () => {
   it('reopens an existing database without reapplying the schema', () => {
     const dir = tempDir();
     const first = openDatabase({ dataDir: dir });
-    inWriteTransaction(first.db, () => bumpRevision(first.db, '2026-07-30T12:00:00.000Z'));
+    inWriteTransaction(first.db, () => bumpRevision(first.db, BOOTSTRAP_USER_ID, '2026-07-30T12:00:00.000Z'));
     first.close();
 
     const second = openDatabase({ dataDir: dir });
     try {
       expect(second.created).toBe(false);
-      expect(readRevision(second.db)).toBe(1);
+      expect(readRevision(second.db, BOOTSTRAP_USER_ID)).toBe(1);
     } finally {
       second.close();
     }
@@ -156,8 +157,8 @@ describe('openDatabase', () => {
       expect(foreignKeysEnabled(opened.db)).toBe(true);
       expect(() =>
         opened.db
-          .prepare('INSERT INTO plan_slots (id, challenge_id, ordinal, pattern_id, pattern_version, generated_at, targets, target_total, rest_seconds, status) VALUES (?, ?, 1, ?, 1, ?, ?, 0, 0, ?)')
-          .run('slot_x', 'no_such_challenge', 'p', '2026-07-30T12:00:00.000Z', '[]', 'available'),
+          .prepare('INSERT INTO plan_slots (id, user_id, challenge_id, ordinal, pattern_id, pattern_version, generated_at, targets, target_total, rest_seconds, status) VALUES (?, ?, ?, 1, ?, 1, ?, ?, 0, 0, ?)')
+          .run('slot_x', BOOTSTRAP_USER_ID, 'no_such_challenge', 'p', '2026-07-30T12:00:00.000Z', '[]', 'available'),
       ).toThrow(/FOREIGN KEY/i);
     } finally {
       opened.close();
@@ -291,11 +292,11 @@ describe('transactions', () => {
     try {
       expect(() =>
         inWriteTransaction(opened.db, () => {
-          bumpRevision(opened.db, '2026-07-30T12:00:00.000Z');
+          bumpRevision(opened.db, BOOTSTRAP_USER_ID, '2026-07-30T12:00:00.000Z');
           throw new Error('halfway');
         }),
       ).toThrow('halfway');
-      expect(readRevision(opened.db)).toBe(0);
+      expect(readRevision(opened.db, BOOTSTRAP_USER_ID)).toBe(0);
     } finally {
       opened.close();
     }
@@ -312,19 +313,19 @@ describe('transactions', () => {
         inWriteTransaction(opened.db, () => {
           opened.db
             .prepare(
-              'INSERT INTO challenges (id, exercise_id, chain_id, pattern_id, pattern_version, pattern_params, rest_policy_id, rest_policy_version, rest_policy_params, evaluation_policy_id, evaluation_policy_version, baseline_value, baseline_source, baseline_recorded_at, status, started_at) ' +
-                "VALUES ('ch_x', 'ex_missing', 'ch_x', 'p', 1, '{}', 'r', 1, '{}', 'e', 1, 1, 'tested', '2026-07-30T12:00:00.000Z', 'active', '2026-07-30T12:00:00.000Z')",
+              'INSERT INTO challenges (id, user_id, exercise_id, chain_id, pattern_id, pattern_version, pattern_params, rest_policy_id, rest_policy_version, rest_policy_params, evaluation_policy_id, evaluation_policy_version, baseline_value, baseline_source, baseline_recorded_at, status, started_at) ' +
+                `VALUES ('ch_x', '${BOOTSTRAP_USER_ID}', 'ex_missing', 'ch_x', 'p', 1, '{}', 'r', 1, '{}', 'e', 1, 1, 'tested', '2026-07-30T12:00:00.000Z', 'active', '2026-07-30T12:00:00.000Z')`,
             )
             .run();
           // The INSERT succeeded: the violation is deferred to commit time.
-          bumpRevision(opened.db, '2026-07-30T12:00:00.000Z');
+          bumpRevision(opened.db, BOOTSTRAP_USER_ID, '2026-07-30T12:00:00.000Z');
         }),
       ).toThrow(/FOREIGN KEY/i);
 
       // The connection is not poisoned, and nothing the failed transaction wrote survived.
-      expect(readRevision(opened.db)).toBe(0);
-      inWriteTransaction(opened.db, () => bumpRevision(opened.db, '2026-07-30T12:01:00.000Z'));
-      expect(readRevision(opened.db)).toBe(1);
+      expect(readRevision(opened.db, BOOTSTRAP_USER_ID)).toBe(0);
+      inWriteTransaction(opened.db, () => bumpRevision(opened.db, BOOTSTRAP_USER_ID, '2026-07-30T12:01:00.000Z'));
+      expect(readRevision(opened.db, BOOTSTRAP_USER_ID)).toBe(1);
       const rows = opened.db.prepare('SELECT COUNT(*) AS n FROM challenges').get() as { n: number };
       expect(rows.n).toBe(0);
     } finally {
@@ -347,8 +348,8 @@ describe('transactions', () => {
       a.db.exec('BEGIN IMMEDIATE;');
       expect(() => b.db.exec('BEGIN IMMEDIATE;')).toThrow(/busy|locked/i);
       a.db.exec('ROLLBACK;');
-      expect(() => inWriteTransaction(b.db, () => bumpRevision(b.db, '2026-07-30T12:00:00.000Z'))).not.toThrow();
-      expect(readRevision(a.db)).toBe(1);
+      expect(() => inWriteTransaction(b.db, () => bumpRevision(b.db, BOOTSTRAP_USER_ID, '2026-07-30T12:00:00.000Z'))).not.toThrow();
+      expect(readRevision(a.db, BOOTSTRAP_USER_ID)).toBe(1);
     } finally {
       a.close();
       b.close();
@@ -362,11 +363,11 @@ describe('transactions', () => {
     try {
       expect(() =>
         inWriteTransaction(opened.db, () => {
-          opened.db.prepare('INSERT INTO meta (id, schema_version, revision, created_at, updated_at) VALUES (?, 1, 0, ?, ?)')
+          opened.db.prepare('INSERT INTO meta (id, schema_version, created_at, updated_at) VALUES (?, 2, ?, ?)')
             .run('meta', '2026-07-30T12:00:00.000Z', '2026-07-30T12:00:00.000Z');
         }),
       ).toThrow(/UNIQUE|PRIMARY KEY|constraint/i);
-      expect(readRevision(opened.db)).toBe(0);
+      expect(readRevision(opened.db, BOOTSTRAP_USER_ID)).toBe(0);
     } finally {
       opened.close();
     }
@@ -377,7 +378,7 @@ describe('settings', () => {
   it('reads defaults when no row has been written yet', () => {
     const opened = openDatabase({ dataDir: tempDir() });
     try {
-      expect(readSettings(opened.db)).toEqual(DEFAULT_SETTINGS_ROW);
+      expect(readSettings(opened.db, BOOTSTRAP_USER_ID)).toEqual(DEFAULT_SETTINGS_ROW);
     } finally {
       opened.close();
     }
@@ -386,15 +387,15 @@ describe('settings', () => {
   it('upserts rather than replacing, and round-trips absent optionals as absent', () => {
     const opened = openDatabase({ dataDir: tempDir() });
     try {
-      writeSettings(opened.db, { id: 'settings', kcalCoefficient: 0.004, bodyweightKg: 80 });
-      expect(readSettings(opened.db)).toEqual({
+      writeSettings(opened.db, BOOTSTRAP_USER_ID, { id: 'settings', kcalCoefficient: 0.004, bodyweightKg: 80 });
+      expect(readSettings(opened.db, BOOTSTRAP_USER_ID)).toEqual({
         id: 'settings',
         kcalCoefficient: 0.004,
         bodyweightKg: 80,
       });
 
-      writeSettings(opened.db, { id: 'settings', kcalCoefficient: 0.004 });
-      const cleared = readSettings(opened.db);
+      writeSettings(opened.db, BOOTSTRAP_USER_ID, { id: 'settings', kcalCoefficient: 0.004 });
+      const cleared = readSettings(opened.db, BOOTSTRAP_USER_ID);
       expect(cleared).toEqual({ id: 'settings', kcalCoefficient: 0.004 });
       // Absent, not `{bodyweightKg: undefined}` — an own property holding undefined is reported
       // by Object.keys and breaks structural equality against the record that was written.
@@ -408,13 +409,13 @@ describe('settings', () => {
   });
 });
 
-describe('the meta row', () => {
-  it('reports a database that was not created by schema.sql rather than guessing', () => {
+describe('the per-user revision row', () => {
+  it('reports a user with no revision row rather than guessing a zero', () => {
     const dir = tempDir();
     const db = new DatabaseSync(join(dir, 'empty.sqlite'));
     try {
-      db.exec('CREATE TABLE meta (id TEXT PRIMARY KEY, schema_version INTEGER, revision INTEGER)');
-      expect(() => readRevision(db)).toThrow(/meta row is missing/);
+      db.exec('CREATE TABLE user_revisions (user_id TEXT PRIMARY KEY, revision INTEGER, updated_at TEXT)');
+      expect(() => readRevision(db, BOOTSTRAP_USER_ID)).toThrow(/no user_revisions row/);
     } finally {
       db.close();
     }

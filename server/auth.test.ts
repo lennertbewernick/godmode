@@ -7,7 +7,10 @@
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
+import { applySchema } from './schema.js';
+import { BOOTSTRAP_USER_ID, createUser, ensureBootstrapUser } from './users.js';
 import {
   AttemptLimiter,
   MINIMUM_TOKEN_LENGTH,
@@ -185,43 +188,78 @@ describe('AttemptLimiter', () => {
 });
 
 describe('SessionStore', () => {
+  /** A fresh in-memory database with the schema and the bootstrap owner sessions can reference. */
+  const store = (options?: { maxAgeMs?: number; idleMs?: number }): SessionStore => {
+    const db = new DatabaseSync(':memory:');
+    applySchema(db);
+    ensureBootstrapUser(db);
+    return new SessionStore(db, options);
+  };
+
   it('mints opaque, unguessable, distinct ids', () => {
-    const store = new SessionStore();
-    const a = store.create(0);
-    const b = store.create(0);
+    const sessions = store();
+    const a = sessions.create(BOOTSTRAP_USER_ID, 0);
+    const b = sessions.create(BOOTSTRAP_USER_ID, 0);
     expect(a).not.toBe(b);
     expect(a).toMatch(/^[A-Za-z0-9_-]{43}$/);
   });
 
+  it('validates to the user it was minted for', () => {
+    const sessions = store();
+    const id = sessions.create(BOOTSTRAP_USER_ID, 0);
+    expect(sessions.validate(id, 0)).toBe(BOOTSTRAP_USER_ID);
+  });
+
   it('never adopts an id it did not mint — so fixation is impossible', () => {
-    const store = new SessionStore();
-    store.create(0);
-    expect(store.validate('planted-by-an-attacker', 0)).toBe(false);
+    const sessions = store();
+    sessions.create(BOOTSTRAP_USER_ID, 0);
+    expect(sessions.validate('planted-by-an-attacker', 0)).toBeUndefined();
   });
 
   it('expires on idle and on absolute age, and deletes rather than merely refusing', () => {
-    const store = new SessionStore({ maxAgeMs: 1000, idleMs: 100 });
-    const idle = store.create(0);
-    expect(store.validate(idle, 99)).toBe(true);
-    expect(store.validate(idle, 250)).toBe(false);
-    expect(store.size).toBe(0);
+    const sessions = store({ maxAgeMs: 1000, idleMs: 100 });
+    const idle = sessions.create(BOOTSTRAP_USER_ID, 0);
+    expect(sessions.validate(idle, 99)).toBe(BOOTSTRAP_USER_ID);
+    expect(sessions.validate(idle, 250)).toBeUndefined();
+    expect(sessions.size).toBe(0);
 
-    const kept = store.create(0);
-    for (let at = 50; at < 1000; at += 50) expect(store.validate(kept, at)).toBe(true);
-    expect(store.validate(kept, 1000)).toBe(false);
+    const kept = sessions.create(BOOTSTRAP_USER_ID, 0);
+    for (let at = 50; at < 1000; at += 50) expect(sessions.validate(kept, at)).toBe(BOOTSTRAP_USER_ID);
+    expect(sessions.validate(kept, 1000)).toBeUndefined();
+  });
+
+  it('keeps each user’s sessions to that user', () => {
+    const db = new DatabaseSync(':memory:');
+    applySchema(db);
+    ensureBootstrapUser(db);
+    createUser(db, {
+      id: 'usr_other',
+      email: 'other@godmode.local',
+      displayName: 'Other',
+      createdAt: '2026-07-31T00:00:00Z',
+    });
+    const sessions = new SessionStore(db);
+    const mine = sessions.create(BOOTSTRAP_USER_ID, 0);
+    const theirs = sessions.create('usr_other', 0);
+    expect(sessions.validate(mine, 0)).toBe(BOOTSTRAP_USER_ID);
+    expect(sessions.validate(theirs, 0)).toBe('usr_other');
+
+    sessions.destroyAllForUser('usr_other');
+    expect(sessions.validate(theirs, 0)).toBeUndefined();
+    expect(sessions.validate(mine, 0)).toBe(BOOTSTRAP_USER_ID);
   });
 
   it('drops a destroyed session immediately', () => {
-    const store = new SessionStore();
-    const id = store.create(0);
-    store.destroy(id);
-    expect(store.validate(id, 0)).toBe(false);
+    const sessions = store();
+    const id = sessions.create(BOOTSTRAP_USER_ID, 0);
+    sessions.destroy(id);
+    expect(sessions.validate(id, 0)).toBeUndefined();
   });
 
-  it('rejects a missing or empty cookie without touching the map', () => {
-    const store = new SessionStore();
-    expect(store.validate(undefined, 0)).toBe(false);
-    expect(store.validate('', 0)).toBe(false);
+  it('rejects a missing or empty cookie without touching the store', () => {
+    const sessions = store();
+    expect(sessions.validate(undefined, 0)).toBeUndefined();
+    expect(sessions.validate('', 0)).toBeUndefined();
   });
 });
 
