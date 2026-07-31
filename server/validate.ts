@@ -117,6 +117,13 @@ function checkField(value: unknown, spec: FieldSpec, path: string, log: IssueLog
         log.add(path, `expected at least ${String(spec.minLength)} character(s), received ""`);
         return FAILED;
       }
+      if (spec.maxLength !== undefined && value.length > spec.maxLength) {
+        log.add(
+          path,
+          `expected at most ${String(spec.maxLength)} character(s), received ${String(value.length)}`,
+        );
+        return FAILED;
+      }
       return { ok: true, value };
     }
 

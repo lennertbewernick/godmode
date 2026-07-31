@@ -156,6 +156,39 @@ export function TextField({
   );
 }
 
+export function TextArea({
+  label,
+  value,
+  onChange,
+  placeholder,
+  hint,
+  maxLength,
+  rows = 3,
+}: {
+  label: string;
+  value: string;
+  onChange: (next: string) => void;
+  placeholder?: string;
+  hint?: string;
+  maxLength?: number;
+  rows?: number;
+}) {
+  return (
+    <label className="block">
+      <span className="text-sm font-medium text-slate-300">{label}</span>
+      <textarea
+        value={value}
+        placeholder={placeholder}
+        rows={rows}
+        maxLength={maxLength}
+        onChange={(e) => onChange(e.target.value)}
+        className="mt-1.5 w-full resize-y rounded-xl border border-[#33405c] bg-[#0f1728] px-3 py-2.5 text-slate-100 outline-none focus:border-teal-400"
+      />
+      {hint ? <span className="mt-1.5 block text-xs text-slate-400">{hint}</span> : null}
+    </label>
+  );
+}
+
 /** A prescribed-set chip row, e.g. 37 · 47 · 37 · 33 · 51+ */
 export function SetRow({
   reps,

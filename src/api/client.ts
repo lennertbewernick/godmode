@@ -350,3 +350,45 @@ export function patchSettings(
     expect: [200],
   });
 }
+
+// ── Push subscriptions ────────────────────────────────────────────────────────────────────────
+
+/**
+ * The browser's `PushSubscription`, flattened to what the server stores.
+ *
+ * `PushSubscription.toJSON()` nests the keys under `keys: { p256dh, auth }`; the wire shape here is
+ * flat because the server column layout is (`server/push.ts`). The keys are public delivery
+ * material, not a secret — there is nothing here to guard the way a password is guarded.
+ */
+export interface PushSubscriptionPayload {
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+}
+
+/**
+ * Store (or replace) this device's push subscription. Idempotent on the endpoint server-side, so a
+ * client that calls this on every load never accumulates duplicate rows. Returns nothing on `204`.
+ */
+export function putPushSubscription(subscription: PushSubscriptionPayload): Promise<void> {
+  return request<void>({
+    method: 'PUT',
+    path: '/push/subscription',
+    body: subscription,
+    expect: [204],
+  });
+}
+
+/**
+ * Drop a subscription the device no longer holds — a stale endpoint (the push service answered
+ * `410`) or one the user turned off. Idempotent server-side: dropping one that is already gone is
+ * still a `204`.
+ */
+export function deletePushSubscription(endpoint: string): Promise<void> {
+  return request<void>({
+    method: 'DELETE',
+    path: '/push/subscription',
+    body: { endpoint },
+    expect: [204],
+  });
+}

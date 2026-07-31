@@ -272,6 +272,15 @@ export interface SettingsRecord {
   /** Whether the user has seen the "this data lives only on this device" explanation. */
   onboardedAt?: string;
   /**
+   * The "why do you do this" the user wrote during onboarding (LBV-1481). Free text, their own
+   * words. Captured here so Phase 1's reminder copy can reflect it back — a reminder that names
+   * the reason lands harder than a generic nudge. Optional: a user who skipped the prompt has none.
+   * Bounded by {@link GOAL_TEXT_MAX_LENGTH}, enforced by the server validator and the client field.
+   * `| undefined` like the other clearable settings: emptying the textarea patches it to `null`,
+   * which the server normalises back to absent.
+   */
+  goalText?: string | undefined;
+  /**
    * Which of several active challenges the app is currently showing.
    *
    * A preference, not a source of truth: if it names a challenge that has since ended or been
@@ -461,6 +470,13 @@ export function openFitnessDB(name = DB_NAME, options: OpenOptions = {}): Promis
     },
   });
 }
+
+/**
+ * A generous ceiling for the onboarding "why" (LBV-1481): long enough for a real paragraph, short
+ * enough that it cannot bloat the settings row. The client textarea reads this; the server validator
+ * enforces the same bound from its own copy in `server/fields.ts` — must match (see the note there).
+ */
+export const GOAL_TEXT_MAX_LENGTH = 1000;
 
 export const DEFAULT_SETTINGS: SettingsRecord = {
   id: 'settings',

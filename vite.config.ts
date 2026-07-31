@@ -138,6 +138,15 @@ export default defineConfig(({ mode }) => {
         },
         workbox: {
           globPatterns: ['**/*.{js,css,html,svg,png,woff2}'],
+          /**
+           * Push reminders (LBV-1481). `generateSW` is kept — every guarantee documented in this
+           * block is generated and re-implementing them under `injectManifest` to add two listeners
+           * would be a large, permanent liability. Instead the Workbox worker `importScripts` a
+           * hand-written `public/push-sw.js`, which adds only the `push` and `notificationclick`
+           * handlers. The path is bare because `public/` is copied to the site root, next to the
+           * generated `sw.js`, so it resolves against the worker's own scope.
+           */
+          importScripts: ['push-sw.js'],
           navigateFallback: 'index.html',
           /**
            * Already the plugin's default and already present in dist/sw.js — restated so a

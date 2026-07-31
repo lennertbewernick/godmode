@@ -284,6 +284,7 @@ is a constant on the domain record, so `server/rows.ts` does not store it (it is
 | `restOverrideSeconds` | `number \| undefined` | **yes** | `rest_override_seconds` | REAL | yes | finite ≥ 0. Typed into a number input (`Settings.tsx:202`) | — |
 | `lastBackupAt` | `string` | **yes** | `last_backup_at` | TEXT | yes | `ts` | — |
 | `onboardedAt` | `string` | **yes** | `onboarded_at` | TEXT | yes | `ts` | — |
+| `goalText` | `string` | **yes** | `goal_text` | TEXT | yes | non-empty, ≤ `GOAL_TEXT_MAX_LENGTH` (1000). The onboarding "why" (LBV-1481) | — |
 | `selectedChallengeId` | `string \| undefined` | **yes** | `selected_challenge_id` | TEXT | yes | non-empty; **reference deliberately not enforced** (see §9) | — |
 
 Three of these are declared `?: T | undefined` rather than `?: T`, so under

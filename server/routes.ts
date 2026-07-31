@@ -99,6 +99,7 @@ import { evaluate as evaluateGate } from './registration.js';
 import type { RegistrationGate } from './registration.js';
 import type { GoogleOAuthConfig } from './google-oauth.js';
 import { BOOTSTRAP_USER_ID, findUserByEmail, registerUser } from './users.js';
+import { removeSubscription, storeSubscription } from './push.js';
 import { BackupValidationError, validateOne } from './validate.js';
 import type { PerformanceTest } from '../src/core/types.js';
 import type {
@@ -880,6 +881,48 @@ function isoNow(ctx: ApiContext): string {
   return new Date(ctx.now()).toISOString();
 }
 
+// ── Push subscriptions ────────────────────────────────────────────────────────────────────────
+//
+// Device state, not domain data: these do NOT carry `expectedRevision`, do NOT bump the revision,
+// and return `204` rather than a snapshot. A subscription is the encrypted-delivery address of one
+// browser; storing or dropping it changes nothing about the training history the snapshot describes.
+// Sending to them, and the VAPID keypair, are a separate DevOps ticket (LBV-1481).
+
+/**
+ * Store (or replace) this device's push subscription for the signed-in user.
+ *
+ * The body is the browser's `PushSubscription`, flattened by the client to `{ endpoint, p256dh,
+ * auth }` (`src/push/subscribe.ts`). Idempotent on `endpoint`: re-subscribing the same browser
+ * replaces the row rather than adding a second, so a client that resubscribes on every load never
+ * accumulates duplicates.
+ */
+function putPushSubscription(
+  ctx: ApiContext,
+  userId: string,
+  body: Record<string, unknown>,
+): void {
+  requireKeys(body, ['endpoint', 'p256dh', 'auth'], 'PUT /api/push/subscription');
+  const endpoint = requireString(body, 'endpoint', 'A push subscription');
+  const p256dh = requireString(body, 'p256dh', 'A push subscription');
+  const auth = requireString(body, 'auth', 'A push subscription');
+  storeSubscription(ctx.db, userId, { endpoint, p256dh, auth }, isoNow(ctx));
+}
+
+/**
+ * Drop a subscription by endpoint — what the client calls when the push service answers `410 Gone`,
+ * or when the user turns reminders off. Scoped to the owner and idempotent: removing one that is
+ * not there (already gone, or never this user's) is a `204`, not an error.
+ */
+function deletePushSubscription(
+  ctx: ApiContext,
+  userId: string,
+  body: Record<string, unknown>,
+): void {
+  requireKeys(body, ['endpoint'], 'DELETE /api/push/subscription');
+  const endpoint = requireString(body, 'endpoint', 'A push subscription');
+  removeSubscription(ctx.db, userId, endpoint);
+}
+
 // ── Session endpoints ───────────────────────────────────────────────────────────────────────
 
 /** Long enough for any real address, short enough that scrypt is never handed an abusive input. */
@@ -1220,6 +1263,20 @@ export async function handleApi(
       if (method !== 'PATCH') throw methodNotAllowed(method, route);
       const body = asObject(await readJsonBody(req, MAX_BODY_BYTES), 'The request body');
       return sendJson(res, 200, patchSettings(ctx, userId!, body));
+    }
+
+    if (rest[0] === 'push' && rest[1] === 'subscription' && rest.length === 2) {
+      if (method === 'PUT') {
+        const body = asObject(await readJsonBody(req, MAX_BODY_BYTES), 'The request body');
+        putPushSubscription(ctx, userId!, body);
+        return sendEmpty(res, 204);
+      }
+      if (method === 'DELETE') {
+        const body = asObject(await readJsonBody(req, MAX_BODY_BYTES), 'The request body');
+        deletePushSubscription(ctx, userId!, body);
+        return sendEmpty(res, 204);
+      }
+      throw methodNotAllowed(method, route);
     }
 
     throw notFound(route);

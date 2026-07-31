@@ -151,6 +151,36 @@ CREATE TABLE user_revisions (
   updated_at TEXT    NOT NULL CHECK (updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*')
 ) STRICT;
 
+-- ── push_subscriptions ──────────────────────────────────────────────────────────────────────
+--
+-- One row per Web Push endpoint a user has granted (LBV-1481). Device state, NOT part of the
+-- domain dataset: it is not in `COLLECTIONS` (`server/dataset.ts`), never appears in a snapshot or
+-- a backup, and no `user_revisions` bump touches it — exactly like `sessions`. A subscription is
+-- re-established by the device on its next visit, so a restore that carries none is correct.
+--
+-- `endpoint` is the push service URL the browser minted; it is the natural identity of a
+-- subscription and is UNIQUE across the whole table, so re-subscribing the same browser replaces
+-- the previous row rather than accumulating duplicates (`ON CONFLICT (endpoint)` in
+-- `server/push.ts`). `p256dh` and `auth` are the base64url key material the sender (a DevOps
+-- ticket, `web-push`) needs to encrypt a payload for this endpoint. `created_at` is when the row
+-- was last written.
+--
+-- `user_id` scopes a subscription to its owner so a send only ever reaches that person's devices,
+-- and `ON DELETE CASCADE` drops a user's subscriptions with the user. The unique `endpoint`
+-- deliberately spans users: a browser is one device, and if a shared device is re-granted under a
+-- second account the endpoint moves to that account rather than being served two people's
+-- reminders.
+
+CREATE TABLE push_subscriptions (
+  endpoint   TEXT NOT NULL PRIMARY KEY CHECK (length(endpoint) > 0),
+  user_id    TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  p256dh     TEXT NOT NULL CHECK (length(p256dh) > 0),
+  auth       TEXT NOT NULL CHECK (length(auth) > 0),
+  created_at TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*')
+) STRICT;
+
+CREATE INDEX idx_push_subscriptions_user ON push_subscriptions (user_id);
+
 -- ── exercises ───────────────────────────────────────────────────────────────────────────────
 --
 -- GLOBAL / shared across all users (LBV-1478 decision, `server/PERSISTENCE.md` §11). No
@@ -318,6 +348,9 @@ CREATE TABLE settings (
   rest_override_seconds REAL     NULL CHECK (rest_override_seconds IS NULL OR rest_override_seconds >= 0),
   last_backup_at        TEXT     NULL CHECK (last_backup_at IS NULL OR last_backup_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'),
   onboarded_at          TEXT     NULL CHECK (onboarded_at IS NULL OR onboarded_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'),
+  -- The onboarding "why do you do this" (LBV-1481). Free text in the user's own words, so no GLOB;
+  -- length is bounded by the validator (`GOAL_TEXT_MAX_LENGTH`), not the column.
+  goal_text             TEXT     NULL CHECK (goal_text IS NULL OR length(goal_text) > 0),
   selected_challenge_id TEXT     NULL
 ) STRICT;
 

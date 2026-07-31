@@ -9,6 +9,14 @@ interface ImportMetaEnv {
    * falls back to the JustClose fork. Must be `VITE_`-prefixed to reach the client build.
    */
   readonly VITE_GODMODE_REPO_URL?: string;
+  /**
+   * The Web Push VAPID **public** key, base64url, provisioned by DevOps (LBV-1481). The client
+   * subscribes with it; the matching private key never leaves the sender. A public key is public by
+   * definition, so embedding it in the build is correct. Unset, reminders report as unavailable and
+   * the opt-in is hidden — the app still works, it just cannot offer push. Must be `VITE_`-prefixed
+   * to reach the client build.
+   */
+  readonly VITE_GODMODE_VAPID_PUBLIC_KEY?: string;
 }
 
 /**
