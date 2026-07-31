@@ -19,7 +19,7 @@ import { existsSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { AttemptLimiter, digest, ensureTokenFile, requireToken, resolveTokenFile } from './auth.js';
+import { AttemptLimiter, digest, ensureTokenFile, resolveTokenFile } from './auth.js';
 import { currentHost, openDatabase, type Host, type OpenedDatabase } from './db.js';
 import {
   HttpError,
@@ -29,6 +29,9 @@ import {
   sendFile,
 } from './http.js';
 import { API_VERSION, handleApi, type ApiContext } from './routes.js';
+import { GOOGLE_AUTH_PREFIX, handleGoogleAuth } from './auth-google.js';
+import { resolveGoogleConfig, type GoogleOAuthConfig } from './google-oauth.js';
+import { resolveRegistrationGate, type RegistrationGate } from './registration.js';
 import { SessionStore, type SessionOptions } from './session.js';
 
 /**
@@ -109,12 +112,23 @@ export interface ServerOptions {
   readonly dataDir?: string;
   /** Built client. Absent or missing is not fatal — the API still works. */
   readonly staticRoot?: string;
+  /**
+   * The dev/global token. When set, `POST /api/session` accepts a `{ token }` body for the
+   * bootstrap owner (`server/routes.ts`). The tests set it; production enables it only through an
+   * explicit `GODMODE_DEV_TOKEN` env var. Real accounts (LBV-1480) are the production path.
+   */
   readonly token?: string;
   readonly now?: () => number;
   readonly sessions?: SessionStore;
   /** Expiry overrides for the default sqlite-backed session store. Ignored if `sessions` is set. */
   readonly sessionOptions?: SessionOptions;
   readonly limiter?: AttemptLimiter;
+  /** Registration policy override. Defaults to the one resolved from the environment. */
+  readonly registration?: RegistrationGate;
+  /** Google OAuth client override. Defaults to the one resolved from the environment (or none). */
+  readonly google?: GoogleOAuthConfig;
+  /** `fetch` used for the Google token exchange. Injected in tests; global `fetch` in production. */
+  readonly fetch?: typeof fetch;
 }
 
 export interface RunningServer {
@@ -151,17 +165,26 @@ export function defaultStaticRoot(host: Host = currentHost()): string {
  */
 export function createGodmodeServer(options: ServerOptions = {}): RunningServer {
   const host = options.host ?? currentHost();
-  const token = options.token ?? requireToken(host);
   const opened = openDatabase({
     ...(options.dataDir === undefined ? {} : { dataDir: options.dataDir }),
     host,
   });
 
+  // The shared token no longer starts the server or authenticates production (LBV-1480): it is a
+  // dev-only convenience, enabled by an injected `options.token` (tests) or an explicit
+  // `GODMODE_DEV_TOKEN` env var, and never by the legacy `GODMODE_TOKEN`. Absent, there is simply
+  // no token login and the server runs on real accounts alone.
+  const devToken = options.token ?? host.env['GODMODE_DEV_TOKEN']?.trim();
+  const google = options.google ?? resolveGoogleConfig(host.env);
+
   const context: ApiContext = {
     db: opened.db,
     sessions: options.sessions ?? new SessionStore(opened.db, options.sessionOptions),
-    tokenDigest: digest(token),
+    ...(devToken !== undefined && devToken !== '' ? { devTokenDigest: digest(devToken) } : {}),
     limiter: options.limiter ?? new AttemptLimiter(),
+    registration: options.registration ?? resolveRegistrationGate(host.env),
+    ...(google === undefined ? {} : { google }),
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     now: options.now ?? (() => Date.now()),
   };
 
@@ -222,6 +245,14 @@ async function handle(
   if (pathname === '/api' || pathname.startsWith('/api/')) {
     await handleApi(context, req, res, pathname);
     return;
+  }
+
+  // Google Sign-In is a set of top-level navigations, not a JSON surface, so it is routed here
+  // rather than through `/api`. `handleGoogleAuth` sets its own security headers and returns
+  // `false` for a path it does not own, so an unrelated `/auth/...` route still falls through to
+  // the static handler and the SPA.
+  if (pathname === GOOGLE_AUTH_PREFIX || pathname.startsWith(`${GOOGLE_AUTH_PREFIX}/`)) {
+    if (await handleGoogleAuth(context, req, res, pathname, url.searchParams)) return;
   }
 
   const method = req.method ?? 'GET';

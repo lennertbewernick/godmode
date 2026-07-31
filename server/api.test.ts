@@ -22,8 +22,10 @@ import {
   type RunningServer,
 } from './index.js';
 import { API_VERSION, ratchet, type Snapshot } from './routes.js';
+import { resolveRegistrationGate, type RegistrationGate } from './registration.js';
+import { type GoogleOAuthConfig } from './google-oauth.js';
 import { SESSION_COOKIE, SessionStore } from './session.js';
-import { createUser } from './users.js';
+import { createUser, findUserByEmail } from './users.js';
 
 const TOKEN = 'a-token-long-enough-to-be-accepted';
 
@@ -54,6 +56,9 @@ async function start(
     limiter?: AttemptLimiter;
     sessions?: SessionStore;
     sessionOptions?: { maxAgeMs?: number; idleMs?: number };
+    registration?: RegistrationGate;
+    google?: GoogleOAuthConfig;
+    fetch?: typeof fetch;
   } = {},
 ): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'godmode-api-'));
@@ -70,6 +75,9 @@ async function start(
     ...(options.limiter === undefined ? {} : { limiter: options.limiter }),
     ...(options.sessions === undefined ? {} : { sessions: options.sessions }),
     ...(options.sessionOptions === undefined ? {} : { sessionOptions: options.sessionOptions }),
+    ...(options.registration === undefined ? {} : { registration: options.registration }),
+    ...(options.google === undefined ? {} : { google: options.google }),
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   });
   await new Promise<void>((done) => {
     running.server.listen(0, '127.0.0.1', done);
@@ -1417,5 +1425,329 @@ describe('multi-user isolation', () => {
     const appended = await b.send('POST', '/api/workouts', { workout: workoutCommand() });
     expect(appended.status).toBe(409);
     expect(appended.body['error']).toBe('unknown_plan_slot');
+  });
+});
+
+// ── Registration and password login (LBV-1480) ────────────────────────────────────────────────
+
+const OPEN = resolveRegistrationGate({ GODMODE_REGISTRATION: 'open' });
+const INVITE = resolveRegistrationGate({ GODMODE_INVITE_CODE: 'let-me-in' });
+
+describe('registration', () => {
+  it('creates an account, signs it in, and refuses a data endpoint before but allows it after', async () => {
+    const harness = await start({ registration: OPEN });
+    const client = new Client(harness.base);
+
+    // Before registering: no session.
+    expect((await client.send('GET', '/api/snapshot')).status).toBe(401);
+
+    const reply = await client.send('POST', '/api/register', {
+      email: 'a@example.com',
+      password: 'a-good-password',
+    });
+    expect(reply.status).toBe(201);
+    expect(reply.body['authenticated']).toBe(true);
+    // The session cookie is set and the client jar picked it up, so a read now works.
+    expect((await client.send('GET', '/api/snapshot')).status).toBe(200);
+  });
+
+  it('the session cookie is HttpOnly, Secure and SameSite=Strict', async () => {
+    const harness = await start({ registration: OPEN });
+    const client = new Client(harness.base);
+    const reply = await client.send('POST', '/api/register', {
+      email: 'strict@example.com',
+      password: 'a-good-password',
+    });
+    const cookie = reply.setCookie.find((c) => c.startsWith(`${SESSION_COOKIE}=`)) ?? '';
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('Secure');
+    expect(cookie).toContain('SameSite=Strict');
+  });
+
+  it('rejects a short password and a malformed email', async () => {
+    const harness = await start({ registration: OPEN });
+    const client = new Client(harness.base);
+    expect((await client.send('POST', '/api/register', { email: 'x@y.z', password: 'short' })).body['error']).toBe(
+      'password_too_short',
+    );
+    expect(
+      (await client.send('POST', '/api/register', { email: 'not-an-email', password: 'a-good-password' })).body[
+        'error'
+      ],
+    ).toBe('invalid_email');
+  });
+
+  it('refuses a duplicate email', async () => {
+    const harness = await start({ registration: OPEN });
+    const first = new Client(harness.base);
+    await first.send('POST', '/api/register', { email: 'dup@example.com', password: 'a-good-password' });
+    const second = new Client(harness.base);
+    const reply = await second.send('POST', '/api/register', {
+      email: 'DUP@example.com', // case-insensitive collision
+      password: 'another-password',
+    });
+    expect(reply.status).toBe(409);
+    expect(reply.body['error']).toBe('email_taken');
+  });
+
+  it('is gated: closed by default, and invite mode needs the right code', async () => {
+    const closed = await start(); // default env gate = invite, no code = closed door
+    expect(
+      (await new Client(closed.base).send('POST', '/api/register', {
+        email: 'z@example.com',
+        password: 'a-good-password',
+      })).status,
+    ).toBe(403);
+
+    const invited = await start({ registration: INVITE });
+    const noCode = await new Client(invited.base).send('POST', '/api/register', {
+      email: 'i@example.com',
+      password: 'a-good-password',
+    });
+    expect(noCode.body['error']).toBe('invite_required');
+    const wrong = await new Client(invited.base).send('POST', '/api/register', {
+      email: 'i@example.com',
+      password: 'a-good-password',
+      inviteCode: 'nope',
+    });
+    expect(wrong.body['error']).toBe('invite_invalid');
+    const ok = await new Client(invited.base).send('POST', '/api/register', {
+      email: 'i@example.com',
+      password: 'a-good-password',
+      inviteCode: 'let-me-in',
+    });
+    expect(ok.status).toBe(201);
+  });
+});
+
+describe('password login (POST /api/session)', () => {
+  async function withAccount(email = 'runner@example.com', password = 'a-good-password') {
+    const harness = await start({ registration: OPEN });
+    const setup = new Client(harness.base);
+    await setup.send('POST', '/api/register', { email, password });
+    // A fresh client with no cookie, to exercise login rather than the registration session.
+    return { harness, email, password };
+  }
+
+  it('signs in with the right email and password', async () => {
+    const { harness, email, password } = await withAccount();
+    const client = new Client(harness.base);
+    const reply = await client.send('POST', '/api/session', { email, password });
+    expect(reply.status).toBe(200);
+    expect((await client.send('GET', '/api/snapshot')).status).toBe(200);
+  });
+
+  it('refuses a wrong password and an unknown email with the same error', async () => {
+    const { harness, email } = await withAccount();
+    const client = new Client(harness.base);
+    const wrongPw = await client.send('POST', '/api/session', { email, password: 'not-it-at-all' });
+    const noUser = await client.send('POST', '/api/session', {
+      email: 'ghost@example.com',
+      password: 'whatever-here',
+    });
+    expect(wrongPw.status).toBe(401);
+    expect(noUser.status).toBe(401);
+    expect(wrongPw.body['error']).toBe('invalid_credentials');
+    expect(noUser.body['error']).toBe('invalid_credentials');
+  });
+
+  it('the dev token still signs in the bootstrap owner (backward compatible)', async () => {
+    const { harness } = await withAccount();
+    const client = new Client(harness.base);
+    expect((await client.login()).status).toBe(200); // Client.login sends { token: TOKEN }
+  });
+
+  it('two separate accounts each see only their own data, end to end', async () => {
+    const harness = await start({ registration: OPEN });
+
+    const a = new Client(harness.base);
+    await a.send('POST', '/api/register', { email: 'a@example.com', password: 'a-good-password' });
+    await a.send('POST', '/api/challenges', {
+      expectedRevision: 0,
+      exercise: exerciseRecord(),
+      challenge: challengeRecord(),
+      slots: [slotRecord()],
+      select: true,
+    });
+
+    const b = new Client(harness.base);
+    await b.send('POST', '/api/register', { email: 'b@example.com', password: 'b-good-password' });
+
+    const bSnap = await b.snapshot();
+    expect(bSnap.challenges).toEqual([]);
+    expect(bSnap.workouts).toEqual([]);
+    const aSnap = await a.snapshot();
+    expect(aSnap.challenges.length).toBe(1);
+  });
+});
+
+// ── Google Sign-In callback (LBV-1480) ────────────────────────────────────────────────────────
+
+const GOOGLE: GoogleOAuthConfig = {
+  clientId: 'client-abc.apps.googleusercontent.com',
+  clientSecret: 'server-secret',
+  redirectUri: 'https://godmode.example/auth/google/callback',
+};
+
+function idTokenFor(claims: Record<string, unknown>): string {
+  const seg = (o: unknown): string => Buffer.from(JSON.stringify(o)).toString('base64url');
+  return `${seg({ alg: 'RS256' })}.${seg(claims)}.sig`;
+}
+
+/** A fake Google token endpoint returning `id_token` for whichever identity the test wants. */
+function fakeGoogleFetch(identity: Record<string, unknown>): typeof fetch {
+  return (async () =>
+    ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        id_token: idTokenFor({
+          iss: 'https://accounts.google.com',
+          aud: GOOGLE.clientId,
+          ...identity,
+        }),
+      }),
+    }) as Response) as typeof fetch;
+}
+
+interface Redirect {
+  status: number;
+  location: string | null;
+  setCookie: string[];
+}
+
+/** A GET that does not follow redirects, so the 302 + Set-Cookie can be inspected. */
+async function manualGet(base: string, path: string, cookie?: string): Promise<Redirect> {
+  const response = await fetch(`${base}${path}`, {
+    redirect: 'manual',
+    ...(cookie === undefined ? {} : { headers: { cookie } }),
+  });
+  return {
+    status: response.status,
+    location: response.headers.get('location'),
+    setCookie: response.headers.getSetCookie(),
+  };
+}
+
+function cookieValue(setCookie: readonly string[], name: string): string | undefined {
+  const raw = setCookie.find((c) => c.startsWith(`${name}=`));
+  if (raw === undefined) return undefined;
+  const match = new RegExp(`^${name}=([^;]*)`).exec(raw);
+  return match?.[1];
+}
+
+describe('Google sign-in', () => {
+  it('login redirects to Google and plants a Lax state cookie', async () => {
+    const harness = await start({ registration: OPEN, google: GOOGLE, fetch: fakeGoogleFetch({}) });
+    const begin = await manualGet(harness.base, '/auth/google/login');
+    expect(begin.status).toBe(302);
+    expect(begin.location).toContain('accounts.google.com');
+    const stateCookie = begin.setCookie.find((c) => c.startsWith('godmode_oauth='));
+    expect(stateCookie).toContain('SameSite=Lax');
+    expect(stateCookie).toContain('HttpOnly');
+  });
+
+  it('a full callback creates the account, signs in, and clears the state cookie', async () => {
+    const harness = await start({
+      registration: OPEN,
+      google: GOOGLE,
+      fetch: fakeGoogleFetch({
+        sub: 'google-sub-1',
+        email: 'gmail-runner@example.com',
+        email_verified: true,
+        name: 'G Runner',
+      }),
+    });
+
+    const begin = await manualGet(harness.base, '/auth/google/login');
+    const oauthCookie = cookieValue(begin.setCookie, 'godmode_oauth') ?? '';
+    const state = new URL(begin.location ?? '').searchParams.get('state') ?? '';
+
+    const callback = await manualGet(
+      harness.base,
+      `/auth/google/callback?code=auth-code&state=${encodeURIComponent(state)}`,
+      `godmode_oauth=${oauthCookie}`,
+    );
+    expect(callback.status).toBe(302);
+    expect(callback.location).toBe('/');
+    // A session cookie was set, and the oauth state cookie was cleared.
+    const session = cookieValue(callback.setCookie, SESSION_COOKIE);
+    expect(session).toBeTruthy();
+    expect(callback.setCookie.find((c) => c.startsWith('godmode_oauth='))).toContain('Max-Age=0');
+
+    // The account exists and the session it minted authenticates a data read.
+    expect(findUserByEmail(harness.running.context.db, 'gmail-runner@example.com')).toBeDefined();
+    const authed = await fetch(`${harness.base}/api/snapshot`, {
+      headers: { cookie: `${SESSION_COOKIE}=${session ?? ''}` },
+    });
+    expect(authed.status).toBe(200);
+  });
+
+  it('rejects a callback whose state does not match the cookie (CSRF)', async () => {
+    const harness = await start({
+      registration: OPEN,
+      google: GOOGLE,
+      fetch: fakeGoogleFetch({ sub: 's', email: 'x@example.com', email_verified: true }),
+    });
+    const begin = await manualGet(harness.base, '/auth/google/login');
+    const oauthCookie = cookieValue(begin.setCookie, 'godmode_oauth') ?? '';
+    const callback = await manualGet(
+      harness.base,
+      `/auth/google/callback?code=c&state=forged-state`,
+      `godmode_oauth=${oauthCookie}`,
+    );
+    expect(callback.status).toBe(302);
+    expect(callback.location).toBe('/?authError=google');
+    expect(cookieValue(callback.setCookie, SESSION_COOKIE)).toBeUndefined();
+  });
+
+  it('turns away a brand-new Google user who has no invite', async () => {
+    const harness = await start({
+      registration: INVITE, // invite mode, code "let-me-in"
+      google: GOOGLE,
+      fetch: fakeGoogleFetch({ sub: 'new-sub', email: 'stranger@example.com', email_verified: true }),
+    });
+    const begin = await manualGet(harness.base, '/auth/google/login'); // no ?invite
+    const oauthCookie = cookieValue(begin.setCookie, 'godmode_oauth') ?? '';
+    const state = new URL(begin.location ?? '').searchParams.get('state') ?? '';
+    const callback = await manualGet(
+      harness.base,
+      `/auth/google/callback?code=c&state=${encodeURIComponent(state)}`,
+      `godmode_oauth=${oauthCookie}`,
+    );
+    expect(callback.location).toBe('/?authError=invite');
+    expect(findUserByEmail(harness.running.context.db, 'stranger@example.com')).toBeUndefined();
+  });
+
+  it('links a Google login to an existing password account of the same verified email', async () => {
+    const harness = await start({
+      registration: OPEN,
+      google: GOOGLE,
+      fetch: fakeGoogleFetch({ sub: 'linking-sub', email: 'both@example.com', email_verified: true }),
+    });
+    // Register by password first.
+    const pw = new Client(harness.base);
+    await pw.send('POST', '/api/register', { email: 'both@example.com', password: 'a-good-password' });
+    const before = findUserByEmail(harness.running.context.db, 'both@example.com');
+
+    // Now sign in with Google for the same email.
+    const begin = await manualGet(harness.base, '/auth/google/login');
+    const oauthCookie = cookieValue(begin.setCookie, 'godmode_oauth') ?? '';
+    const state = new URL(begin.location ?? '').searchParams.get('state') ?? '';
+    await manualGet(
+      harness.base,
+      `/auth/google/callback?code=c&state=${encodeURIComponent(state)}`,
+      `godmode_oauth=${oauthCookie}`,
+    );
+
+    const after = findUserByEmail(harness.running.context.db, 'both@example.com');
+    // Same account (same id), now carrying the google_sub — not a second row.
+    expect(after?.id).toBe(before?.id);
+    expect(after?.googleSub).toBe('linking-sub');
+  });
+
+  it('answers /auth/google/* with 404 when Google is not configured', async () => {
+    const harness = await start({ registration: OPEN }); // no google
+    expect((await manualGet(harness.base, '/auth/google/login')).status).toBe(404);
   });
 });
