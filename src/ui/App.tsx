@@ -152,29 +152,6 @@ function daysPerWeek(challenge: ChallengeRecord): number {
   return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : 3;
 }
 
-/**
- * Read and clear a `?authError=<why>` the Google callback may have redirected back with.
- *
- * Returns a human sentence for the sign-in screen, or `undefined` when there is none. Strips the
- * parameter from the address bar with `replaceState` so a reload does not resurrect the message
- * and so the code never lingers in a shareable URL.
- */
-function takeAuthError(): string | undefined {
-  try {
-    const url = new URL(window.location.href);
-    const why = url.searchParams.get('authError');
-    if (why === null) return undefined;
-    url.searchParams.delete('authError');
-    window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
-    if (why === 'invite') {
-      return 'That account needs an invite. Enter your invite code, then continue with Google.';
-    }
-    return 'Google sign-in did not complete. Please try again.';
-  } catch {
-    return undefined;
-  }
-}
-
 function rememberTab(tab: Tab): void {
   try {
     window.localStorage.setItem(TAB_KEY, tab);
@@ -201,15 +178,12 @@ interface State {
 export function App() {
   const [session, setSession] = useState<Session>({ kind: 'checking' });
   /**
-   * Which sign-in affordances the server offers: the Google button only when an OAuth client is
-   * configured, and the invite field only in invite mode. Resolved once from `GET /api/session`.
+   * Which sign-in affordances the server offers: the invite field only in invite mode. Resolved
+   * once from `GET /api/session`.
    */
   const [signInOptions, setSignInOptions] = useState<{
-    googleEnabled: boolean;
     registrationMode: RegistrationMode;
-  }>({ googleEnabled: false, registrationMode: 'invite' });
-  /** A message set when the browser returns from a failed Google sign-in (`?authError=`). */
-  const [authErrorReason, setAuthErrorReason] = useState<string | undefined>(undefined);
+  }>({ registrationMode: 'invite' });
   /** Exactly as the server last described it. Never edited in place. */
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   /** Finished workouts this device is still holding. */
@@ -345,7 +319,6 @@ export function App() {
       try {
         const state = await sessionState();
         setSignInOptions({
-          googleEnabled: state.googleEnabled,
           registrationMode: state.registrationMode,
         });
         if (!state.authenticated) {
@@ -361,14 +334,6 @@ export function App() {
       }
     })();
   }, [load, handleFailure, readLocal]);
-
-  // The Google callback redirects here with `?authError=<why>` when a sign-in did not complete.
-  // Turn it into a message for the sign-in screen and strip it from the URL, so a reload does not
-  // keep showing it.
-  useEffect(() => {
-    const message = takeAuthError();
-    if (message !== undefined) setAuthErrorReason(message);
-  }, []);
 
   // Asked for once, early. Best-effort: the answer is reported in Settings rather than acted on.
   useEffect(() => {
@@ -798,8 +763,7 @@ export function App() {
     return (
       <>
         <SignIn
-          reason={session.reason ?? authErrorReason}
-          googleEnabled={signInOptions.googleEnabled}
+          reason={session.reason}
           registrationMode={signInOptions.registrationMode}
           onSignedIn={() => void load()}
         />

@@ -48,8 +48,6 @@ export interface UserRecord {
   readonly displayName: string;
   /** Nullable until the auth ticket sets it. Present for password sign-in. */
   readonly passwordHash?: string;
-  /** Nullable and unique-when-present. Present for Google SSO. */
-  readonly googleSub?: string;
   readonly createdAt: string;
 }
 
@@ -58,7 +56,6 @@ interface UserRow {
   email: string;
   display_name: string;
   password_hash: string | null;
-  google_sub: string | null;
   created_at: string;
 }
 
@@ -68,7 +65,6 @@ function decodeUser(row: UserRow): UserRecord {
     email: row.email,
     displayName: row.display_name,
     ...(row.password_hash === null ? {} : { passwordHash: row.password_hash }),
-    ...(row.google_sub === null ? {} : { googleSub: row.google_sub }),
     createdAt: row.created_at,
   };
 }
@@ -85,17 +81,16 @@ export function generateUserId(): string {
   return `usr_${randomBytes(12).toString('base64url')}`;
 }
 
-/** Insert one user. Plain INSERT — a duplicate id, email or google_sub is a caller error. */
+/** Insert one user. Plain INSERT — a duplicate id or email is a caller error. */
 export function createUser(db: DatabaseSync, user: UserRecord): void {
   db.prepare(
-    'INSERT INTO users (id, email, display_name, password_hash, google_sub, created_at) ' +
-      'VALUES (?, ?, ?, ?, ?, ?)',
+    'INSERT INTO users (id, email, display_name, password_hash, created_at) ' +
+      'VALUES (?, ?, ?, ?, ?)',
   ).run(
     user.id,
     user.email,
     user.displayName,
     user.passwordHash ?? null,
-    user.googleSub ?? null,
     user.createdAt,
   );
 }
@@ -108,13 +103,6 @@ export function findUserById(db: DatabaseSync, id: string): UserRecord | undefin
 /** Case-insensitive, matching `idx_users_email` on `lower(email)`. */
 export function findUserByEmail(db: DatabaseSync, email: string): UserRecord | undefined {
   const row = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(email) as
-    | UserRow
-    | undefined;
-  return row === undefined ? undefined : decodeUser(row);
-}
-
-export function findUserByGoogleSub(db: DatabaseSync, googleSub: string): UserRecord | undefined {
-  const row = db.prepare('SELECT * FROM users WHERE google_sub = ?').get(googleSub) as
     | UserRow
     | undefined;
   return row === undefined ? undefined : decodeUser(row);
@@ -179,7 +167,6 @@ export interface NewUser {
   readonly email: string;
   readonly displayName: string;
   readonly passwordHash?: string;
-  readonly googleSub?: string;
   readonly now?: string;
 }
 
@@ -191,8 +178,8 @@ export interface NewUser {
  * transaction — the same pairing `ensureBootstrapUser` makes for the owner. The id is generated
  * here, not supplied, so a caller can never collide with the owner's fixed id or another user's.
  *
- * A duplicate email or `google_sub` raises SQLite's `UNIQUE` constraint from `createUser`; the
- * caller turns that into the right HTTP answer rather than this module guessing at one.
+ * A duplicate email raises SQLite's `UNIQUE` constraint from `createUser`; the caller turns that
+ * into the right HTTP answer rather than this module guessing at one.
  */
 export function registerUser(db: DatabaseSync, user: NewUser): UserRecord {
   const now = user.now ?? new Date().toISOString();
@@ -201,7 +188,6 @@ export function registerUser(db: DatabaseSync, user: NewUser): UserRecord {
     email: user.email,
     displayName: user.displayName,
     ...(user.passwordHash === undefined ? {} : { passwordHash: user.passwordHash }),
-    ...(user.googleSub === undefined ? {} : { googleSub: user.googleSub }),
     createdAt: now,
   };
   const tx = db.prepare('BEGIN');
@@ -218,16 +204,4 @@ export function registerUser(db: DatabaseSync, user: NewUser): UserRecord {
     throw cause;
   }
   return record;
-}
-
-/**
- * Link a Google identity to an account that already exists.
- *
- * Used when someone who first registered by password later signs in with a Google account of the
- * same email: rather than a second, duplicate account, the `google_sub` is attached to the one
- * they have, so both methods reach the same training history. Scoped by `id`; the caller has
- * already established that the row is the right one.
- */
-export function attachGoogleSub(db: DatabaseSync, id: string, googleSub: string): void {
-  db.prepare('UPDATE users SET google_sub = ? WHERE id = ?').run(googleSub, id);
 }

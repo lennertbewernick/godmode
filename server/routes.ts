@@ -97,7 +97,6 @@ import type { SessionStore } from './session.js';
 import { hashPassword, passwordTooShort, verifyPassword } from './passwords.js';
 import { evaluate as evaluateGate } from './registration.js';
 import type { RegistrationGate } from './registration.js';
-import type { GoogleOAuthConfig } from './google-oauth.js';
 import { BOOTSTRAP_USER_ID, findUserByEmail, registerUser } from './users.js';
 import { removeSubscription, storeSubscription } from './push.js';
 import { BackupValidationError, validateOne } from './validate.js';
@@ -130,12 +129,8 @@ export interface ApiContext {
    */
   readonly devTokenDigest?: Buffer | undefined;
   readonly limiter: AttemptLimiter;
-  /** The single registration policy, consulted by both password and Google account creation. */
+  /** The single registration policy, consulted when a password account is created. */
   readonly registration: RegistrationGate;
-  /** The Google OAuth client, present only when Google Sign-In is configured. */
-  readonly google?: GoogleOAuthConfig | undefined;
-  /** Injected for the Google token exchange; defaults to the global `fetch` in production. */
-  readonly fetch?: typeof fetch | undefined;
   /** Epoch milliseconds. Injectable so session expiry and rate limits are testable. */
   readonly now: () => number;
 }
@@ -965,9 +960,9 @@ function requirePassword(body: Record<string, unknown>): string {
  * Discard whatever session the caller presented, mint a fresh one for `userId`, and answer.
  *
  * A new id is always generated and the presented one dropped first — the two moves that make
- * session fixation impossible (see `server/session.ts`). Shared by password login, registration
- * and (via the cookie it returns) the Google callback, so all three routes are fixation-safe by
- * construction rather than by each remembering to be.
+ * session fixation impossible (see `server/session.ts`). Shared by password login and
+ * registration, so both routes are fixation-safe by construction rather than by each remembering
+ * to be.
  */
 function establishSession(
   ctx: ApiContext,
@@ -1138,7 +1133,7 @@ async function register(ctx: ApiContext, req: IncomingMessage, res: ServerRespon
 }
 
 /** A display name from the body if it is a usable string, else the local part of the email. */
-export function resolveDisplayName(raw: unknown, email: string): string {
+function resolveDisplayName(raw: unknown, email: string): string {
   if (typeof raw === 'string' && raw.trim() !== '') {
     return raw.trim().slice(0, MAX_DISPLAY_NAME_LENGTH);
   }
@@ -1192,12 +1187,11 @@ export async function handleApi(
       if (method === 'DELETE') return closeSession(ctx, req, res);
       if (method === 'GET') {
         const authenticated = ctx.sessions.validate(readSessionId(req), ctx.now()) !== undefined;
-        // The client uses these to decide which sign-in affordances to show: the Google button
-        // only when a real OAuth client is configured, and the invite field only in invite mode.
+        // The client uses `registrationMode` to decide whether to show the invite field: only in
+        // invite mode.
         return sendJson(res, 200, {
           authenticated,
           apiVersion: API_VERSION,
-          googleEnabled: ctx.google !== undefined,
           registrationMode: ctx.registration.mode,
         });
       }

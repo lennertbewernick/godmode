@@ -369,6 +369,5 @@ export const USER_FIELDS = {
   email: { kind: 'string', minLength: 1 },
   displayName: { kind: 'string', minLength: 1 },
   passwordHash: { kind: 'string', minLength: 1, optional: true },
-  googleSub: { kind: 'string', minLength: 1, optional: true },
   createdAt: { kind: 'timestamp' },
 } as const satisfies SpecFor<UserRecord>;

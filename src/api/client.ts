@@ -8,8 +8,7 @@
  * §9). Script cannot read it, so there is nothing here to leak: **a password appears in exactly one
  * place, the argument to `login`/`register`, and is never stored, logged, put in a URL or attached
  * to an error.** Every request is same-origin and relative, so the cookie rides along by itself and
- * `SameSite=Strict` stays a complete CSRF defence. (Google sign-in is a top-level navigation to
- * `/auth/google/*`, handled by the server, not a call from here.)
+ * `SameSite=Strict` stays a complete CSRF defence.
  *
  * ## Failures are classified, because the UI has to say different things
  *
@@ -193,8 +192,6 @@ export type RegistrationMode = 'invite' | 'open' | 'closed';
 export interface SessionState {
   authenticated: boolean;
   apiVersion: number;
-  /** Whether the server has a Google OAuth client configured; the button is hidden otherwise. */
-  googleEnabled: boolean;
   /** How registration is gated, so the form can ask for an invite code only when it is needed. */
   registrationMode: RegistrationMode;
 }
@@ -232,14 +229,6 @@ export function register(body: {
   displayName?: string;
 }): Promise<{ authenticated: true; expiresAt: string }> {
   return request({ method: 'POST', path: '/register', body, expect: [201] });
-}
-
-/** Where the browser goes to start Google Sign-In; a top-level navigation, not a `fetch`. */
-export function googleLoginUrl(inviteCode?: string): string {
-  const code = inviteCode?.trim();
-  return code === undefined || code === ''
-    ? '/auth/google/login'
-    : `/auth/google/login?invite=${encodeURIComponent(code)}`;
 }
 
 export function closeSession(): Promise<void> {

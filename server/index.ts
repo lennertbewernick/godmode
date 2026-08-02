@@ -30,8 +30,6 @@ import {
   sendFile,
 } from './http.js';
 import { API_VERSION, handleApi, type ApiContext } from './routes.js';
-import { GOOGLE_AUTH_PREFIX, handleGoogleAuth } from './auth-google.js';
-import { resolveGoogleConfig, type GoogleOAuthConfig } from './google-oauth.js';
 import { resolveRegistrationGate, type RegistrationGate } from './registration.js';
 import { SessionStore, type SessionOptions } from './session.js';
 
@@ -126,10 +124,6 @@ export interface ServerOptions {
   readonly limiter?: AttemptLimiter;
   /** Registration policy override. Defaults to the one resolved from the environment. */
   readonly registration?: RegistrationGate;
-  /** Google OAuth client override. Defaults to the one resolved from the environment (or none). */
-  readonly google?: GoogleOAuthConfig;
-  /** `fetch` used for the Google token exchange. Injected in tests; global `fetch` in production. */
-  readonly fetch?: typeof fetch;
 }
 
 export interface RunningServer {
@@ -176,7 +170,6 @@ export function createGodmodeServer(options: ServerOptions = {}): RunningServer 
   // `GODMODE_DEV_TOKEN` env var, and never by the legacy `GODMODE_TOKEN`. Absent, there is simply
   // no token login and the server runs on real accounts alone.
   const devToken = options.token ?? host.env['GODMODE_DEV_TOKEN']?.trim();
-  const google = options.google ?? resolveGoogleConfig(host.env);
 
   const context: ApiContext = {
     db: opened.db,
@@ -184,8 +177,6 @@ export function createGodmodeServer(options: ServerOptions = {}): RunningServer 
     ...(devToken !== undefined && devToken !== '' ? { devTokenDigest: digest(devToken) } : {}),
     limiter: options.limiter ?? new AttemptLimiter(),
     registration: options.registration ?? resolveRegistrationGate(host.env),
-    ...(google === undefined ? {} : { google }),
-    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     now: options.now ?? (() => Date.now()),
   };
 
@@ -246,14 +237,6 @@ async function handle(
   if (pathname === '/api' || pathname.startsWith('/api/')) {
     await handleApi(context, req, res, pathname);
     return;
-  }
-
-  // Google Sign-In is a set of top-level navigations, not a JSON surface, so it is routed here
-  // rather than through `/api`. `handleGoogleAuth` sets its own security headers and returns
-  // `false` for a path it does not own, so an unrelated `/auth/...` route still falls through to
-  // the static handler and the SPA.
-  if (pathname === GOOGLE_AUTH_PREFIX || pathname.startsWith(`${GOOGLE_AUTH_PREFIX}/`)) {
-    if (await handleGoogleAuth(context, req, res, pathname, url.searchParams)) return;
   }
 
   const method = req.method ?? 'GET';

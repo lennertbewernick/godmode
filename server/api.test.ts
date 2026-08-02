@@ -23,9 +23,8 @@ import {
 } from './index.js';
 import { API_VERSION, ratchet, type Snapshot } from './routes.js';
 import { resolveRegistrationGate, type RegistrationGate } from './registration.js';
-import { type GoogleOAuthConfig } from './google-oauth.js';
 import { SESSION_COOKIE, SessionStore } from './session.js';
-import { BOOTSTRAP_USER_ID, createUser, findUserByEmail } from './users.js';
+import { BOOTSTRAP_USER_ID, createUser } from './users.js';
 import { listSubscriptions } from './push.js';
 
 const TOKEN = 'a-token-long-enough-to-be-accepted';
@@ -58,8 +57,6 @@ async function start(
     sessions?: SessionStore;
     sessionOptions?: { maxAgeMs?: number; idleMs?: number };
     registration?: RegistrationGate;
-    google?: GoogleOAuthConfig;
-    fetch?: typeof fetch;
   } = {},
 ): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'godmode-api-'));
@@ -77,8 +74,6 @@ async function start(
     ...(options.sessions === undefined ? {} : { sessions: options.sessions }),
     ...(options.sessionOptions === undefined ? {} : { sessionOptions: options.sessionOptions }),
     ...(options.registration === undefined ? {} : { registration: options.registration }),
-    ...(options.google === undefined ? {} : { google: options.google }),
-    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   });
   await new Promise<void>((done) => {
     running.server.listen(0, '127.0.0.1', done);
@@ -1671,176 +1666,5 @@ describe('password login (POST /api/session)', () => {
     expect(bSnap.workouts).toEqual([]);
     const aSnap = await a.snapshot();
     expect(aSnap.challenges.length).toBe(1);
-  });
-});
-
-// ── Google Sign-In callback (LBV-1480) ────────────────────────────────────────────────────────
-
-const GOOGLE: GoogleOAuthConfig = {
-  clientId: 'client-abc.apps.googleusercontent.com',
-  clientSecret: 'server-secret',
-  redirectUri: 'https://godmode.example/auth/google/callback',
-};
-
-function idTokenFor(claims: Record<string, unknown>): string {
-  const seg = (o: unknown): string => Buffer.from(JSON.stringify(o)).toString('base64url');
-  return `${seg({ alg: 'RS256' })}.${seg(claims)}.sig`;
-}
-
-/** A fake Google token endpoint returning `id_token` for whichever identity the test wants. */
-function fakeGoogleFetch(identity: Record<string, unknown>): typeof fetch {
-  return (async () =>
-    ({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        id_token: idTokenFor({
-          iss: 'https://accounts.google.com',
-          aud: GOOGLE.clientId,
-          ...identity,
-        }),
-      }),
-    }) as Response) as typeof fetch;
-}
-
-interface Redirect {
-  status: number;
-  location: string | null;
-  setCookie: string[];
-}
-
-/** A GET that does not follow redirects, so the 302 + Set-Cookie can be inspected. */
-async function manualGet(base: string, path: string, cookie?: string): Promise<Redirect> {
-  const response = await fetch(`${base}${path}`, {
-    redirect: 'manual',
-    ...(cookie === undefined ? {} : { headers: { cookie } }),
-  });
-  return {
-    status: response.status,
-    location: response.headers.get('location'),
-    setCookie: response.headers.getSetCookie(),
-  };
-}
-
-function cookieValue(setCookie: readonly string[], name: string): string | undefined {
-  const raw = setCookie.find((c) => c.startsWith(`${name}=`));
-  if (raw === undefined) return undefined;
-  const match = new RegExp(`^${name}=([^;]*)`).exec(raw);
-  return match?.[1];
-}
-
-describe('Google sign-in', () => {
-  it('login redirects to Google and plants a Lax state cookie', async () => {
-    const harness = await start({ registration: OPEN, google: GOOGLE, fetch: fakeGoogleFetch({}) });
-    const begin = await manualGet(harness.base, '/auth/google/login');
-    expect(begin.status).toBe(302);
-    expect(begin.location).toContain('accounts.google.com');
-    const stateCookie = begin.setCookie.find((c) => c.startsWith('godmode_oauth='));
-    expect(stateCookie).toContain('SameSite=Lax');
-    expect(stateCookie).toContain('HttpOnly');
-  });
-
-  it('a full callback creates the account, signs in, and clears the state cookie', async () => {
-    const harness = await start({
-      registration: OPEN,
-      google: GOOGLE,
-      fetch: fakeGoogleFetch({
-        sub: 'google-sub-1',
-        email: 'gmail-runner@example.com',
-        email_verified: true,
-        name: 'G Runner',
-      }),
-    });
-
-    const begin = await manualGet(harness.base, '/auth/google/login');
-    const oauthCookie = cookieValue(begin.setCookie, 'godmode_oauth') ?? '';
-    const state = new URL(begin.location ?? '').searchParams.get('state') ?? '';
-
-    const callback = await manualGet(
-      harness.base,
-      `/auth/google/callback?code=auth-code&state=${encodeURIComponent(state)}`,
-      `godmode_oauth=${oauthCookie}`,
-    );
-    expect(callback.status).toBe(302);
-    expect(callback.location).toBe('/');
-    // A session cookie was set, and the oauth state cookie was cleared.
-    const session = cookieValue(callback.setCookie, SESSION_COOKIE);
-    expect(session).toBeTruthy();
-    expect(callback.setCookie.find((c) => c.startsWith('godmode_oauth='))).toContain('Max-Age=0');
-
-    // The account exists and the session it minted authenticates a data read.
-    expect(findUserByEmail(harness.running.context.db, 'gmail-runner@example.com')).toBeDefined();
-    const authed = await fetch(`${harness.base}/api/snapshot`, {
-      headers: { cookie: `${SESSION_COOKIE}=${session ?? ''}` },
-    });
-    expect(authed.status).toBe(200);
-  });
-
-  it('rejects a callback whose state does not match the cookie (CSRF)', async () => {
-    const harness = await start({
-      registration: OPEN,
-      google: GOOGLE,
-      fetch: fakeGoogleFetch({ sub: 's', email: 'x@example.com', email_verified: true }),
-    });
-    const begin = await manualGet(harness.base, '/auth/google/login');
-    const oauthCookie = cookieValue(begin.setCookie, 'godmode_oauth') ?? '';
-    const callback = await manualGet(
-      harness.base,
-      `/auth/google/callback?code=c&state=forged-state`,
-      `godmode_oauth=${oauthCookie}`,
-    );
-    expect(callback.status).toBe(302);
-    expect(callback.location).toBe('/?authError=google');
-    expect(cookieValue(callback.setCookie, SESSION_COOKIE)).toBeUndefined();
-  });
-
-  it('turns away a brand-new Google user who has no invite', async () => {
-    const harness = await start({
-      registration: INVITE, // invite mode, code "let-me-in"
-      google: GOOGLE,
-      fetch: fakeGoogleFetch({ sub: 'new-sub', email: 'stranger@example.com', email_verified: true }),
-    });
-    const begin = await manualGet(harness.base, '/auth/google/login'); // no ?invite
-    const oauthCookie = cookieValue(begin.setCookie, 'godmode_oauth') ?? '';
-    const state = new URL(begin.location ?? '').searchParams.get('state') ?? '';
-    const callback = await manualGet(
-      harness.base,
-      `/auth/google/callback?code=c&state=${encodeURIComponent(state)}`,
-      `godmode_oauth=${oauthCookie}`,
-    );
-    expect(callback.location).toBe('/?authError=invite');
-    expect(findUserByEmail(harness.running.context.db, 'stranger@example.com')).toBeUndefined();
-  });
-
-  it('links a Google login to an existing password account of the same verified email', async () => {
-    const harness = await start({
-      registration: OPEN,
-      google: GOOGLE,
-      fetch: fakeGoogleFetch({ sub: 'linking-sub', email: 'both@example.com', email_verified: true }),
-    });
-    // Register by password first.
-    const pw = new Client(harness.base);
-    await pw.send('POST', '/api/register', { email: 'both@example.com', password: 'a-good-password' });
-    const before = findUserByEmail(harness.running.context.db, 'both@example.com');
-
-    // Now sign in with Google for the same email.
-    const begin = await manualGet(harness.base, '/auth/google/login');
-    const oauthCookie = cookieValue(begin.setCookie, 'godmode_oauth') ?? '';
-    const state = new URL(begin.location ?? '').searchParams.get('state') ?? '';
-    await manualGet(
-      harness.base,
-      `/auth/google/callback?code=c&state=${encodeURIComponent(state)}`,
-      `godmode_oauth=${oauthCookie}`,
-    );
-
-    const after = findUserByEmail(harness.running.context.db, 'both@example.com');
-    // Same account (same id), now carrying the google_sub — not a second row.
-    expect(after?.id).toBe(before?.id);
-    expect(after?.googleSub).toBe('linking-sub');
-  });
-
-  it('answers /auth/google/* with 404 when Google is not configured', async () => {
-    const harness = await start({ registration: OPEN }); // no google
-    expect((await manualGet(harness.base, '/auth/google/login')).status).toBe(404);
   });
 });
