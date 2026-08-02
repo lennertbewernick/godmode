@@ -1,18 +1,17 @@
 /**
- * The gate: sign in to an existing account, or create one, or continue with Google.
+ * The gate: sign in to an existing account, or create one.
  *
  * Everything behind the app requires an authenticated session (`App.tsx`), and this is where one
  * is obtained. It replaced the single shared-token screen when the app grew real per-user accounts
- * (LBV-1480). Three ways in, in order of how most people will use them:
+ * (LBV-1480). Two ways in:
  *
- *   - **Continue with Google** — a top-level navigation to `/auth/google/login`, shown only when
- *     the server reports a configured OAuth client (`googleEnabled`). Not a `fetch`: the browser
- *     leaves for Google and returns to a callback the server handles.
  *   - **Email + password** — a same-origin POST that mints the `HttpOnly` session cookie. The
  *     password lives only in this component's state and is dropped the moment it is exchanged;
  *     nothing writes it to `localStorage`, a URL, or a log.
  *   - **Create an account** — the same, against `/api/register`, plus an invite code when the
  *     server is invite-gated (`registrationMode === 'invite'`).
+ *
+ * Email + password is the sole way in; the Google OAuth path was retired in LBV-1567.
  *
  * `type="password"`/`autoComplete` are set so a password manager can hold the credentials and the
  * owner is not retyping on a phone; `spellCheck`/autocapitalisation are off so iOS does not
@@ -20,7 +19,7 @@
  */
 
 import { useState } from 'react';
-import { ApiError, googleLoginUrl, login, register, type RegistrationMode } from '../api/client.js';
+import { ApiError, login, register, type RegistrationMode } from '../api/client.js';
 import { Banner, Button, Card } from './kit.js';
 
 type Mode = 'login' | 'register';
@@ -28,13 +27,11 @@ type Mode = 'login' | 'register';
 export function SignIn({
   onSignedIn,
   reason,
-  googleEnabled,
   registrationMode,
 }: {
   onSignedIn: () => void;
   /** Why the user is here, when they did not come here on purpose. */
   reason?: string | undefined;
-  googleEnabled: boolean;
   registrationMode: RegistrationMode;
 }) {
   const [mode, setMode] = useState<Mode>('login');
@@ -80,12 +77,6 @@ export function SignIn({
     }
   }
 
-  function continueWithGoogle(): void {
-    // A top-level navigation, carrying the invite code the user typed (if any) so a new Google
-    // account can pass an invite gate. Never a fetch — the browser leaves for Google.
-    window.location.assign(googleLoginUrl(needsInvite ? invite : undefined));
-  }
-
   return (
     <div className="mx-auto w-full px-4 pb-10 md:max-w-md safe-t">
       <header className="py-8">
@@ -106,19 +97,6 @@ export function SignIn({
         <p className="mt-1.5 text-sm leading-relaxed text-slate-300">
           Your training lives on this server, in your own account.
         </p>
-
-        {googleEnabled ? (
-          <div className="mt-4">
-            <Button className="w-full" variant="ghost" onClick={continueWithGoogle}>
-              Continue with Google
-            </Button>
-            <div className="my-4 flex items-center gap-3 text-xs uppercase tracking-wider text-slate-500">
-              <span className="h-px flex-1 bg-[#33405c]" />
-              or
-              <span className="h-px flex-1 bg-[#33405c]" />
-            </div>
-          </div>
-        ) : null}
 
         <form
           className="mt-4 flex flex-col gap-3"

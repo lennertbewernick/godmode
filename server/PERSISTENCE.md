@@ -36,7 +36,7 @@ exported): `users` and `sessions`.
 
 | Table | Columns | Notes |
 |---|---|---|
-| `users` | `id` PK, `email` (unique, ci via `idx_users_email` on `lower(email)`), `display_name`, `password_hash` NULL, `google_sub` NULL (unique-when-present), `created_at` | The auth ticket adds credentials; this ticket only needs the table to exist. A `UserRecord` compile guard lives in `server/fields.ts` (`USER_FIELDS`). |
+| `users` | `id` PK, `email` (unique, ci via `idx_users_email` on `lower(email)`), `display_name`, `password_hash` NULL, `created_at` | Invite-gated email + password accounts (the Google OAuth path was retired in LBV-1567). A `UserRecord` compile guard lives in `server/fields.ts` (`USER_FIELDS`). |
 | `sessions` | `id` PK, `user_id` FK→`users`, `created_at` INTEGER (epoch ms), `last_seen_at` INTEGER | Persisted so a deploy no longer logs everyone out. Epoch-ms, not ISO, because expiry is arithmetic. |
 | `user_revisions` | `user_id` PK FK→`users`, `revision` INTEGER ≥ 0, `updated_at` | The per-user optimistic-concurrency counter. Every user gets a row (revision 0) at creation. |
 

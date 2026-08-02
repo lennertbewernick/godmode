@@ -7,8 +7,8 @@
  * on a box reachable from the internet is an open invitation to fill the database with strangers.
  * Lennert asked for invite-gated registration with a single switch that can flip to open later
  * (issue LBV-1480, "Product defaults"). So the whole policy lives in one place: this module reads
- * it from the environment once and every registration path — password *and* Google — asks the
- * same `evaluate` the same way. Flipping to open is one env var, not an edit to two endpoints.
+ * it from the environment once and the registration path asks the same `evaluate` the same way.
+ * Flipping to open is one env var, not an edit to the endpoint.
  *
  * ## Why the code compare is constant-time
  *
@@ -19,10 +19,10 @@
  *
  * ## What this gate is not
  *
- * It gates *new accounts only*. An existing user signing in — by password, or by a Google account
- * already linked — never touches this: they already passed the gate the day they registered. The
- * callers enforce that ordering (`server/routes.ts`, `server/auth-google.ts`); this module only
- * answers "may a brand-new account be created with this code?".
+ * It gates *new accounts only*. An existing user signing in by password never touches this: they
+ * already passed the gate the day they registered. The caller enforces that ordering
+ * (`server/routes.ts`); this module only answers "may a brand-new account be created with this
+ * code?".
  */
 
 import { createHash, timingSafeEqual } from 'node:crypto';

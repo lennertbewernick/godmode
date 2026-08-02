@@ -29,7 +29,7 @@ Defaults: `http://127.0.0.1:8787`, loopback only.
 | `GODMODE_SERVER_HOST` | `127.0.0.1` | Set to `0.0.0.0` to be reachable — see TLS below. |
 | `GODMODE_OWNER_EMAIL` / `GODMODE_OWNER_NAME` | `owner@godmode.local` / `Owner` | Identity of the bootstrap owner row (the pre-account single-tenant history). |
 
-Google Sign-In (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and either `GOOGLE_REDIRECT_URI` or `GODMODE_PUBLIC_ORIGIN`) is optional; see the Google OAuth section below. With no client id/secret, the Google button is hidden and `/auth/google/*` answers 404 — password accounts still work.
+Auth is invite-gated email + password only; there are no OAuth environment variables. The server boots and login/register work with no auth-provider credentials of any kind (the Google OAuth path was retired in LBV-1567).
 
 ## The four things a deployment must get right
 
@@ -285,25 +285,3 @@ CREATE TABLE push_subscriptions (
   created_at TEXT NOT NULL
 ) STRICT;
 ```
-
-### Google OAuth **[MANUAL]**
-
-The auth code is shipped (LBV-1480). Google Sign-In stays **hidden** (`/auth/google/*` → 404, no button) until these credentials are provisioned; password accounts work without them. Steps:
-
-1. Go to https://console.cloud.google.com → APIs & Services → Credentials
-2. Create OAuth 2.0 Client ID (type: Web Application)
-3. Add authorized redirect URI **exactly** (must match to the character, or Google returns `redirect_uri_mismatch`): `https://godmode.lennert.cloud/auth/google/callback`
-4. Copy Client ID and Client Secret
-5. Add to `/etc/godmode/env`:
-   ```
-   GOOGLE_CLIENT_ID=<id>
-   GOOGLE_CLIENT_SECRET=<secret>
-   # The redirect URI is derived from GODMODE_PUBLIC_ORIGIN + /auth/google/callback.
-   # Set the origin (no trailing path), or set GOOGLE_REDIRECT_URI explicitly to override.
-   GODMODE_PUBLIC_ORIGIN=https://godmode.lennert.cloud
-   ```
-6. Restart: `systemctl restart godmode.service`
-
-The server derives the redirect URI from `GODMODE_PUBLIC_ORIGIN` (or takes `GOOGLE_REDIRECT_URI` verbatim); with a client id/secret but no way to determine the redirect URI, Google stays disabled rather than sending a guessed URI that Google would reject. Placeholder lines are already in `/etc/godmode/env` (commented out).
-
-**Account model:** a returning Google user is matched by their stable `google_sub`; a Google login whose *verified* email already has a password account links to it (no duplicate row); a brand-new Google user passes the same registration gate as password sign-up (in `invite` mode they must supply an invite code on the sign-in screen before pressing "Continue with Google").
