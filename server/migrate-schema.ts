@@ -10,19 +10,35 @@
  * any point before the rename leaves the original exactly as it was; the previous file is copied
  * aside and kept.
  *
- * ## v1 → v2 (LBV-1478): single-tenant → multi-user
+ * ## v1 → current (LBV-1478): single-tenant → multi-user, by rebuild
  *
  * v1 was global: every table was shared, `settings`/`meta` were single-row, one `meta.revision`
- * served the whole file. v2 adds tenancy (`server/schema.sql`). The upgrade reads the v1 dataset —
+ * served the whole file. v2 added tenancy (`server/schema.sql`). The upgrade reads the v1 dataset —
  * which is tenancy-blind, since the record types carry no `user_id` — assigns all of it to the
  * bootstrap owner (`server/users.ts`), and seeds that owner's per-user revision from v1's old
  * global one. The owner's history survives, now owned by a real `users` row that the auth ticket
- * can later attach real credentials to.
+ * can later attach real credentials to. It builds a *fresh* file with `applySchema`, so a v1 file
+ * lands directly at the current `SCHEMA_VERSION` (v3) — the fresh schema is the current one, and
+ * the v2→v3 additions (`goal_text`, `push_subscriptions`) are simply present in it.
  *
  * The migration takes and holds its own ownership lock (`server/lock.ts`) for the whole read →
  * build → rename, and runs BEFORE the server opens the file for writing (`server/db.ts`). It must:
  * a rename under a connection another process still has open is the precise hazard the lock exists
  * to prevent.
+ *
+ * ## v2 → v3 (LBV-1575): additive, IN PLACE
+ *
+ * v3 adds only `settings.goal_text` and the `push_subscriptions` table + index — a purely additive
+ * change (ADR 0002). Additive-only changes carry none of the insert-order / FK hazards that made
+ * v1→v2 a rebuild, so this one migrates in place: a guarded `ALTER TABLE ADD COLUMN` and a
+ * `CREATE TABLE IF NOT EXISTS`-equivalent, inside one transaction, then the version bump. It is
+ * idempotent because production was already hotfixed to carry both objects while still reporting
+ * version 2 (`ops/lbv1572-hotfix.mjs`): on such a file the guards skip the DDL and only the version
+ * moves. A safety copy of the pre-v3 file is still taken first — this is the only copy of the data.
+ *
+ * `server/migrate-schema.test.ts` proves, against a frozen v2 snapshot schema, that a database
+ * brought up by this migration is schema-identical to one built fresh from `schema.sql`: the drift
+ * that caused LBV-1572 fails the build rather than production.
  */
 
 import {
@@ -103,17 +119,15 @@ export function migrateFileToCurrent(
 
   if (version === undefined) return { migrated: false };
   if (version >= SCHEMA_VERSION) return { migrated: false };
-  if (version !== 1) {
-    throw new SchemaMigrationError(
-      `Database at ${path} is schema version ${String(version)}, which this build cannot ` +
-        `migrate to ${String(SCHEMA_VERSION)}. Nothing has been changed.`,
-    );
-  }
-
-  return migrateOneToTwo(path, options);
+  if (version === 1) return migrateOneToCurrent(path, options);
+  if (version === 2) return migrateTwoToThree(path, options);
+  throw new SchemaMigrationError(
+    `Database at ${path} is schema version ${String(version)}, which this build cannot ` +
+      `migrate to ${String(SCHEMA_VERSION)}. Nothing has been changed.`,
+  );
 }
 
-function migrateOneToTwo(path: string, options: MigrateFileOptions): MigrateFileResult {
+function migrateOneToCurrent(path: string, options: MigrateFileOptions): MigrateFileResult {
   const lock = acquireOwnership(path, options.breakStaleLock === true);
   try {
     // 1. Read the v1 file, read-only. Tenancy-blind: the record types carry no user_id, so the
@@ -169,7 +183,7 @@ function migrateOneToTwo(path: string, options: MigrateFileOptions): MigrateFile
 
       // 4. Put it in place: fsync, copy the v1 file aside for good, then the atomic rename.
       fsyncPath(temporaryPath);
-      const safetyCopyPath = copyAside(path);
+      const safetyCopyPath = copyAside(path, 1);
       assertStillOwned(lock);
       renameSync(temporaryPath, path);
       fsyncPath(dirname(path));
@@ -188,6 +202,113 @@ function migrateOneToTwo(path: string, options: MigrateFileOptions): MigrateFile
     } finally {
       rmSync(workDir, { recursive: true, force: true });
     }
+  } finally {
+    lock.release();
+  }
+}
+
+// ── v2 → v3: additive, in place ───────────────────────────────────────────────────────────────
+
+/**
+ * The two objects v3 adds over v2 (LBV-1481, shipped without a version bump — LBV-1572).
+ *
+ * These are token-equivalent to their definitions in `server/schema.sql`; the drift test proves a
+ * database migrated with them is schema-identical to a fresh `applySchema`, so the two cannot
+ * diverge unnoticed. `goal_text` is added as the LAST `settings` column because `ALTER TABLE ADD
+ * COLUMN` appends, and the schema declares it last to match (see `schema.sql`).
+ */
+const ADD_GOAL_TEXT =
+  'ALTER TABLE settings ADD COLUMN goal_text TEXT NULL ' +
+  'CHECK (goal_text IS NULL OR length(goal_text) > 0)';
+
+const CREATE_PUSH_SUBSCRIPTIONS = `CREATE TABLE push_subscriptions (
+  endpoint   TEXT NOT NULL PRIMARY KEY CHECK (length(endpoint) > 0),
+  user_id    TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  p256dh     TEXT NOT NULL CHECK (length(p256dh) > 0),
+  auth       TEXT NOT NULL CHECK (length(auth) > 0),
+  created_at TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*')
+) STRICT`;
+
+const CREATE_PUSH_SUBSCRIPTIONS_INDEX =
+  'CREATE INDEX idx_push_subscriptions_user ON push_subscriptions (user_id)';
+
+function hasColumn(db: DatabaseSync, table: string, column: string): boolean {
+  const info = db.prepare(`PRAGMA table_info(${table})`).all() as { name?: unknown }[];
+  return info.some((row) => row.name === column);
+}
+
+function hasTable(db: DatabaseSync, table: string): boolean {
+  const row = db
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(table);
+  return row !== undefined;
+}
+
+/**
+ * Apply the v2→v3 additions to an open connection, guarded so a file that already carries them
+ * (production, hotfixed under LBV-1572) is left untouched but for the version bump. Caller owns the
+ * transaction.
+ */
+function applyTwoToThree(db: DatabaseSync, now: string): void {
+  if (!hasColumn(db, 'settings', 'goal_text')) db.exec(ADD_GOAL_TEXT);
+  if (!hasTable(db, 'push_subscriptions')) {
+    db.exec(CREATE_PUSH_SUBSCRIPTIONS);
+    db.exec(CREATE_PUSH_SUBSCRIPTIONS_INDEX);
+  }
+  db.prepare('UPDATE meta SET schema_version = ?, updated_at = ? WHERE id = ?').run(
+    SCHEMA_VERSION,
+    now,
+    'meta',
+  );
+}
+
+/**
+ * Additive in-place upgrade. No rebuild/rename: the objects are added to the live file inside one
+ * transaction (SQLite DDL is transactional, so a crash mid-way rolls back to the exact v2 file),
+ * behind existence guards that make it idempotent on the already-hotfixed production database. A
+ * safety copy of the pre-v3 file is taken first regardless — it is the only copy of the data.
+ */
+function migrateTwoToThree(path: string, options: MigrateFileOptions): MigrateFileResult {
+  const lock = acquireOwnership(path, options.breakStaleLock === true);
+  try {
+    // Fold any WAL back into the main file, then copy it aside, so the safety copy is a complete
+    // snapshot of the v2 database before a single byte of it is altered.
+    const checkpoint = new DatabaseSync(path);
+    try {
+      armConnection(checkpoint);
+      checkpoint.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } finally {
+      checkpoint.close();
+    }
+    const safetyCopyPath = copyAside(path, 2);
+    assertStillOwned(lock);
+
+    const db = new DatabaseSync(path);
+    try {
+      armConnection(db);
+      db.exec('BEGIN');
+      try {
+        applyTwoToThree(db, new Date().toISOString());
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+      // Fold the committed DDL back into the main file so the fsync below actually persists it,
+      // rather than leaving it in a WAL a later open would have to recover.
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } finally {
+      db.close();
+    }
+    fsyncPath(path);
+
+    const message =
+      `[godmode] migrated ${path} from schema v2 to v${String(SCHEMA_VERSION)} ` +
+      `(additive: goal_text + push_subscriptions). The previous database was copied to ` +
+      `${safetyCopyPath} and left there.`;
+    (options.onMigrated ?? ((m: string) => console.warn(m)))(message);
+
+    return { migrated: true, fromVersion: 2, toVersion: SCHEMA_VERSION, safetyCopyPath };
   } finally {
     lock.release();
   }
@@ -215,10 +336,13 @@ function assertStillOwned(lock: HeldLock): void {
   }
 }
 
-/** Copy the previous database aside, refusing to overwrite an earlier copy. */
-function copyAside(path: string): string {
+/**
+ * Copy the previous database aside, refusing to overwrite an earlier copy. Named after the version
+ * it holds (`fromVersion`) — the shape you would restore to if the upgrade were ever regretted.
+ */
+function copyAside(path: string, fromVersion: number): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const candidate = `${path}.pre-v2-${stamp}.sqlite`;
+  const candidate = `${path}.pre-v${String(fromVersion)}-${stamp}.sqlite`;
   copyFileSync(path, candidate, constants.COPYFILE_EXCL);
   fsyncPath(candidate);
   return candidate;

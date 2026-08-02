@@ -441,7 +441,7 @@ describe('GET /api/snapshot', () => {
     const snapshot = await client.snapshot();
     expect(snapshot).toMatchObject({
       apiVersion: API_VERSION,
-      schemaVersion: 2,
+      schemaVersion: 3,
       revision: 0,
       exercises: [],
       challenges: [],
