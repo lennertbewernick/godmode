@@ -108,18 +108,25 @@ VALUES ('meta', 2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:
 --
 -- One row per person. `email` is unique case-insensitively (`idx_users_email` on `lower(email)`).
 -- `password_hash` is nullable so a bootstrap owner row can exist before any credential is set;
--- registration/login fills it. Auth is email + password only (the Google OAuth path was retired
--- in LBV-1567).
+-- registration/login fills it.
+--
+-- `google_sub` + `idx_users_google_sub` are part of the REAL v2 that shipped: the Google OAuth
+-- path existed at v2 and production still carries both (DevOps read-only audit of the deployed
+-- v2 DB, LBV-1578). They must be here so this frozen snapshot models the shape prod actually ran,
+-- not the post-LBV-1567 removal — otherwise the drift guard would compare two databases that
+-- agree with each other but not with reality (ADR-0003). Do NOT edit to track schema.sql.
 
 CREATE TABLE users (
   id            TEXT NOT NULL PRIMARY KEY CHECK (length(id) > 0),
   email         TEXT NOT NULL CHECK (length(email) > 0),
   display_name  TEXT NOT NULL CHECK (length(display_name) > 0),
   password_hash TEXT     NULL CHECK (password_hash IS NULL OR length(password_hash) > 0),
+  google_sub    TEXT     NULL CHECK (google_sub IS NULL OR length(google_sub) > 0),
   created_at    TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*')
 ) STRICT;
 
 CREATE UNIQUE INDEX idx_users_email ON users (lower(email));
+CREATE UNIQUE INDEX idx_users_google_sub ON users (google_sub) WHERE google_sub IS NOT NULL;
 
 -- ── sessions ────────────────────────────────────────────────────────────────────────────────
 --

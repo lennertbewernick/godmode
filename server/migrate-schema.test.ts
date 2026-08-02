@@ -237,6 +237,13 @@ function tableExists(db: DatabaseSync, name: string): boolean {
   );
 }
 
+function indexExists(db: DatabaseSync, name: string): boolean {
+  return (
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(name) !==
+    undefined
+  );
+}
+
 function columnNames(db: DatabaseSync, table: string): string[] {
   return (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((r) => r.name);
 }
@@ -283,6 +290,12 @@ describe('migrateFileToCurrent — v2 to v3 (additive)', () => {
       expect(readSchemaVersion(before)).toBe(2);
       expect(columnNames(before, 'settings')).not.toContain('goal_text');
       expect(tableExists(before, 'push_subscriptions')).toBe(false);
+      // Guard the guard (LBV-1579): the v2 fixture must carry `google_sub` + its partial-unique
+      // index, because production shipped v2 with them (DevOps audit, LBV-1578). Neither is added
+      // or dropped by the additive v2→v3 migration, so if the fixture ever loses them the drift
+      // guard silently compares the wrong shape against reality again (ADR-0003).
+      expect(columnNames(before, 'users')).toContain('google_sub');
+      expect(indexExists(before, 'idx_users_google_sub')).toBe(true);
     } finally {
       before.close();
     }
