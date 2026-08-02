@@ -1,6 +1,10 @@
 # Persistence matrix — every field, every column
 
-**Written:** 2026-07-30 · **Schema version:** 2 · **Backup format read:** 1
+**Written:** 2026-07-30 · **Schema version:** 3 · **Backup format read:** 1
+
+> Schema v3 (LBV-1575) is purely additive over v2: `settings.goal_text` (LBV-1481) and the
+> device-state table `push_subscriptions` — neither changes the domain matrix below. The v2→v3
+> migration is idempotent and in place; see `server/migrate-schema.ts` and ADR 0002.
 
 This is the field-by-field contract between the record types in `src/` and the SQLite schema in
 `server/schema.sql`. It is exhaustive, not illustrative. Every property of every persisted record

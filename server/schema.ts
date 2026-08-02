@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import type { DatabaseSync } from 'node:sqlite';
 
 /** Must equal `meta.schema_version` seeded by `schema.sql`. */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /**
  * The `meta.schema_version` currently in a file, or `undefined` if there is no readable meta row.

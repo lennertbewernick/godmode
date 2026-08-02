@@ -1,21 +1,17 @@
--- GodMode — server-owned SQLite schema, version 3.
+-- GodMode — server-owned SQLite schema, version 2. FROZEN SNAPSHOT.
+--
+-- This is the schema as it stood at v2 (multi-user tenancy, LBV-1478) BEFORE the additive v3
+-- objects — `settings.goal_text` and `push_subscriptions` — existed. It is the shape every
+-- database migrated v1→v2 on 2026-07-31 actually had, and the shape production ran with until
+-- the LBV-1572 hotfix. Kept frozen so `migrate-schema.test.ts` can build a real v2 database and
+-- prove the v2→v3 migration brings it to exactly what `schema.sql` produces fresh. Do NOT edit
+-- to track schema.sql: its whole value is that it does not move.
 --
 -- Authority: this file is generated from nothing. It is written by hand against
 -- `src/db/schema.ts` and `src/core/types.ts`, and every column here has a row in
 -- `server/PERSISTENCE.md`. A field added to a record type without a row in that matrix and a
 -- column here is silently dropped on import — which, on the only copy of the training history,
 -- is data loss. `server/fields.ts` makes that failure a compile error rather than a surprise.
---
--- ─────────────────────────────────────────────────────────────────────────────────────────
--- VERSION 3 — ADDITIVE: goal_text + push_subscriptions (LBV-1575, follow-up to LBV-1572).
---
--- `settings.goal_text` (last column, see below) and the whole `push_subscriptions` table were
--- added for Web Push (LBV-1481) but shipped WITHOUT a version bump, so no migration ran and every
--- database already at v2 (production) lacked them — a 500 in the core flow (LBV-1572). This file
--- is now version 3, and `server/migrate-schema.ts` carries the idempotent v2→v3 additive
--- migration that closes that drift on an already-migrated database. `server/migrate-schema.test.ts`
--- proves the migration chain and this file cannot diverge again without failing the build.
--- See `docs/adr/0002-schema-drift-additive-migrations.md`.
 --
 -- ─────────────────────────────────────────────────────────────────────────────────────────
 -- VERSION 2 — MULTI-USER TENANCY (LBV-1478).
@@ -106,7 +102,7 @@ CREATE TABLE meta (
 ) STRICT;
 
 INSERT INTO meta (id, schema_version, created_at, updated_at)
-VALUES ('meta', 3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+VALUES ('meta', 2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 
 -- ── users ───────────────────────────────────────────────────────────────────────────────────
 --
@@ -157,36 +153,6 @@ CREATE TABLE user_revisions (
   revision   INTEGER NOT NULL CHECK (revision >= 0),
   updated_at TEXT    NOT NULL CHECK (updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*')
 ) STRICT;
-
--- ── push_subscriptions ──────────────────────────────────────────────────────────────────────
---
--- One row per Web Push endpoint a user has granted (LBV-1481). Device state, NOT part of the
--- domain dataset: it is not in `COLLECTIONS` (`server/dataset.ts`), never appears in a snapshot or
--- a backup, and no `user_revisions` bump touches it — exactly like `sessions`. A subscription is
--- re-established by the device on its next visit, so a restore that carries none is correct.
---
--- `endpoint` is the push service URL the browser minted; it is the natural identity of a
--- subscription and is UNIQUE across the whole table, so re-subscribing the same browser replaces
--- the previous row rather than accumulating duplicates (`ON CONFLICT (endpoint)` in
--- `server/push.ts`). `p256dh` and `auth` are the base64url key material the sender (a DevOps
--- ticket, `web-push`) needs to encrypt a payload for this endpoint. `created_at` is when the row
--- was last written.
---
--- `user_id` scopes a subscription to its owner so a send only ever reaches that person's devices,
--- and `ON DELETE CASCADE` drops a user's subscriptions with the user. The unique `endpoint`
--- deliberately spans users: a browser is one device, and if a shared device is re-granted under a
--- second account the endpoint moves to that account rather than being served two people's
--- reminders.
-
-CREATE TABLE push_subscriptions (
-  endpoint   TEXT NOT NULL PRIMARY KEY CHECK (length(endpoint) > 0),
-  user_id    TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
-  p256dh     TEXT NOT NULL CHECK (length(p256dh) > 0),
-  auth       TEXT NOT NULL CHECK (length(auth) > 0),
-  created_at TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*')
-) STRICT;
-
-CREATE INDEX idx_push_subscriptions_user ON push_subscriptions (user_id);
 
 -- ── exercises ───────────────────────────────────────────────────────────────────────────────
 --
@@ -355,16 +321,7 @@ CREATE TABLE settings (
   rest_override_seconds REAL     NULL CHECK (rest_override_seconds IS NULL OR rest_override_seconds >= 0),
   last_backup_at        TEXT     NULL CHECK (last_backup_at IS NULL OR last_backup_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'),
   onboarded_at          TEXT     NULL CHECK (onboarded_at IS NULL OR onboarded_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'),
-  selected_challenge_id TEXT     NULL,
-  -- The onboarding "why do you do this" (LBV-1481). Free text in the user's own words, so no GLOB;
-  -- length is bounded by the validator (`GOAL_TEXT_MAX_LENGTH`), not the column.
-  --
-  -- LAST column deliberately (LBV-1575): this is a v2→v3 additive column, and the v2→v3 migration
-  -- adds it with `ALTER TABLE ... ADD COLUMN`, which SQLite appends after the existing columns.
-  -- Declaring it last here means a freshly-applied schema and a migrated one hold the same physical
-  -- column order, so the schema-drift test can compare them. Do not move it above another column
-  -- without giving the migration a reason it can still reach byte-parity.
-  goal_text             TEXT     NULL CHECK (goal_text IS NULL OR length(goal_text) > 0)
+  selected_challenge_id TEXT     NULL
 ) STRICT;
 
 -- ── indexes ─────────────────────────────────────────────────────────────────────────────────
