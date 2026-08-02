@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "license": "AGPL-3.0-or-later",
-  "description": "GodMode: No More Later — progressive bodyweight challenge planner. Local-first, open source, no accounts, nothing paywalled.",
+  "description": "GodMode: No More Later — progressive bodyweight challenge planner. Open source, account-based, invite-only.",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

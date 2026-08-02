@@ -124,7 +124,7 @@ export default defineConfig(({ mode }) => {
         manifest: {
           name: 'GodMode: No More Later',
           short_name: 'GodMode',
-          description: 'Progressive bodyweight challenge planner. Local-first, no accounts.',
+          description: 'Progressive bodyweight challenge planner. Account-based, invite-only.',
           theme_color: '#0f172a',
           background_color: '#0f172a',
           display: 'standalone',
