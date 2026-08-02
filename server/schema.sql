@@ -114,16 +114,27 @@ VALUES ('meta', 3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:
 -- `password_hash` is nullable so a bootstrap owner row can exist before any credential is set;
 -- registration/login fills it. Auth is email + password only (the Google OAuth path was retired
 -- in LBV-1567).
+--
+-- `google_sub` is a RETAINED ARTIFACT of that retired Google OAuth path — NOT a resurrection of
+-- Google auth (the code path stays removed). Production shipped v2 with this column + its
+-- partial-unique index and still carries them (DevOps read-only audit, LBV-1578); LBV-1567
+-- dropped them from this file in place, no migration — an ADR-0002 violation that left schema.sql
+-- describing a shape prod never had. This file must describe the DEPLOYED shape, so the column
+-- and index are restored here (ADR-0003). It is nullable and unused (all rows NULL post-pivot);
+-- the partial-unique index constrains only non-NULL values, so it is inert. Any future removal
+-- is a versioned destructive migration (v3→v4), board-gated — never an in-place edit.
 
 CREATE TABLE users (
   id            TEXT NOT NULL PRIMARY KEY CHECK (length(id) > 0),
   email         TEXT NOT NULL CHECK (length(email) > 0),
   display_name  TEXT NOT NULL CHECK (length(display_name) > 0),
   password_hash TEXT     NULL CHECK (password_hash IS NULL OR length(password_hash) > 0),
+  google_sub    TEXT     NULL CHECK (google_sub IS NULL OR length(google_sub) > 0),
   created_at    TEXT NOT NULL CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*')
 ) STRICT;
 
 CREATE UNIQUE INDEX idx_users_email ON users (lower(email));
+CREATE UNIQUE INDEX idx_users_google_sub ON users (google_sub) WHERE google_sub IS NOT NULL;
 
 -- ── sessions ────────────────────────────────────────────────────────────────────────────────
 --
